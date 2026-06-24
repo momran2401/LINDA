@@ -190,14 +190,15 @@ class SharedConfig:
                 print("[config] no-op update ignored")
                 return []
 
-            for key, old, value, label in changes:
-                print(
-                    f"[config] changed ({label}): {key} "
-                    f"{format_config_value(key, old)} -> {format_config_value(key, value)}"
-                )
             self._changes.extend(changes)
             self._dirty = True
-            return changes
+
+        for key, old, value, label in changes:
+            print(
+                f"[config] changed ({label}): {key} "
+                f"{format_config_value(key, old)} -> {format_config_value(key, value)}"
+            )
+        return changes
 
     def take_dirty(self):
         with self._lock:
@@ -704,6 +705,17 @@ class Acquirer(threading.Thread):
                             time.sleep(1.0)
                         continue
 
+                if self.source is None:
+                    try:
+                        read_size, tmp, buffers = self.recover_radio(cfg, "source not open")
+                    except Exception as recover_err:
+                        self._set_status(
+                            f"acquisition recovery failed: {recover_err}", healthy=False)
+                        print(f"acquirer: recovery failed: {recover_err}")
+                        self._push_event(f"acquisition recovery failed: {recover_err}", "ERROR")
+                        time.sleep(1.0)
+                    continue
+
                 # Read a full chunk (READ_SIZE / stream MTU bound) each pass and
                 # push the raw IQ into the ring. LocalReceiver slices the last
                 # rows*nfft samples it needs from get_latest().
@@ -955,6 +967,7 @@ class LiveViewer(QtWidgets.QMainWindow):
         self.graphics = pg.GraphicsLayoutWidget()
         titles = {0: "Spectrogram Port 0 -- RX1",
                   1: "Spectrogram Port 1 -- RX2 (unavailable on this device)"}
+        self.hists = {}
         col = 0
         for ch in (0, 1):
             plot = self.graphics.addPlot(row=0, col=col)
@@ -973,7 +986,21 @@ class LiveViewer(QtWidgets.QMainWindow):
             self.graphics.addItem(hist, row=0, col=col + 1)
             self.specplots[ch] = plot
             self.images[ch] = img
+            self.hists[ch] = hist
             col += 2
+
+        self._hist_syncing = False
+
+        def _hist_sync(src, dst):
+            if not self._hist_syncing:
+                self._hist_syncing = True
+                lmin, lmax = src.getLevels()
+                dst.setLevels(lmin, lmax)
+                self._hist_syncing = False
+
+        h0, h1 = self.hists[0], self.hists[1]
+        h0.sigLevelsChanged.connect(lambda: _hist_sync(h0, h1))
+        h1.sigLevelsChanged.connect(lambda: _hist_sync(h1, h0))
         split.addWidget(self.graphics)
 
         self.psd_plot = pg.PlotWidget()
@@ -1045,6 +1072,10 @@ class LiveViewer(QtWidgets.QMainWindow):
         self.psd_plot.setTitle("Power Spectral Density (RX1)")
         self.diff_chk.setEnabled(False)
         self.diff_chk.setToolTip("RX1-RX2 diff requires two channels")
+        self.specplots[1].setVisible(False)
+        self.images[1].setVisible(False)
+        if 1 in self.hists:
+            self.hists[1].setVisible(False)
 
     def _controls(self):
         box = QtWidgets.QWidget()
@@ -1532,7 +1563,7 @@ class LiveViewer(QtWidgets.QMainWindow):
             b = self.buffers.get(ch)
             if b is None or b.shape[1] != self._freqs.size:
                 continue
-            lin = 10.0 ** (b.mean(axis=0) / 10.0)     # time-avg PSD, dB -> linear
+            lin = (10.0 ** (b / 10.0)).mean(axis=0)   # linear-domain time average
             band[ch] = 10.0 * np.log10(lin[mask].mean())          # in-band level
             qual[ch] = band[ch] - 10.0 * np.log10(lin.mean())     # vs span avg (RSRQ-ish)
         seg = [f"Band {lo:.3f}–{hi:.3f} MHz ({nb} bins)"]
@@ -1622,6 +1653,8 @@ class LiveViewer(QtWidgets.QMainWindow):
         freqs = self._freqs if self._freqs is not None else self._freqs_mhz()
         b0 = self.buffers.get(0)
         b1 = self.buffers.get(1)
+        if b0 is None:
+            return
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["freq_mhz", "rx1_mean_db", "rx1_max_db",

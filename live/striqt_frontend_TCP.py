@@ -102,15 +102,17 @@ class Receiver(QtCore.QThread):
                 sock = socket.create_connection((self.host, self.port), timeout=5)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self._lock.lock()
-                self._sock = sock
-                if self._pending:
-                    try:
-                        p = json.dumps(self._pending).encode("utf-8")
-                        sock.sendall(struct.pack(">I", len(p)) + p)
-                        self._pending = {}
-                    except Exception:
-                        pass
-                self._lock.unlock()
+                try:
+                    self._sock = sock
+                    if self._pending:
+                        try:
+                            p = json.dumps(self._pending).encode("utf-8")
+                            sock.sendall(struct.pack(">I", len(p)) + p)
+                            self._pending = {}
+                        except Exception:
+                            pass
+                finally:
+                    self._lock.unlock()
                 self.statusChanged.emit(f"connected to {self.host}:{self.port}")
                 while self._running:
                     hlen = struct.unpack(">I", recvall(sock, 4))[0]
@@ -211,6 +213,7 @@ class LiveViewer(QtWidgets.QMainWindow):
 
         self.graphics = pg.GraphicsLayoutWidget()
         titles = {0: "Spectrogram Port 0 -- RX1", 1: "Spectrogram Port 1 -- RX2"}
+        self.hists = {}
         col = 0
         for ch in (0, 1):
             plot = self.graphics.addPlot(row=0, col=col)
@@ -229,7 +232,21 @@ class LiveViewer(QtWidgets.QMainWindow):
             self.graphics.addItem(hist, row=0, col=col + 1)
             self.specplots[ch] = plot
             self.images[ch] = img
+            self.hists[ch] = hist
             col += 2
+
+        self._hist_syncing = False
+
+        def _hist_sync(src, dst):
+            if not self._hist_syncing:
+                self._hist_syncing = True
+                lmin, lmax = src.getLevels()
+                dst.setLevels(lmin, lmax)
+                self._hist_syncing = False
+
+        h0, h1 = self.hists[0], self.hists[1]
+        h0.sigLevelsChanged.connect(lambda: _hist_sync(h0, h1))
+        h1.sigLevelsChanged.connect(lambda: _hist_sync(h1, h0))
         split.addWidget(self.graphics)
 
         self.psd_plot = pg.PlotWidget()
@@ -764,7 +781,7 @@ class LiveViewer(QtWidgets.QMainWindow):
             b = self.buffers.get(ch)
             if b is None or b.shape[1] != self._freqs.size:
                 continue
-            lin = 10.0 ** (b.mean(axis=0) / 10.0)     # time-avg PSD, dB -> linear
+            lin = (10.0 ** (b / 10.0)).mean(axis=0)   # linear-domain time average
             band[ch] = 10.0 * np.log10(lin[mask].mean())          # in-band level
             qual[ch] = band[ch] - 10.0 * np.log10(lin.mean())     # vs span avg (RSRQ-ish)
         seg = [f"Band {lo:.3f}\u2013{hi:.3f} MHz ({nb} bins)"]
@@ -853,6 +870,8 @@ class LiveViewer(QtWidgets.QMainWindow):
         freqs = self._freqs if self._freqs is not None else self._freqs_mhz()
         b0 = self.buffers.get(0)
         b1 = self.buffers.get(1)
+        if b0 is None:
+            return
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["freq_mhz", "rx1_mean_db", "rx1_max_db",

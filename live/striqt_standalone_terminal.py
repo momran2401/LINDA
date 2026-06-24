@@ -364,8 +364,8 @@ def quick_spectrogram(samples, nfft, rows, sample_rate):
         _QUICK_WINDOWS[nfft] = window
     fft_blocks = np.fft.fft(blocks * window[None, None, :], axis=-1)
     fft_blocks = np.fft.fftshift(fft_blocks, axes=-1)
-    mag = np.abs(fft_blocks)
-    db = (20.0 * np.log10(np.maximum(mag, 1e-12))).astype(np.float32)
+    power = (np.abs(fft_blocks) ** 2) / max(float(nfft), 1.0)
+    db = (10.0 * np.log10(power + 1e-20)).astype(np.float32)
     return db, {"backend": "quick", "units": "quick/uncalibrated dB"}
 
 
@@ -793,7 +793,7 @@ def draw_screen(
     else:
         s1 = summaries[0] if summaries else None
         s2 = summaries[1] if summaries and len(summaries) > 1 else None
-        if s1 and s2:
+        if s1 and s2 and s1["peak_freq"] is not None and s2["peak_freq"] is not None:
             delta = None
             if s1["peak_power"] is not None and s2["peak_power"] is not None:
                 delta = s1["peak_power"] - s2["peak_power"]
@@ -1054,7 +1054,7 @@ def main():
         center=float(args.center_mhz) * 1e6,
         sample_rate=float(args.rate_msps) * 1e6,
         gain=float(args.gain),
-        nfft=clamp_int(args.nfft, min(NFFTS), max(NFFTS)),
+        nfft=min(NFFTS, key=lambda x: abs(x - args.nfft)),
         rows=clamp_int(args.rows, 1, 200),
     )
     target_fps = min(max(float(args.fps), 0.5), 10.0)

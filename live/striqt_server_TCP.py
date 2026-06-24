@@ -19,6 +19,13 @@ import numpy as np
 
 from striqt.sensor import specs
 from striqt.sensor.lib.sources.deepwave import Air8201BSourceSpec, Airstack1Source
+try:
+    from striqt.sensor.lib.sources.soapy import ReceiveStreamError
+except Exception:
+    try:
+        from striqt.sensor.lib.sources.base import ReceiveStreamError
+    except Exception:
+        ReceiveStreamError = OSError
 
 # Calibrated spectrogram backend (striqt.analysis). Imported defensively so the
 # default "quicklook" path keeps working even if the analysis package fails to
@@ -93,6 +100,7 @@ class SharedConfig:
         valid = {"center", "sample_rate", "gain", "nfft", "rows"}
 
         with self._lock:
+            changed = False
             for key, value in update.items():
                 if key not in valid:
                     continue
@@ -102,9 +110,14 @@ class SharedConfig:
                 else:
                     value = float(value)
 
-                setattr(self._cfg, key, value)
+                if getattr(self._cfg, key) == value:
+                    continue
 
-            self._dirty = True
+                setattr(self._cfg, key, value)
+                changed = True
+
+            if changed:
+                self._dirty = True
 
     def take_dirty(self):
         with self._lock:
@@ -364,6 +377,13 @@ def calibrated_spectrogram(samples, nfft, rows, sample_rate):
     # Guarantee the (channels, rows, nfft) wire contract regardless.
     if spg.shape[1] != rows:
         spg = spg[:, -rows:, :]
+        if spg.shape[1] < rows:
+            fill = float(spg.min()) if spg.shape[1] > 0 else -200.0
+            pad = np.full(
+                (spg.shape[0], rows - spg.shape[1], spg.shape[2]),
+                fill, dtype=np.float32,
+            )
+            spg = np.concatenate([pad, spg], axis=1)
     if spg.shape[2] != nfft:
         raise RuntimeError(
             f"calibrated spectrogram freq bins {spg.shape[2]} != nfft {nfft}; "
@@ -492,18 +512,39 @@ class Acquirer(threading.Thread):
                 if dirty:
                     cfg = new_cfg
                     self.rearm(cfg)
+                    read_size = min(self.stream_mtu or READ_SIZE, READ_SIZE)
+                    tmp = np.empty((len(CHANNELS), read_size), dtype=np.complex64)
+                    buffers, _ = stream_buffers_for(self.source, tmp)
+
+                if self.source is None:
+                    time.sleep(0.1)
+                    continue
 
                 # Read a full chunk (READ_SIZE / stream MTU bound) each pass and
                 # let db_spectrogram() slice the last rows*nfft samples from it.
                 count = read_size
 
-                got, _ = self.source._read_stream(
-                    buffers,
-                    offset=0,
-                    count=count,
-                    timeout_sec=count / cfg.sample_rate + 0.1,
-                    on_overflow="log",
-                )
+                try:
+                    got, _ = self.source._read_stream(
+                        buffers,
+                        offset=0,
+                        count=count,
+                        timeout_sec=count / cfg.sample_rate + 0.1,
+                        on_overflow="log",
+                    )
+                except (ReceiveStreamError, OverflowError, OSError) as e:
+                    print(f"stream error: {e}; attempting recovery")
+                    try:
+                        close_source(self.source)
+                        self.source = None
+                        self.open_radio(cfg)
+                        read_size = min(self.stream_mtu or READ_SIZE, READ_SIZE)
+                        tmp = np.empty((len(CHANNELS), read_size), dtype=np.complex64)
+                        buffers, _ = stream_buffers_for(self.source, tmp)
+                    except Exception as recover_err:
+                        print(f"recovery failed: {recover_err}; retrying in 1.0s")
+                        time.sleep(1.0)
+                    continue
 
                 if got <= 0:
                     time.sleep(0.001)
