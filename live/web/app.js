@@ -543,7 +543,11 @@ function drawPsdOverlays(u) {
 function applyYspan() {
     if (!uplot) return;
     if (psdYspan === null) {
-        uplot.scales.y.auto = true;
+        // uPlot normalizes scale.auto into a function (fnOrSelf) at construction
+        // and *calls* it as auto(self, resetScales) on every rescale. Assigning a
+        // bare boolean here makes uPlot throw "e.auto is not a function" on the
+        // next draw and the plot never paints — so always assign a function.
+        uplot.scales.y.auto = () => true;
         return;
     }
     // Find highest displayed value across all visible curves and lock a span
@@ -557,7 +561,7 @@ function applyYspan() {
     }
     if (peak !== null) {
         const head = psdYspan * 0.05;
-        uplot.scales.y.auto = false;
+        uplot.scales.y.auto = () => false;
         uplot.setScale("y", { min: peak - psdYspan + head, max: peak + head });
     }
 }
@@ -849,8 +853,8 @@ document.getElementById("abs-rf").addEventListener("change", (e) => {
 
 document.getElementById("reset-btn").addEventListener("click", () => {
     if (uplot) {
-        uplot.scales.x.auto = true;
-        uplot.scales.y.auto = true;
+        uplot.scales.x.auto = () => true;
+        uplot.scales.y.auto = () => true;
     }
 });
 
@@ -888,7 +892,7 @@ document.getElementById("cross-chk").addEventListener("change", (e) => {
 document.getElementById("yspan-sel").addEventListener("change", (e) => {
     psdYspan = e.target.value === "auto" ? null : parseFloat(e.target.value);
     if (psdYspan === null && uplot) {
-        uplot.scales.y.auto = true;
+        uplot.scales.y.auto = () => true;
     }
 });
 

@@ -843,8 +843,9 @@ async def _broadcaster():
     fans it out to all connected WebSocket clients. Dropped connections are
     pruned from the set.
     """
-    interval = 1.0 / max(BROADCAST_FPS, 1)
-    last_t   = 0.0
+    interval   = 1.0 / max(BROADCAST_FPS, 1)
+    last_t     = 0.0
+    last_diag  = 0.0   # throttle the heartbeat log to ~once/sec
 
     while True:
         await asyncio.sleep(interval)
@@ -854,7 +855,15 @@ async def _broadcaster():
 
         # latest() is fast (threading.Lock + numpy copy) — no executor needed
         header, blocks = _acquirer.latest()
+
+        now    = time.time()
+        diag   = now - last_diag > 1.0   # throttled heartbeat this tick?
+        if diag:
+            last_diag = now
+
         if header is None:
+            if diag:
+                print(f"[ws] tick: latest()=None (no frame yet)  clients={len(_connections)}")
             continue
         frame_t = header.get("time", 0.0)
         if frame_t == last_t:
@@ -868,12 +877,27 @@ async def _broadcaster():
             continue
 
         dead = set()
+        sent = 0
         for ws in list(_connections):
             try:
                 await ws.send_bytes(msg)
-            except Exception:
+                sent += 1
+            except Exception as e:
+                print(f"[ws] send failed, dropping client: {e}")
                 dead.add(ws)
-        _connections -= dead
+
+        if diag:
+            print(
+                f"[ws] tick: frame t={frame_t:.3f}  blocks={len(blocks)}  "
+                f"bytes={len(msg)}  sent={sent}/{len(_connections)}"
+            )
+        # NOTE: mutate in place. Using `_connections -= dead` here rebinds the
+        # name, which (with no `global` decl) makes `_connections` a function
+        # local for the WHOLE function — so the `if not _connections:` read at
+        # the top of the loop raises UnboundLocalError on the first tick and the
+        # broadcaster task dies silently, sending zero frames. (This was the bug.)
+        if dead:
+            _connections.difference_update(dead)
 
 
 @app.websocket("/ws")
