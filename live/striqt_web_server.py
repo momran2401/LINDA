@@ -96,6 +96,8 @@ DEFAULT_ROWS        = 12      # rows per frame (window_ms drives this from brows
 
 MASTER_CLOCK_RATE   = 125e6
 READ_SIZE           = 1 << 18   # max IQ samples per _read_stream call (262144)
+MAX_TAIL            = 1 << 22   # per-channel ring buffer capacity (4M samples)
+DATA_STALE_SEC      = 1.0       # get_latest() returns None if the ring is older
 
 BROADCAST_FPS       = 15        # default max frames/sec to browsers
 SCROLL_ROWS         = 12        # rows per frame in Cool (scroll/waterfall) mode
@@ -319,7 +321,7 @@ def db_spectrogram(samples: np.ndarray, nfft: int, rows: int) -> np.ndarray:
     else:
         samples = samples[:, -needed:]
     x      = samples.reshape(samples.shape[0], rows, nfft)
-    window = np.hann(nfft).astype(np.float32)
+    window = np.hanning(nfft).astype(np.float32)
     x      = x * window[None, None, :]
     spec   = np.fft.fftshift(np.fft.fft(x, axis=-1), axes=-1)
     # Normalize by window power (proper PSD estimate)
@@ -397,9 +399,14 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig) -> np.ndarray:
 
 class Acquirer(threading.Thread):
     """
-    Reads raw IQ from the AIR8201B into a ring buffer, computes spectrogram
-    blocks, and stores the latest frame in a single-slot newest-wins slot.
-    The broadcaster reads latest() at BROADCAST_FPS to fan out to all clients.
+    Drains raw IQ from the AIR8201B into a per-channel ring buffer in a tight
+    read loop (no spectrogram math here). The separate Computer thread pulls the
+    latest samples via get_latest(), computes blocks, and calls publish(); the
+    broadcaster reads latest() at BROADCAST_FPS to fan out to all clients.
+
+    Keeping compute off this loop is what prevents DMA overflow: while a frame is
+    being computed, _read_stream keeps draining the radio. This mirrors the
+    Acquirer/LocalReceiver split in striqt_standalone.py.
     """
 
     def __init__(self, shared: SharedConfig):
@@ -408,15 +415,26 @@ class Acquirer(threading.Thread):
         self.source       = None
         self.stream_mtu   = None
         self.stream_ports = CHANNELS
-        self._lock            = threading.Lock()
+
+        # Latest computed-frame slot (written by Computer, read by broadcaster).
+        self._pub_lock        = threading.Lock()
         self._latest_header   = None
         self._latest_blocks   = None
 
-    # --- Public interface (thread-safe) ---
+        # Raw IQ ring buffer (complex64). One write pointer + sample count shared
+        # across channels since every read fills all channels equally.
+        self._lock        = threading.Lock()
+        self._ring        = np.zeros((len(CHANNELS), MAX_TAIL), dtype=np.complex64)
+        self._write       = 0      # next write index (mod MAX_TAIL)
+        self._count       = 0      # total samples written (saturates at MAX_TAIL)
+        self._last_write  = 0.0
+        self._healthy     = False
+
+    # --- Latest-frame slot (thread-safe) ---
 
     def latest(self):
         """Return (header_dict, [block_array, ...]) of the most recent frame."""
-        with self._lock:
+        with self._pub_lock:
             if self._latest_header is None:
                 return None, None
             return dict(self._latest_header), [b.copy() for b in self._latest_blocks]
@@ -432,9 +450,72 @@ class Acquirer(threading.Thread):
             "channels": list(CHANNELS),
             "time":     time.time(),
         }
-        with self._lock:
+        with self._pub_lock:
             self._latest_header = header
             self._latest_blocks = [np.asarray(b, dtype=np.float32) for b in blocks]
+
+    # --- Ring buffer (thread-safe; ported from striqt_standalone.py) ---
+
+    def _clear_ring_locked(self):
+        self._write      = 0
+        self._count      = 0
+        self._last_write = 0.0
+        self._healthy    = False
+
+    def _ring_write(self, iq):
+        """Append raw IQ (channels, n) into the ring buffer with wraparound."""
+        n = iq.shape[1]
+        if n <= 0:
+            return
+        with self._lock:
+            cap = MAX_TAIL
+            if n >= cap:
+                # Only the newest `cap` samples can survive.
+                self._ring[:, :]  = iq[:, -cap:]
+                self._write       = 0
+                self._count       = cap
+                self._last_write  = time.time()
+                self._healthy     = True
+                return
+            end = self._write + n
+            if end <= cap:
+                self._ring[:, self._write:end] = iq
+            else:
+                first = cap - self._write
+                self._ring[:, self._write:] = iq[:, :first]
+                self._ring[:, : n - first]  = iq[:, first:]
+            self._write      = end % cap
+            self._count      = min(self._count + n, cap)
+            self._last_write = time.time()
+            self._healthy    = True
+
+    def get_latest(self, n):
+        """
+        Return the most recent `n` complex samples per channel, shape
+        (channels, n) complex64, chronological (oldest -> newest). Front-padded
+        with zeros if fewer than `n` exist. Returns None if the ring is empty or
+        stale (so frames never mix old-tuning samples after a retune).
+        """
+        n = int(n)
+        if n <= 0:
+            return None
+        with self._lock:
+            if (not self._healthy or self._count == 0
+                    or time.time() - self._last_write > DATA_STALE_SEC):
+                return None
+            cap   = MAX_TAIL
+            avail = min(self._count, cap)
+            take  = min(n, avail)
+            out   = np.zeros((len(CHANNELS), n), dtype=np.complex64)
+            start = (self._write - take) % cap
+            end   = start + take
+            if end <= cap:
+                out[:, n - take:] = self._ring[:, start:end]
+            else:
+                first = cap - start
+                out[:, n - take:n - take + first] = self._ring[:, start:]
+                out[:, n - take + first:]         = self._ring[:, : take - first]
+        return out
 
     # --- Hardware management ---
 
@@ -458,6 +539,9 @@ class Acquirer(threading.Thread):
         open_stream(self.source)
         self.source.arm_spec(make_capture(cfg))
         enable_stream(self.source, True)
+        # Drop stale samples from the old tuning so they never mix into a frame.
+        with self._lock:
+            self._clear_ring_locked()
         print(
             f"[radio] retune: center {cfg.center/1e6:.2f} MHz, "
             f"{cfg.sample_rate/1e6:.3f} MS/s, gain {cfg.gain:.1f} dB, "
@@ -476,6 +560,8 @@ class Acquirer(threading.Thread):
         if self.source is not None:
             close_source(self.source)
             self.source = None
+        with self._lock:
+            self._clear_ring_locked()
         time.sleep(0.25)
         self.open_radio(cfg)
         return self._make_read_buffers()
@@ -529,17 +615,16 @@ class Acquirer(threading.Thread):
                     time.sleep(0.001)
                     continue
 
+                # Drain-only: push raw IQ into the ring and loop back to read
+                # again immediately. The Computer thread does the spectrogram.
                 iq = tmp[:, :got].copy()
-                try:
-                    blocks = compute_blocks(iq, cfg)
-                    self.publish(cfg, [blocks[i] for i in range(blocks.shape[0])])
-                except Exception as e:
-                    print(f"[compute] error: {e}")
+                self._ring_write(iq)
 
                 now = time.time()
                 if now - last_log > 5.0:
                     print(
                         f"[radio] IQ {iq.shape} {iq.dtype}  "
+                        f"ring {min(self._count, MAX_TAIL)}/{MAX_TAIL}  "
                         f"backend={SPEC_BACKEND}"
                     )
                     last_log = now
@@ -547,6 +632,50 @@ class Acquirer(threading.Thread):
         finally:
             if self.source is not None:
                 close_source(self.source)
+
+
+# ---------------------------------------------------------------------------
+# Compute thread (spectrogram worker, decoupled from the DMA drain)
+# ---------------------------------------------------------------------------
+
+class Computer(threading.Thread):
+    """
+    Pulls the latest raw IQ from the Acquirer's ring buffer, computes the
+    spectrogram, and publishes the frame — all off the DMA drain loop so the
+    radio keeps draining while a frame is being computed. Paced to ~BROADCAST_FPS
+    so it doesn't compute frames the broadcaster would only drop.
+    """
+
+    def __init__(self, acquirer: "Acquirer", shared: SharedConfig):
+        super().__init__(daemon=True)
+        self.acquirer = acquirer
+        self.shared   = shared
+
+    def run(self):
+        interval = 1.0 / max(BROADCAST_FPS, 1.0)
+        next_t   = time.time()
+        while not self.shared.stopped():
+            cfg     = self.shared.snapshot()
+            samples = self.acquirer.get_latest(cfg.nfft * cfg.rows)
+            if samples is None:
+                # Ring empty/stale (startup or just after a retune) — wait.
+                time.sleep(0.03)
+                next_t = time.time()
+                continue
+
+            try:
+                blocks = compute_blocks(samples, cfg)
+                self.acquirer.publish(cfg, [blocks[i] for i in range(blocks.shape[0])])
+            except Exception as e:
+                print(f"[compute] error: {e}")
+
+            # Pace to the broadcast rate; never busy-spin if compute outran it.
+            next_t += interval
+            dt = next_t - time.time()
+            if dt > 0:
+                time.sleep(dt)
+            else:
+                next_t = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +804,7 @@ def serialize_frame(header: dict, blocks: list, quantize: bool = False) -> bytes
 
 # Module-level globals set in main() before uvicorn starts
 _acquirer: "Acquirer | DemoAcquirer | None" = None
+_computer: "Computer | None"                 = None
 _shared:   "SharedConfig | None"             = None
 _quantize: bool                              = False
 _connections: set                            = set()
@@ -682,8 +812,10 @@ _connections: set                            = set()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the acquirer thread and broadcaster on startup; clean up on shutdown."""
+    """Start the acquirer (+ compute) threads and broadcaster; clean up on shutdown."""
     _acquirer.start()
+    if _computer is not None:
+        _computer.start()
     # Give the radio (or demo) a moment to produce the first frame
     await asyncio.sleep(1.2)
     task = asyncio.create_task(_broadcaster())
@@ -697,6 +829,8 @@ async def lifespan(app: FastAPI):
             await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
         except Exception:
             pass
+        if _computer is not None:
+            _computer.join(timeout=3.0)
         _acquirer.join(timeout=3.0)
 
 
@@ -788,7 +922,7 @@ else:
 # ---------------------------------------------------------------------------
 
 def main():
-    global _acquirer, _shared, _quantize, BROADCAST_FPS, SPEC_BACKEND
+    global _acquirer, _computer, _shared, _quantize, BROADCAST_FPS, SPEC_BACKEND
 
     parser = argparse.ArgumentParser(
         description="striqt WebSocket live viewer server",
@@ -826,7 +960,14 @@ def main():
     BROADCAST_FPS = max(args.fps, 0.5)
     _quantize     = args.quantize
     _shared       = SharedConfig()
-    _acquirer     = DemoAcquirer(_shared) if args.demo else Acquirer(_shared)
+    if args.demo:
+        # DemoAcquirer generates synthetic IQ and self-publishes — no DMA to
+        # overflow, so it keeps the inline-compute path and needs no Computer.
+        _acquirer = DemoAcquirer(_shared)
+        _computer = None
+    else:
+        _acquirer = Acquirer(_shared)
+        _computer = Computer(_acquirer, _shared)
 
     try:
         import uvicorn

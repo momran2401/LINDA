@@ -366,7 +366,10 @@ function initUplot(freqs) {
     };
 
     const nfft   = freqs.length;
-    const empty  = Array(9).fill(null);
+    // Each y-series must be an array the same length as the x-axis. uPlot reads
+    // data[i].length on every series, so a bare null throws at construction —
+    // initialize with all-null arrays (rendered as gaps) until the first frame.
+    const empty  = Array.from({ length: 9 }, () => new Array(nfft).fill(null));
     uplot = new uPlot(opts, [Array.from(freqs), ...empty], container);
 
     // Set up band dragging on the uPlot canvas
@@ -442,19 +445,20 @@ function updatePSD(channels, blocks, rows, nfft) {
 
     const freqArr = Array.from(freqsMHz);
 
-    let s1m = mean[0] ? Array.from(mean[0]) : null;
-    let s1x = max[0]  ? Array.from(max[0])  : null;
-    let s2m = mean[1] ? Array.from(mean[1]) : null;
-    let s2x = max[1]  ? Array.from(max[1])  : null;
-    let h1  = (peakHold && holdBuf[0]) ? Array.from(holdBuf[0]) : null;
-    let h2  = (peakHold && holdBuf[1]) ? Array.from(holdBuf[1]) : null;
-    let n1  = (showMin  && minBuf[0])  ? Array.from(minBuf[0])  : null;
-    let n2  = (showMin  && minBuf[1])  ? Array.from(minBuf[1])  : null;
-    let dif = null;
-
-    if (showDiff && s1m && s2m) {
-        dif = s1m.map((v, i) => v - s2m[i]);
-    }
+    // Never hand uPlot a bare null series — it reads data[i].length. Any series
+    // that is toggled off or not yet available becomes a length-nfft array of
+    // nulls, which uPlot renders as gaps (drawing nothing).
+    const gaps = new Array(nfft).fill(null);
+    let s1m = mean[0] ? Array.from(mean[0]) : gaps;
+    let s1x = max[0]  ? Array.from(max[0])  : gaps;
+    let s2m = mean[1] ? Array.from(mean[1]) : gaps;
+    let s2x = max[1]  ? Array.from(max[1])  : gaps;
+    let h1  = (peakHold && holdBuf[0]) ? Array.from(holdBuf[0]) : gaps;
+    let h2  = (peakHold && holdBuf[1]) ? Array.from(holdBuf[1]) : gaps;
+    let n1  = (showMin  && minBuf[0])  ? Array.from(minBuf[0])  : gaps;
+    let n2  = (showMin  && minBuf[1])  ? Array.from(minBuf[1])  : gaps;
+    let dif = (showDiff && mean[0] && mean[1])
+            ? Array.from(mean[0]).map((v, i) => v - mean[1][i]) : gaps;
 
     // Series order: freqs, mean0, max0, mean1, max1, hold0, hold1, min0, min1, diff
     uplot.setData([freqArr, s1m, s1x, s2m, s2x, h1, h2, n1, n2, dif]);
