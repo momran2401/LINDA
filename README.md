@@ -64,10 +64,11 @@ developed and tested on a laptop.
   **striqt** acquisition/analysis library:
 
   ```sh
-  pip install 'striqt @ git+https://github.com/usnistgov/striqt'
+  pip install 'striqt @ git+https://github.com/usnistgov/striqt@2e7696d3cd7c9f710f406b4b83148476ead8c20f'
   ```
 
-  (On the AIR-T, the pixi environment usually provides striqt already.)
+  This pins striqt 0.7.0 to the exact commit verified in the AIR-T's working
+  Pixi environment.
 
 Demo mode needs only Python + the pip packages — no SDR stack at all.
 
@@ -171,6 +172,15 @@ tuning range are greyed out.
   center/rate/gain and analyses. Raw IQ is opt-in; advanced YAML supports
   multi-frequency sweeps. Controls lock while the radio records, all viewers
   see a banner, and live acquisition resumes after Stop, duration, or error.
+  Capture length and the spectrogram/PSD/native-power products are selectable.
+  Output is written transactionally, integrity-checked before finalization, and
+  listed in a recording catalog with guarded downloads.
+- **MEASURE** (DAN) — native striqt RMS/peak channel power, an explicitly
+  thresholded occupancy histogram, calibration provenance and honest units,
+  low-rate PSS/SSS cell-candidate status, rich metadata export, and versioned
+  server-owned analysis presets. A configured calibration file is shown as
+  available to recording but live direct-stream values remain labelled
+  relative until correction is actually applied to that path.
 - **OPS** — the verified-operations trail (every change with its
   validation → readback → verdict stages), service health, and — for admins —
   a live tail of the service journal.

@@ -604,10 +604,11 @@ class Computer(threading.Thread):
     so it doesn't compute frames the broadcaster would only drop.
     """
 
-    def __init__(self, acquirer: "Acquirer", shared: SharedConfig):
+    def __init__(self, acquirer: "Acquirer", shared: SharedConfig, insights=None):
         super().__init__(daemon=True)
         self.acquirer = acquirer
         self.shared   = shared
+        self.insights = insights
         self._last_err_notice = 0.0
 
     def run(self):
@@ -638,6 +639,8 @@ class Computer(threading.Thread):
             try:
                 blocks, meta = compute_blocks(samples, cfg)
                 self.acquirer.publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
+                if self.insights is not None:
+                    self.insights.update(samples, cfg)
                 self.shared.note_good_analysis(cfg)
                 # Data-path proof for the pending verified operation (if any):
                 # a frame of this ring generation actually computed.
@@ -678,9 +681,10 @@ class DemoAcquirer(threading.Thread):
     Exposes the same latest()/publish() interface.
     """
 
-    def __init__(self, shared: SharedConfig):
+    def __init__(self, shared: SharedConfig, insights=None):
         super().__init__(daemon=True)
         self.shared           = shared
+        self.insights         = insights
         self._lock            = threading.Lock()
         self._latest_header   = None
         self._latest_blocks   = None
@@ -769,6 +773,8 @@ class DemoAcquirer(threading.Thread):
             try:
                 blocks, meta = compute_blocks(samples, cfg)
                 self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
+                if self.insights is not None:
+                    self.insights.update(samples, cfg)
                 self.shared.note_good_analysis(cfg)
                 if pending_op is not None:
                     OPERATIONS.stage(pending_op, "data-path",
