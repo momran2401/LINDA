@@ -121,3 +121,30 @@ def test_admin_health_is_rich(server):
     status, body, _ = _req(server, "/health", auth=ADMIN)
     assert status == 200
     assert body["device"]["name"] == "demo"
+
+
+def test_measurement_metadata_and_presets_are_exposed(server):
+    deadline = time.time() + 5
+    body = {}
+    while time.time() < deadline:
+        status, body, _ = _req(server, "/insights", auth=VIEWER)
+        if body.get("channel_power") and body.get("occupancy"):
+            break
+        time.sleep(0.2)
+    assert status == 200
+    assert body["channel_power"]["detectors"] == ["rms", "peak"]
+    assert body["channel_power"]["units"] == "dB relative"
+    assert body["occupancy"]["threshold"] == -80.0
+
+    status, presets, _ = _req(server, "/presets", auth=VIEWER)
+    assert status == 200
+    assert "5g-cell-identification" in {p["id"] for p in presets["presets"]}
+
+
+def test_preset_apply_is_admin_only(server):
+    path = "/presets/spectrum-survey/apply"
+    status, _, _ = _req(server, path, auth=VIEWER, payload={})
+    assert status == 403
+    status, body, _ = _req(server, path, auth=ADMIN, payload={})
+    assert status == 200
+    assert body["preset"] == "spectrum-survey"

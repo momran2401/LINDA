@@ -34,6 +34,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
+from fractions import Fraction
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -49,6 +51,8 @@ from core.constants import BACKENDS, CALIBRATED_GRID_BACKENDS, DEVICE_PROFILES
 from core.dsp import aligned_nfft
 from core.operations import OPERATIONS
 from core.recording import RecordingManager
+from core.insights import InsightService, calibration_status
+from core.presets import PRESETS, public_presets
 from core.serialization import serialize_frame
 from core.shims import seal_open_fds_for_exec
 from core.striqt_compat import _ANALYSIS_OK, _SENSOR_OK
@@ -58,6 +62,7 @@ try:
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import (
         HTMLResponse,
+        FileResponse,
         JSONResponse,
         PlainTextResponse,
         RedirectResponse,
@@ -438,6 +443,7 @@ _connections: set = set()   # ALL clients (broadcast fan-out set)
 _slot_lock = asyncio.Lock() # guards the single-admin slot
 _admin_ws  = None           # the one active admin socket, or None
 _recording = None           # RecordingManager
+_insights  = None           # InsightService
 
 
 @asynccontextmanager
@@ -482,6 +488,13 @@ def _json_safe(obj):
         return [_json_safe(v) for v in obj]
     if isinstance(obj, float) and not math.isfinite(obj):
         return None
+    if isinstance(obj, Fraction):
+        return str(obj)
+    if hasattr(obj, "item"):
+        try:
+            return _json_safe(obj.item())
+        except (TypeError, ValueError):
+            pass
     return obj
 
 
@@ -586,6 +599,7 @@ def current_config():
         "backend": str(cfg.backend),
         "rows":    int(cfg.rows),
         "lo_null": bool(cfg.lo_null),
+        "calibration": calibration_status(cfg),
     })
 
 
@@ -614,6 +628,35 @@ async def health_endpoint(request: Request):
 async def operations_endpoint():
     """Recent verified-operations history (any authenticated role)."""
     return JSONResponse(_json_safe({"operations": OPERATIONS.recent(50)}))
+
+
+@app.get("/insights")
+async def insights_endpoint():
+    """Latest native striqt power, occupancy, cell, and provenance results."""
+    return JSONResponse(_json_safe(_insights.snapshot()))
+
+
+@app.get("/presets")
+async def presets_endpoint():
+    return JSONResponse(_json_safe({"presets": public_presets()}))
+
+
+@app.post("/presets/{preset_id}/apply")
+async def preset_apply_endpoint(preset_id: str, request: Request):
+    if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
+        return JSONResponse({"error": "admin privileges required"}, status_code=403)
+    if _recording.active():
+        return JSONResponse({"error": "controls are locked while recording"}, status_code=409)
+    preset = PRESETS.get(preset_id)
+    if preset is None:
+        return JSONResponse({"error": "unknown preset"}, status_code=404)
+    try:
+        ack = await asyncio.to_thread(_shared.update, preset["control"])
+        _insights.configure(cell_enabled=preset.get("cell_detection", False))
+        return JSONResponse(_json_safe({"preset": preset_id, "ack": ack,
+                                        "effective": current_config()}))
+    except (ValueError, TypeError, AttributeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 @app.get("/record")
@@ -645,6 +688,29 @@ async def record_stop_endpoint(request: Request):
     if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
     return JSONResponse({"recording": _json_safe(await _recording.stop())}, status_code=202)
+
+
+@app.get("/recordings")
+async def recordings_endpoint():
+    return JSONResponse(_json_safe({"recordings": _recording.catalog()}))
+
+
+@app.get("/recordings/{recording_id:path}/inspect")
+async def recording_inspect_endpoint(recording_id: str):
+    try:
+        return JSONResponse(_json_safe(_recording.inspect(recording_id)))
+    except (ValueError, FileNotFoundError, OSError, zipfile.BadZipFile) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+
+
+@app.get("/recordings/{recording_id:path}/download")
+async def recording_download_endpoint(recording_id: str):
+    try:
+        path = _recording.resolve_catalog_item(recording_id)
+        return FileResponse(path, filename=path.name,
+                            media_type="application/zip")
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
 
 
 @app.post("/config")
@@ -1269,7 +1335,7 @@ else:
 # ---------------------------------------------------------------------------
 
 def main():
-    global _acquirer, _computer, _shared, _quantize, _recording
+    global _acquirer, _computer, _shared, _quantize, _recording, _insights
 
     parser = argparse.ArgumentParser(
         description="striqt WebSocket live viewer server",
@@ -1356,14 +1422,15 @@ def main():
     state.set_fps(args.fps)
     _quantize     = args.quantize
     _shared       = SharedConfig()
+    _insights     = InsightService()
     if is_demo:
         # DemoAcquirer generates synthetic IQ and self-publishes — no DMA to
         # overflow, so it keeps the inline-compute path and needs no Computer.
-        _acquirer = DemoAcquirer(_shared)
+        _acquirer = DemoAcquirer(_shared, _insights)
         _computer = None
     else:
         _acquirer = Acquirer(_shared)
-        _computer = Computer(_acquirer, _shared)
+        _computer = Computer(_acquirer, _shared, _insights)
     health.bind(_acquirer, _shared)
     _recording = RecordingManager(_acquirer, _shared, demo=is_demo)
 

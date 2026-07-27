@@ -79,3 +79,24 @@ def test_record_spec_uses_form_radio_fields_and_raw_iq(tmp_path):
         assert "iq_waveform: {}" in spec
 
     asyncio.run(scenario())
+
+
+def test_record_spec_can_select_products(tmp_path):
+    manager = RecordingManager(FakeAcquirer(), SharedConfig(), demo=False)
+    spec = manager._default_spec({"analyses": ["channel_power"]},
+                                 tmp_path / "capture.zarr.zip")
+    assert "channel_power_time_series:" in spec
+    assert "spectrogram:" not in spec
+    assert "power_spectral_density:" not in spec
+
+
+def test_catalog_resolution_rejects_escape(tmp_path, monkeypatch):
+    import core.recording as recording
+    monkeypatch.setattr(recording, "DEFAULT_RECORDINGS_DIR", tmp_path)
+    manager = RecordingManager(FakeAcquirer(), SharedConfig(), demo=False)
+    try:
+        manager.resolve_catalog_item("../outside.zarr.zip")
+    except ValueError as exc:
+        assert "escapes" in str(exc)
+    else:
+        raise AssertionError("catalog traversal was accepted")

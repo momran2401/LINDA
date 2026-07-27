@@ -1,6 +1,6 @@
 # Python dependencies for the live viewer frontends (live/core + web server).
 # The striqt acquisition/analysis stack is installed separately (see setup.sh):
-#   pip install 'striqt @ git+https://github.com/usnistgov/striqt'
+#   pip install 'striqt @ git+https://github.com/usnistgov/striqt@2e7696d3cd7c9f710f406b4b83148476ead8c20f'
 fastapi>=0.110
 uvicorn[standard]>=0.27
 numpy>=1.24

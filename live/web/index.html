@@ -8,7 +8,7 @@
     <!-- No CDN dependencies: hotspot/ethernet modes run with no internet.
          Fonts fall back to the system stacks declared in style.css; uPlot is
          vendored in web/vendor/ (with a CDN fallback only if it is missing). -->
-    <link rel="stylesheet" href="style.css?v=20260721-8">
+    <link rel="stylesheet" href="style.css?v=20260722-9">
     <link rel="stylesheet" href="vendor/uPlot.min.css">
 </head>
 <body class="mode-pro">
@@ -37,6 +37,7 @@
             <span id="status-text">connecting…</span>
         </span>
         <span id="role-badge" class="role-badge" hidden></span>
+        <span id="calibration-badge" class="role-badge">UNCALIBRATED</span>
 
         <div class="mode-switch" role="group" aria-label="Interface mode">
             <button type="button" class="mode-opt" data-mode="pro">DAN</button>
@@ -59,6 +60,7 @@
     <div class="rail-tabs" role="tablist">
         <div class="rail-tab active" data-tab="display" role="tab">DISPLAY</div>
         <div class="rail-tab pro-only" data-tab="psd" role="tab">PSD</div>
+        <div class="rail-tab pro-only" data-tab="insights" role="tab">MEASURE</div>
         <div class="rail-tab pro-only" data-tab="capture" role="tab">CAPTURE</div>
         <div class="rail-tab pro-only admin-only" data-tab="record" role="tab">RECORD</div>
         <div class="rail-tab" data-tab="ops" role="tab">OPS</div>
@@ -130,10 +132,16 @@
             <label class="record-field">Duration (seconds; blank = until Stop)
                 <input id="record-duration" type="number" min="0.1" step="0.1" placeholder="until Stop">
             </label>
+            <label class="record-field">Capture length (ms)
+                <input id="record-capture-ms" type="number" min="1" step="1" value="20">
+            </label>
             <label class="record-field">Recordings directory
                 <input id="record-directory" type="text">
             </label>
             <label class="record-check"><span>Include raw IQ (large)</span><input id="record-raw-iq" type="checkbox"></label>
+            <label class="record-check"><span>Spectrogram</span><input id="record-analysis-spg" type="checkbox" checked></label>
+            <label class="record-check"><span>PSD statistics</span><input id="record-analysis-psd" type="checkbox" checked></label>
+            <label class="record-check"><span>RMS/peak channel power</span><input id="record-analysis-power" type="checkbox" checked></label>
             <details class="record-advanced">
                 <summary>Advanced raw YAML (multi-frequency sweeps)</summary>
                 <p>Leave blank to use the current live view. A full sweep YAML here replaces the generated spec.</p>
@@ -144,6 +152,29 @@
                 <button id="record-stop" type="button" disabled>■ Stop</button>
             </div>
             <div id="record-status" class="record-summary">idle</div>
+            <h3 class="settings-h">Recording catalog</h3>
+            <button id="record-refresh" type="button">Refresh catalog</button>
+            <div id="record-catalog" class="record-summary">No catalog loaded.</div>
+        </section>
+
+        <section class="rail-panel pro-only" data-panel="insights">
+            <h3 class="settings-h">Measurement provenance</h3>
+            <div id="calibration-summary" class="record-summary">Waiting for metadata…</div>
+            <button id="metadata-export" type="button">Export metadata JSON</button>
+
+            <h3 class="settings-h">Analysis preset</h3>
+            <select id="preset-select"></select>
+            <button id="preset-apply" class="admin-only" type="button">Apply preset</button>
+            <div id="preset-description" class="record-summary"></div>
+
+            <h3 class="settings-h">Native channel power</h3>
+            <div id="power-summary" class="record-summary">Waiting for native RMS/peak results…</div>
+
+            <h3 class="settings-h">Occupancy histogram</h3>
+            <div id="occupancy-summary" class="record-summary">Waiting for histogram…</div>
+
+            <h3 class="settings-h">5G cell candidate</h3>
+            <div id="cell-summary" class="record-summary">Apply the 5G cell-identification preset to enable PSS/SSS detection.</div>
         </section>
 
         <!-- ── PSD panel ────────────────────────────────────────────────── -->
@@ -286,7 +317,7 @@ if (!window.uPlot) {
     document.write('<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"><\/script>');
 }
 </script>
-<script src="app.js?v=20260721-11"></script>
+<script src="app.js?v=20260722-12"></script>
 
 <!-- Rail tab switching (layout only — plain divs, never sends control) -->
 <script>

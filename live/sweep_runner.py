@@ -21,7 +21,9 @@ def run_sweep(spec_path, output, duration=None, should_stop=lambda: False,
         sink=spec.sink.replace(path=str(output), store="directory"))
     started = time.monotonic()
     steps = 0
-    progress("opened")
+    effective_backend = getattr(source.setup_spec, "array_backend", None) if source is not None else getattr(spec.source, "array_backend", None)
+    progress("opened", effective_backend=effective_backend,
+             gapless=bool(getattr(source.setup_spec if source is not None else spec.source, "gapless", False)))
     if source is None:
         resource_context = sensor.open_resources(spec, spec_path)
     else:
@@ -71,6 +73,7 @@ def run_sweep(spec_path, output, duration=None, should_stop=lambda: False,
             resources, yield_values=False, always_yield=True, loop=True)
         try:
             for _ in sweep:
+                step_started = time.monotonic()
                 steps += 1
                 # iterate_sweep is a three-stage acquire/analyze/sink pipeline.
                 # The first durable capture appears after the third yielded
@@ -78,13 +81,24 @@ def run_sweep(spec_path, output, duration=None, should_stop=lambda: False,
                 count = max(0, steps - 2)
                 elapsed = time.monotonic() - started
                 progress("progress", captures=count,
-                         elapsed_s=round(elapsed, 3))
+                         elapsed_s=round(elapsed, 3),
+                         pipeline_step=steps,
+                         step_interval_s=round(step_started - started if steps == 1 else elapsed / steps, 6))
+                # The live AIR-T source is gapless.  A finite recording sweep,
+                # however, performs analysis and sink work between reads.  If
+                # the stream remains enabled during that gap, unread XDMA data
+                # accumulates and the next read overflows.  Quiesce only after
+                # the complete pipeline step; acquire.trigger() re-enables it
+                # for the next finite capture.
+                if source is not None and hasattr(source, "prepare_retrigger"):
+                    source.prepare_retrigger()
                 limit_hit = should_stop() or (duration and elapsed >= duration)
                 if limit_hit and steps >= 3:
                     break
         finally:
             sweep.close()
-    result = {"captures": max(0, steps - 2),
+    result = {"captures": max(0, steps - 2), "pipeline_steps": steps,
+              "effective_backend": effective_backend,
               "elapsed_s": round(time.monotonic() - started, 3)}
     progress("stopped", **result)
     return result

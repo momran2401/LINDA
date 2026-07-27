@@ -701,6 +701,7 @@ async function refreshOps() {
 
 // ── Supervised recording -------------------------------------------------
 let recordingSeeded = false;
+let latestInsights = null;
 
 function updateRecordingUI(rec) {
     if (!rec) return;
@@ -736,6 +737,7 @@ async function loadRecordingPanel() {
     document.getElementById("record-rate").value = (d.sample_rate / 1e6).toFixed(6);
     document.getElementById("record-gain").value = d.gain;
     document.getElementById("record-directory").value = d.directory || "";
+    document.getElementById("record-capture-ms").value = ((d.capture_duration || 0.02) * 1000).toFixed(1);
     const backend = c.backend || "spectrogram";
     document.getElementById("record-summary").textContent =
         `Seeded from live view · ${backend} · spectrogram + PSD + channel power`;
@@ -751,8 +753,14 @@ document.getElementById("record-start")?.addEventListener("click", async () => {
         sample_rate: Number(document.getElementById("record-rate").value) * 1e6,
         gain: Number(document.getElementById("record-gain").value),
         duration: durationText === "" ? null : Number(durationText),
+        capture_duration: Number(document.getElementById("record-capture-ms").value) / 1000,
         directory: document.getElementById("record-directory").value.trim(),
         include_raw_iq: document.getElementById("record-raw-iq").checked,
+        analyses: [
+            document.getElementById("record-analysis-spg").checked ? "spectrogram" : null,
+            document.getElementById("record-analysis-psd").checked ? "psd" : null,
+            document.getElementById("record-analysis-power").checked ? "channel_power" : null,
+        ].filter(Boolean),
         yaml: document.getElementById("record-yaml").value
     };
     const r = await fetch("/record", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
@@ -765,6 +773,110 @@ document.getElementById("record-stop")?.addEventListener("click", async () => {
     const data = await r.json();
     if (data.recording) updateRecordingUI(data.recording);
 });
+
+async function refreshRecordingCatalog() {
+    const r = await fetch("/recordings", {cache: "no-store"});
+    if (!r.ok) return;
+    const rows = (await r.json()).recordings || [];
+    const el = document.getElementById("record-catalog");
+    if (!el) return;
+    el.textContent = "";
+    if (!rows.length) { el.textContent = "No recordings found."; return; }
+    rows.forEach(x => {
+        const row = document.createElement("div");
+        row.textContent = `${x.valid === true ? "✓" : x.valid === false ? "✗" : "…"} ${x.name} · ${(x.bytes / 1048576).toFixed(1)} MiB · ${x.state} `;
+        if (x.state === "complete") {
+            const a = document.createElement("a");
+            a.href = `/recordings/${x.id.split("/").map(encodeURIComponent).join("/")}/download`;
+            a.textContent = "download"; row.appendChild(a);
+        }
+        el.appendChild(row);
+    });
+}
+document.getElementById("record-refresh")?.addEventListener("click", () =>
+    refreshRecordingCatalog().catch(e => logMsg(e.message, "ERROR")));
+
+function lastDetector(values, channel, detector) {
+    const row = values?.[channel]?.[detector];
+    return row?.length ? Number(row[row.length - 1]) : null;
+}
+
+function renderInsights(data) {
+    latestInsights = data;
+    const cal = data.calibration || {};
+    const badge = document.getElementById("calibration-badge");
+    if (badge) {
+        badge.textContent = cal.active ? "CALIBRATED" : cal.available ? "CAL CONFIGURED" : cal.state === "invalid" ? "CAL INVALID" : "UNCALIBRATED";
+        badge.title = cal.message || "";
+    }
+    const csum = document.getElementById("calibration-summary");
+    if (csum) csum.textContent = `${cal.state || "unknown"} · ${cal.message || ""}${cal.name ? `\n${cal.name}\nSHA-256 ${cal.sha256 || "unavailable"}` : ""}`;
+
+    const power = data.channel_power;
+    const pel = document.getElementById("power-summary");
+    if (pel && power) {
+        const lines = power.values.map((_, ch) => {
+            const rms = lastDetector(power.values, ch, 0);
+            const peak = lastDetector(power.values, ch, 1);
+            return `RX${ch + 1}  RMS ${rms?.toFixed(2) ?? "—"} ${power.units}  ·  peak ${peak?.toFixed(2) ?? "—"}  ·  crest ${(peak !== null && rms !== null ? peak-rms : NaN).toFixed(2)} dB`;
+        });
+        pel.textContent = lines.join("\n") + `\n${power.detector_period_s * 1000} ms native detector bins`;
+    }
+    const occ = data.occupancy;
+    const oel = document.getElementById("occupancy-summary");
+    if (oel && occ) {
+        oel.textContent = occ.fraction_above_threshold.map((row, ch) =>
+            `RX${ch + 1}  RMS ${(100 * row[0]).toFixed(1)}%  ·  peak ${(100 * row[1]).toFixed(1)}%`
+        ).join("\n") + `\nFraction of native detector readings ≥ ${occ.threshold} ${occ.power_units}`;
+    }
+    const cell = data.cell;
+    const cel = document.getElementById("cell-summary");
+    if (cel && cell) cel.textContent = cell.error ? `Unavailable: ${cell.error}` :
+        `${cell.persistent ? "Persistent candidate" : cell.detected ? "Candidate — awaiting persistence" : "No persistent candidate"}\nNID2 ${cell.nid2 ?? "—"} · PSS peak/median ${cell.pss_peak_to_median?.toFixed(2) ?? "—"} · hits ${cell.consecutive_hits || 0}/3\n${cell.physical_cell_id == null ? "PCI pending unambiguous NID1 coordinate metadata" : `PCI ${cell.physical_cell_id}`}`;
+}
+
+async function refreshInsights() {
+    const r = await fetch("/insights", {cache: "no-store"});
+    if (r.ok) renderInsights(await r.json());
+}
+
+let analysisPresets = [];
+async function loadPresets() {
+    const r = await fetch("/presets", {cache: "no-store"});
+    if (!r.ok) return;
+    analysisPresets = (await r.json()).presets || [];
+    const select = document.getElementById("preset-select");
+    if (!select) return;
+    select.textContent = "";
+    analysisPresets.forEach(p => {
+        const opt = document.createElement("option"); opt.value = p.id; opt.textContent = p.label; select.appendChild(opt);
+    });
+    select.dispatchEvent(new Event("change"));
+}
+document.getElementById("preset-select")?.addEventListener("change", e => {
+    const p = analysisPresets.find(x => x.id === e.target.value);
+    const el = document.getElementById("preset-description");
+    if (el) el.textContent = p?.description || "";
+});
+document.getElementById("preset-apply")?.addEventListener("click", async () => {
+    const id = document.getElementById("preset-select").value;
+    const r = await fetch(`/presets/${encodeURIComponent(id)}/apply`, {method: "POST"});
+    const data = await r.json();
+    if (!r.ok) return logMsg(`Preset failed: ${data.error || r.status}`, "ERROR");
+    logMsg(`Preset ${id} applied`);
+    await loadSchema();
+});
+document.getElementById("metadata-export")?.addEventListener("click", () => {
+    if (!latestInsights) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(latestInsights, null, 2)], {type: "application/json"}));
+    a.download = `striqt_metadata_${Date.now()}.json`; a.click(); URL.revokeObjectURL(a.href);
+});
+document.querySelector('.rail-tab[data-tab="insights"]')?.addEventListener("click", () => {
+    refreshInsights(); loadPresets();
+});
+setInterval(refreshInsights, 2000);
+setTimeout(() => { refreshInsights(); loadPresets(); }, 900);
 
 // ── Service journal tail (admin only): journalctl over /ws/logs ──────────
 let journalWs = null;
@@ -2504,6 +2616,12 @@ async function loadSchema(seed = null) {
         }
     }
     renderSettings(schema, effSeed);
+    // The live /config response is only a form seed.  It must not become a
+    // hidden sweep overlay: if the page loaded at 1955 MHz and was later tuned
+    // to 3700 MHz, applying a gain edit would otherwise merge the stale hidden
+    // 1955 MHz center back into the control payload.  Only an explicitly
+    // uploaded sweep JSON is allowed to preserve hidden capture/source fields.
+    if (seed === null) hiddenSweepSettings = {};
 }
 
 document.getElementById("settings-apply").addEventListener("click", () => {

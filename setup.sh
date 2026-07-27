@@ -39,6 +39,7 @@ AUTOSTART="yes"
 HOTSPOT_SSID="radio-viewer"
 HOTSPOT_PASS=""
 INSTALL_STRIQT="ask"
+STRIQT_COMMIT="2e7696d3cd7c9f710f406b4b83148476ead8c20f"  # v0.7.0; verified on the radio
 ASSUME_DEFAULTS=0
 DEPS_ONLY=0
 
@@ -107,9 +108,9 @@ install_python_deps() {
     "$REPO_ROOT/.venv/bin/pip" install --upgrade pip -q
     "$REPO_ROOT/.venv/bin/pip" install -q -r "$REPO_ROOT/live/requirements.txt"
     if [[ "$INSTALL_STRIQT" != "no" ]]; then
-        say "Installing striqt (acquisition/analysis library) — may take a while…"
+        say "Installing radio-verified striqt 0.7.0 (commit ${STRIQT_COMMIT}) — may take a while…"
         "$REPO_ROOT/.venv/bin/pip" install -q \
-            'striqt @ git+https://github.com/usnistgov/striqt' \
+            "striqt @ git+https://github.com/usnistgov/striqt@${STRIQT_COMMIT}" \
             || warn "striqt install failed — --demo mode still works; on the AIR-T use its pixi env instead"
     fi
     # Offline plot assets: the repo vendors uPlot; restore it when missing so

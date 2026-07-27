@@ -41,6 +41,48 @@ class RecordingManager:
     def active(self):
         return self._status.get("state") in {"starting", "recording", "stopping"}
 
+    def catalog(self, limit=100):
+        """Read-only recording inventory; never opens more than ZIP metadata."""
+        root = DEFAULT_RECORDINGS_DIR
+        rows = []
+        if not root.exists():
+            return rows
+        paths = sorted(root.rglob("*.zarr.zip"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in paths[:max(1, min(int(limit), 500))]:
+            state_name = "partial" if ".partial.zarr.zip" in path.name else "complete"
+            item = {"path": str(path), "name": path.name,
+                    "id": str(path.relative_to(root)),
+                    "state": state_name, "bytes": path.stat().st_size,
+                    "modified_at": path.stat().st_mtime, "valid": None}
+            if state_name == "complete":
+                try:
+                    with zipfile.ZipFile(path) as archive:
+                        item["entries"] = len(archive.infolist())
+                        item["valid"] = archive.testzip() is None
+                except (OSError, zipfile.BadZipFile):
+                    item["valid"] = False
+            rows.append(item)
+        return rows
+
+    def resolve_catalog_item(self, recording_id):
+        root = DEFAULT_RECORDINGS_DIR.resolve()
+        candidate = (root / str(recording_id)).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError("recording path escapes the catalog root")
+        if not candidate.is_file() or not candidate.name.endswith(".zarr.zip"):
+            raise FileNotFoundError("recording not found")
+        return candidate
+
+    def inspect(self, recording_id):
+        path = self.resolve_catalog_item(recording_id)
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            return {"id": str(path.relative_to(DEFAULT_RECORDINGS_DIR.resolve())),
+                    "bytes": path.stat().st_size, "valid": archive.testzip() is None,
+                    "entries": len(infos),
+                    "members": [i.filename for i in infos[:500]]}
+
     def defaults(self):
         cfg = self.shared.snapshot()
         # Rolling live view intentionally uses duration=0 (12-row chunks), but
@@ -70,18 +112,26 @@ class RecordingManager:
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             radio_id = str(request.get("radio_id") or state.DEVICE).replace("/", "_")
             output = directory / radio_id / f"{stamp}.zarr.zip"
+            # Keep the final `.zip` suffix: this striqt release selects its ZIP
+            # wrapper from the path suffix even though the inner Zarr store is
+            # configured as a directory.
+            working = output.with_name(output.name.removesuffix(".zarr.zip")
+                                       + ".partial.zarr.zip")
             output.parent.mkdir(parents=True, exist_ok=True)
             if output.exists():
                 raise FileExistsError(f"recording output already exists: {output}")
+            if working.exists():
+                raise FileExistsError(f"recording work output already exists: {working}")
             op_id = OPERATIONS.begin("record", f"record sweep to {output}")
             self._stop = asyncio.Event()
             self._thread_stop = threading.Event()
             self._status = {"state": "starting", "op_id": op_id,
                             "output": str(output), "started_at": time.time(),
+                            "working_output": str(working),
                             "duration": duration, "captures": 0, "elapsed_s": 0.0,
                             "phase": "releasing the live radio"}
             self._task = asyncio.create_task(
-                self._run(request, output, duration, op_id), name="radio-recording")
+                self._run(request, output, working, duration, op_id), name="radio-recording")
             return self.status()
 
     async def stop(self):
@@ -106,6 +156,8 @@ class RecordingManager:
         center = float(request.get("center_frequency", cfg.center))
         sample_rate = float(request.get("sample_rate", cfg.sample_rate))
         gain = float(request.get("gain", cfg.gain))
+        requested_analyses = set(request.get("analyses") or
+                                 ("spectrogram", "psd", "channel_power"))
         raw = "\n  iq_waveform: {}" if request.get("include_raw_iq") else ""
         freq_res = sample_rate / max(aligned_nfft(int(cfg.nfft)), 1)
         capture_duration = max(
@@ -117,6 +169,29 @@ class RecordingManager:
         binding = "noise" if self.demo else (state.DEVICE if state.DEVICE.startswith("air") else "air8201b")
         source_extra = "\n  num_rx_ports: %d" % len(state.CHANNELS) if self.demo else ""
         capture_extra = "\n    noise_psd: 1e-17" if self.demo else f"\n    center_frequency: {center!r}\n    gain: {gain!r}"
+        analysis_lines = []
+        if "spectrogram" in requested_analyses:
+            analysis_lines.append(f'''  spectrogram:
+    frequency_resolution: {freq_res!r}
+    fractional_overlap: {str(cfg.fractional_overlap)!r}
+    window_fill: {str(cfg.window_fill)!r}
+    window: {json.dumps(cfg.window)}
+    trim_stopband: {str(bool(cfg.trim_stopband)).lower()}''')
+        if "psd" in requested_analyses:
+            analysis_lines.append(f'''  power_spectral_density:
+    frequency_resolution: {freq_res!r}
+    fractional_overlap: {str(cfg.psd_fractional_overlap)!r}
+    window_fill: {str(cfg.psd_window_fill)!r}
+    window: {json.dumps(cfg.psd_window)}
+    trim_stopband: {str(bool(cfg.psd_trim_stopband)).lower()}
+    time_statistic: {json.dumps(list(cfg.psd_time_statistic))}''')
+        if "channel_power" in requested_analyses:
+            analysis_lines.append(f'''  channel_power_time_series:
+    detector_period: 0.01
+    power_detectors: [rms, peak]{raw}''')
+        elif raw:
+            analysis_lines.append("  iq_waveform: {}")
+        analysis_yaml = "\n".join(analysis_lines) or "  iq_waveform: {}"
         return f'''sensor_binding: {binding}
 source:
   master_clock_rate: 125e6
@@ -130,28 +205,13 @@ captures:
     lo_shift: {str(cfg.lo_shift)!r}
     host_resample: {str(bool(cfg.host_resample)).lower()}{capture_extra}
 analysis:
-  spectrogram:
-    frequency_resolution: {freq_res!r}
-    fractional_overlap: {str(cfg.fractional_overlap)!r}
-    window_fill: {str(cfg.window_fill)!r}
-    window: {json.dumps(cfg.window)}
-    trim_stopband: {str(bool(cfg.trim_stopband)).lower()}
-  power_spectral_density:
-    frequency_resolution: {freq_res!r}
-    fractional_overlap: {str(cfg.psd_fractional_overlap)!r}
-    window_fill: {str(cfg.psd_window_fill)!r}
-    window: {json.dumps(cfg.psd_window)}
-    trim_stopband: {str(bool(cfg.psd_trim_stopband)).lower()}
-    time_statistic: {json.dumps(list(cfg.psd_time_statistic))}
-  channel_power_time_series:
-    detector_period: 0.01
-    power_detectors: [rms, peak]{raw}
+{analysis_yaml}
 sink:
   path: {json.dumps(str(output))}
   store: zip
 '''
 
-    async def _run(self, request, output, duration, op_id):
+    async def _run(self, request, output, working, duration, op_id):
         spec_path = None
         terminal = "success"
         detail = "recording completed"
@@ -168,17 +228,26 @@ sink:
             self._status["state"] = "recording"
             self._status["phase"] = "warming up capture → analysis → archive pipeline"
             advanced = str(request.get("yaml") or "").strip()
-            spec_text = advanced or self._default_spec(request, output)
+            spec_text = advanced or self._default_spec(request, working)
             fd, spec_name = tempfile.mkstemp(prefix="radio-record-", suffix=".yaml")
             os.close(fd)
             spec_path = Path(spec_name)
             spec_path.write_text(spec_text, encoding="utf-8")
             if self.demo:
-                await self._run_demo(output, duration, op_id, spec_text)
+                await self._run_demo(working, duration, op_id, spec_text)
             else:
-                await self._run_hardware(spec_path, output, duration, op_id)
-            if not output.is_file() or output.stat().st_size == 0:
+                await self._run_hardware(spec_path, working, duration, op_id)
+            if not working.is_file() or working.stat().st_size == 0:
                 raise RuntimeError("recording finished without a non-empty archive")
+            with zipfile.ZipFile(working) as archive:
+                bad = archive.testzip()
+                if bad:
+                    raise RuntimeError(f"recording archive CRC failed at {bad}")
+                self._status["archive_entries"] = len(archive.infolist())
+            os.replace(working, output)
+            self._status.pop("working_output", None)
+            self._status["bytes"] = output.stat().st_size
+            self._status["validated"] = True
             if self._stop.is_set():
                 detail = "recording stopped by operator"
             elif duration:
@@ -209,9 +278,13 @@ sink:
         def progress(kind, **event):
             if kind == "opened":
                 self._status["phase"] = "acquiring/analyzing the first capture"
+                self._status.update({k: v for k, v in event.items()
+                                     if k in {"effective_backend", "gapless"}})
             elif kind == "progress":
                 self._status.update(captures=event["captures"],
-                                    elapsed_s=event["elapsed_s"])
+                                    elapsed_s=event["elapsed_s"],
+                                    pipeline_steps=event.get("pipeline_step", 0),
+                                    mean_step_s=event.get("step_interval_s"))
                 self._status["phase"] = (
                     "writing captures" if event["captures"]
                     else "first capture is still in the analysis/write pipeline"
