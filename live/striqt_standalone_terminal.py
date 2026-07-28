@@ -11,7 +11,7 @@ Usage:
     python3 live/striqt_standalone_terminal.py                     # AIR8201B
     python3 live/striqt_standalone_terminal.py --demo              # no hardware
     python3 live/striqt_standalone_terminal.py --device pluto
-    python3 live/striqt_standalone_terminal.py --center-mhz 1955 --rate-msps 15.36 \
+    python3 live/striqt_standalone_terminal.py --center-mhz 3750 --rate-msps 15.36 \
             --nfft 1024 --fps 3 --backend quicklook
 
 Keys:
@@ -42,6 +42,13 @@ from core.constants import BACKENDS, NFFT_CHOICES, RATES_HZ    # noqa: E402
 from core.striqt_compat import _ANALYSIS_OK, _SENSOR_OK        # noqa: E402
 
 GRADIENT = " .:-=+*#%@"
+
+# Terminal translation of the web brand lockup (.brand-lockup in web/style.css):
+# a five-bar PSD envelope beside the wordmark, with the device label following
+# it the way .brand-sub sits under the axis rule. Drawn from the GRADIENT
+# vocabulary so it stays pure ASCII — this pane is for dumb SSH terminals, and
+# the lockup's rule and accent colour have no counterpart here.
+BRAND = ".:|:. LINDA  |"
 
 
 class LogBuffer(io.TextIOBase):
@@ -161,7 +168,7 @@ def ui_loop(stdscr, shared, acquirer, fps, logbuf):
 
         cfg = shared.snapshot()
         snap = health.health_snapshot()
-        head1 = (f"{state.DEVICE_LABEL}  {cfg.center/1e6:.3f} MHz  "
+        head1 = (f"{BRAND}  {state.DEVICE_LABEL}  {cfg.center/1e6:.3f} MHz  "
                  f"{cfg.sample_rate/1e6:.2f} MS/s  gain {cfg.gain:.0f} dB  "
                  f"nfft {cfg.nfft}  backend {cfg.backend}")
         age = snap.get("last_frame_age_s")

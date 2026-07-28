@@ -23,7 +23,8 @@
 
 let ws          = null;
 let paused      = false;
-let replaceMode = false;    // Boring Mode (full-window snapshots) vs Cool Mode (fast scroll)
+let replaceMode = true;     // Boring Mode (full-window snapshots) vs Cool Mode (fast scroll)
+                            // — must match the `selected` option on #mode-sel
 let absRF       = true;     // absolute RF freq vs baseband offset
 let autoColor   = true;
 let showDiff    = false;    // RX1−RX2 difference on PSD
@@ -49,7 +50,7 @@ const DENY_MESSAGES = {
 };
 
 // Current frame metadata (updated on each frame)
-let curCenter   = 1955e6;
+let curCenter   = 3750e6;   // = DEFAULT_CENTER in core/constants.py
 let curFs       = 15.36e6;
 let curGain     = null;     // header "gain" (dB) — shown in the applied-config readout
 let radioNfft   = 1024;     // requested radio FFT size (from #nfft-sel); NEVER set from frame headers
@@ -1055,8 +1056,24 @@ const CH_COLORS = [
     { mean: "#4db6ac", max: "#f06292", hold: "rgba(240,98,146,0.45)",
       min: "rgba(77,182,172,0.6)",   dot: "#4db6ac" },
 ];
+// Light-theme counterparts: same hues, darkened until they hold up on a white
+// plot background (#4ea3ff and #ff5252 wash out completely there).
+const CH_COLORS_LIGHT = [
+    { mean: "#1a63c8", max: "#c92f2f", hold: "rgba(201,47,47,0.45)",
+      min: "rgba(26,99,200,0.6)",     dot: "#1a63c8" },
+    { mean: "#3f7fd4", max: "#d95f5f", hold: "rgba(217,95,95,0.45)",
+      min: "rgba(63,127,212,0.6)",    dot: "#3f7fd4" },
+    { mean: "#a06a00", max: "#7b3fa0", hold: "rgba(123,63,160,0.45)",
+      min: "rgba(160,106,0,0.6)",     dot: "#a06a00" },
+    { mean: "#1c7f76", max: "#c04070", hold: "rgba(192,64,112,0.45)",
+      min: "rgba(28,127,118,0.6)",    dot: "#1c7f76" },
+];
+function isLightTheme() {
+    return document.body.classList.contains("light-theme");
+}
 function chColors(i) {
-    return CH_COLORS[i % CH_COLORS.length];
+    const set = isLightTheme() ? CH_COLORS_LIGHT : CH_COLORS;
+    return set[i % set.length];
 }
 
 // Build (or rebuild) the per-channel display: one waterfall pane per header
@@ -1218,13 +1235,21 @@ function renderWfAxis() {
 // PSD (uPlot)
 // ---------------------------------------------------------------------------
 
-const PSD_BG    = "#000000";
-const PSD_FG    = "#8b97a8";
-const PSD_GRID  = "#22262c";
+// Plot chrome is theme-dependent, so it can no longer be constant: read the
+// tokens style.css owns (--plot-bg / --plot-grid / --text-dim) at build time.
+// Dark values are the historical #000000 / #8b97a8 / #22262c.
+function cssToken(name, fallback) {
+    const v = getComputedStyle(document.body).getPropertyValue(name).trim();
+    return v || fallback;
+}
+function psdBg()   { return cssToken("--plot-bg",   "#000000"); }
+function psdFg()   { return cssToken("--text-dim",  "#8b97a8"); }
+function psdGrid() { return cssToken("--plot-grid", "#22262c"); }
 
 // Per-channel PSD trace colors live in CH_COLORS (P3-4); only the two-channel
-// difference trace keeps a dedicated color.
-const DIFF_COL = "#e6e9ef";
+// difference trace keeps a dedicated color (near-white on black, near-black on
+// white).
+function diffCol() { return isLightTheme() ? "#2a323d" : "#e6e9ef"; }
 
 // PSD y-axis label depends on the backend: calibrated/ssb values are band-
 // integrated over one averaged bin (~+8.5 dB vs per-bin); quicklook is per-bin.
@@ -1244,9 +1269,9 @@ const PSD_LEGEND_H = 16;
 function psdAxis(opts) {
     return Object.assign({
         gap:    3,
-        stroke: PSD_FG,
-        ticks:  { stroke: PSD_FG, size: 4 },
-        grid:   { stroke: PSD_GRID },
+        stroke: psdFg(),
+        ticks:  { stroke: psdFg(), size: 4 },
+        grid:   { stroke: psdGrid() },
         font:   "11px Menlo,monospace",
     }, opts);
 }
@@ -1316,7 +1341,7 @@ function buildPsdLegend() {
         el.dataset.series = String(e.i);
         el.title = e.label;
         const swatch = document.createElement("i");
-        swatch.style.background = e.stroke || PSD_FG;
+        swatch.style.background = e.stroke || psdFg();
         const text = document.createElement("span");
         text.textContent = bare ? e.label.replace(/^RX\d+\s+/, "") : e.label;
         el.append(swatch, text);
@@ -1397,14 +1422,14 @@ function initUplot(freqs) {
                       width: 1, dash: [2, 4], show: false });
     });
     if (chans.length === 2) {
-        series.push({ label: "RX1−RX2", stroke: DIFF_COL, width: 2, show: false });
+        series.push({ label: "RX1−RX2", stroke: diffCol(), width: 2, show: false });
     }
 
     const opts = {
         width:  size.width,
         height: size.height,
         title:  `Power Spectral Density (${chans.map((c, i) => rxName(i)).join(" + ")})`,
-        background: PSD_BG,
+        background: psdBg(),
         cursor: {
             show:  true,
             drag:  { x: false, y: false },
@@ -1517,7 +1542,7 @@ function initUplotPsdStats(freqs, stats) {
         width:  size.width,
         height: size.height,
         title:  `Power Spectral Density — striqt statistics (${chans.map((_, i) => `RX${i + 1}`).join(" + ")})`,
-        background: PSD_BG,
+        background: psdBg(),
         cursor: {
             show:  true,
             drag:  { x: false, y: false },
@@ -2060,7 +2085,7 @@ function exportPng() {
     out.width  = W;
     out.height = H;
     const ctx = out.getContext("2d");
-    ctx.fillStyle = PSD_BG;
+    ctx.fillStyle = psdBg();
     ctx.fillRect(0, 0, W, H);
     let x = 0;
     for (const c of canvases) {
@@ -2076,7 +2101,7 @@ function exportPng() {
     const capWinMs = (capDepth * rowHopSamples() / curFs * 1e3).toFixed(0);
     const capFft   = curBackend === "quicklook" ? `${radioNfft}` : `${radioNfft}→${curFftNfft}`;
     const cap = `${ts}  center ${(curCenter / 1e6).toFixed(3)} MHz  span ${(curFs / 1e6).toFixed(2)} MS/s  FFT ${capFft}  window ${capWinMs} ms`;
-    ctx.fillStyle = "#d0d0d0";
+    ctx.fillStyle = isLightTheme() ? "#3a434f" : "#d0d0d0";
     ctx.font      = "11px Menlo,monospace";
     ctx.fillText(cap, 10, H - 8);
 
@@ -2200,6 +2225,24 @@ document.getElementById("abs-rf").addEventListener("change", (e) => {
 // Dark / light theme toggle. Client-only cosmetic preference, persisted in
 // localStorage so it survives reloads and reconnects. Available to every role.
 const THEME_KEY = "striqt-theme";
+// The PSD canvas and the per-channel dots are painted with resolved colour
+// strings, so a token flip alone cannot reach them: rebuild the plot (uPlot has
+// no live background/stroke setter) and re-stroke the dots after the class
+// change. uplotKind = null makes the next frame rebuild the right layout even
+// if the plot is the striqt-statistics variant.
+function repaintThemedGraphics() {
+    (channelList || []).forEach((ch, i) => {
+        const dot = document.querySelector(`#wf-pane-${ch} .dot`);
+        if (!dot) return;
+        dot.style.background = chColors(i).dot;
+        dot.style.boxShadow  = `0 0 6px ${chColors(i).dot}`;
+    });
+    if (typeof uplot !== "undefined" && uplot && freqsMHz) {
+        uplotKind = null;
+        initUplot(freqsMHz);
+    }
+}
+
 function applyTheme(theme) {
     const light = theme === "light";
     document.body.classList.toggle("light-theme", light);
@@ -2210,6 +2253,7 @@ function applyTheme(theme) {
         if (icon)  icon.textContent  = light ? "☀️" : "🌙";
         if (label) label.textContent = light ? "Light" : "Dark";
     }
+    repaintThemedGraphics();
 }
 (function initTheme() {
     let saved = null;

@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import devices, health, state                       # noqa: E402
+from core.constants import DEFAULT_CENTER                      # noqa: E402
 from core.acquisition import Acquirer, Computer, DemoAcquirer  # noqa: E402
 from core.config import SharedConfig                           # noqa: E402
 from core.operations import OPERATIONS                         # noqa: E402
@@ -123,7 +124,7 @@ def main():
     points = ([("center", c, "center") for c in centers]
               + [("sample_rate", r, "fs") for r in rates]
               + [("gain", g, "gain") for g in gains]
-              + [("center", 1955e6, "center"),          # return to defaults
+              + [("center", DEFAULT_CENTER, "center"),  # return to defaults
                  ("sample_rate", 15.36e6 if 15.36e6 <= env["rate_max"] else rates[0], "fs")])
 
     results = []

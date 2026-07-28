@@ -827,6 +827,19 @@ def _login_page(error: str = "") -> str:
            border:1px solid var(--border); border-radius:14px; padding:26px 24px;
            box-shadow:0 12px 48px rgba(0,0,0,0.5); }}
   h1 {{ font-size:19px; margin:0 0 2px; letter-spacing:0.01em; }}
+  /* LINDA lockup, 16px variant — mirrors .brand-lockup--lg in web/style.css:
+     a five-bar PSD envelope and the wordmark standing on one shared axis. */
+  .lockup {{ display:flex; align-items:flex-end; gap:9px; padding-bottom:4px;
+             margin:0 0 18px; border-bottom:1px solid var(--accent); }}
+  .mark {{ display:flex; align-items:flex-end; gap:2px; height:14px; flex:0 0 auto; }}
+  .mark i {{ width:2.5px; background:var(--accent); }}
+  .mark i:nth-child(1) {{ height:5px;  opacity:0.40; }}
+  .mark i:nth-child(2) {{ height:8px;  opacity:0.62; }}
+  .mark i:nth-child(3) {{ height:14px; }}
+  .mark i:nth-child(4) {{ height:7px;  opacity:0.62; }}
+  .mark i:nth-child(5) {{ height:4px;  opacity:0.40; }}
+  .wordmark {{ font-size:16px; font-weight:700; letter-spacing:0.16em;
+               line-height:0.86; color:var(--text); }}
   .sub {{ color:var(--dim); font-size:12px; margin:0 0 20px; }}
   label {{ display:block; font-size:12px; color:var(--dim); margin:14px 0 5px; }}
   input {{ width:100%; padding:10px 12px; background:var(--bg);
@@ -840,6 +853,10 @@ def _login_page(error: str = "") -> str:
           padding:8px 10px; border-radius:8px; font-size:13px; margin:0 0 4px; }}
 </style></head><body>
   <form class="card" method="post" action="/login" autocomplete="off">
+    <div class="lockup">
+      <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      <span class="wordmark">LINDA</span>
+    </div>
     <h1>SDR LIVE Viewer - Div. 675</h1>
     <p class="sub">National Institute of Standards and Technology</p>
     {err_html}
