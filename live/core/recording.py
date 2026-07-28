@@ -41,8 +41,15 @@ class RecordingManager:
     def active(self):
         return self._status.get("state") in {"starting", "recording", "stopping"}
 
-    def catalog(self, limit=100):
-        """Read-only recording inventory; never opens more than ZIP metadata."""
+    def catalog(self, limit=100, *, verify=False):
+        """Read-only recording inventory.
+
+        Reads only each archive's central directory, so cost is independent of
+        recording size. `verify=True` additionally CRC-checks every complete
+        archive, which reads each one end to end — that belongs off the request
+        path; use inspect() for a single recording instead. Without it `valid`
+        stays None, meaning "not checked".
+        """
         root = DEFAULT_RECORDINGS_DIR
         rows = []
         if not root.exists():
@@ -59,7 +66,8 @@ class RecordingManager:
                 try:
                     with zipfile.ZipFile(path) as archive:
                         item["entries"] = len(archive.infolist())
-                        item["valid"] = archive.testzip() is None
+                        if verify:
+                            item["valid"] = archive.testzip() is None
                 except (OSError, zipfile.BadZipFile):
                     item["valid"] = False
             rows.append(item)

@@ -1,3 +1,76 @@
+==============================================================================
+ THE striqt/ DIRECTORY IN THIS REPO IS **NOT** THE striqt THAT RUNS ON THE RADIO
+==============================================================================
+
+setup.sh installs a pinned build:
+
+    striqt @ git+https://github.com/usnistgov/striqt@2e7696d3cd7c9f710f406b4b83148476ead8c20f
+    (v0.7.0 — "verified on the radio"; STRIQT_COMMIT in setup.sh is the source
+     of truth if this file ever drifts)
+
+The vendored `striqt/` subdirectory is a LATER upstream snapshot with a
+substantially different API. It is useful for reading upstream intent, but any
+conclusion about runtime behaviour drawn from it is unreliable, and any code
+written against it fails against what is actually installed.
+
+This has already caused a production bug: `live/sweep_runner.py` called
+`source.prepare_retrigger()` behind a `hasattr()` guard. That method exists only
+in the vendored tree, so on the radio the guard silently skipped the call, the
+RX stream was never quiesced between captures, and every recording overflowed
+after roughly one capture. `live/core/devices/` had the same problem — it
+constructed Pluto/generic-Soapy sources with the vendored `__init__`/`setup()`
+contract, which cannot work on v0.7.0 at all.
+
+To check something against the real API, work from the pinned commit:
+
+    git clone https://github.com/usnistgov/striqt && cd striqt
+    git checkout 2e7696d3cd7c9f710f406b4b83148476ead8c20f
+
+------------------------------------------------------------------------------
+ SENSOR API DIVERGENCE (what live/core depends on)
+------------------------------------------------------------------------------
+
+live/core drives the striqt SOURCE object directly. `live/core/shims.py`
+defines REQUIRED_SOURCE_API and `Acquirer.open_radio` fails loudly if the
+installed build does not provide it.
+
+  purpose                       INSTALLED v0.7.0        vendored striqt/ (newer)
+  ----------------------------- ----------------------- ------------------------
+  arm a capture                 source.arm_spec(cap)    Controller._arm_spec /
+                                                        backend.arm(cap)
+  raw stream read               source._read_stream()   backend.read()
+  the source's own spec         source.setup_spec       source.spec
+                                (cached_property over
+                                 __setup__)
+  source identity               source.id (property)    source.get_id() /
+                                                        Controller.source_id
+  open the RX stream            RxStream.open(dev)      RxStream.setup(dev)
+  construct + configure         Cls.from_spec(spec)     Cls(spec); source.setup()
+                                (one step)              (two steps)
+  quiesce between captures      (none — disable the     source.prepare_retrigger()
+                                 stream via
+                                 RxStream.enable)
+
+Other v0.7.0 facts live/core relies on:
+
+  * SourceBase.__init__ is (reuse_iq=False, **spec_fields). Passing a spec
+    POSITIONALLY binds it to `reuse_iq` and construction fails — always use
+    .from_spec(). SoapySDR device kwargs (e.g. driver=) reach the device only
+    through the _connect() override.
+  * SoapySource.id has an upstream `raise self._device.getHardwareKey()` typo
+    (`raise`, not `return`), and Airstack1Source.id resolves the Jetson eth0 MAC.
+    Non-Deepwave radios must override `id` themselves.
+  * gapless=True forces on_overflow='except' on a capture's first read
+    (sources/base.py read_iq) and __post_init__ rejects receive_retries > 0.
+    Finite/recording sweeps must run with gapless=False — see
+    core.shims.finite_capture_mode.
+  * Air*SourceSpec sets stream_all_rx_ports=True, which is what lets
+    shims.open_stream() call RxStream.open(dev) with no explicit port list.
+
+------------------------------------------------------------------------------
+ ANALYSIS API (striqt.analysis — dumped from the installed build)
+------------------------------------------------------------------------------
+
 ['AnalysisRegistry', 'Capture', 'EvaluationOptions', 'Trigger', 'analyze_by_spec', 'cellular_5g_pss_correlation', 'cellular_5g_pss_sync', 'cellular_5g_ssb_spectrogram', 'cellular_5g_sss_correlation', 'cellular_cyclic_autocorrelation', 'cellular_resource_power_histogram', 'channel_power_histogram', 'channel_power_time_series', 'cyclic_channel_power', 'dBlinmean', 'dBlinsum', 'dBtopow', 'dataarrays', 'dump', 'envtodB', 'envtopow', 'io', 'iq_waveform', 'lib', 'load', 'measurements', 'open_store', 'power_spectral_density', 'powtodB', 'register', 'registry', 'shared', 'source', 'specs', 'spectrogram', 'spectrogram_histogram', 'spectrogram_ratio_histogram', 'typing', 'util']
 def evaluate_spectrogram(
     iq: Array,
