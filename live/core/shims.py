@@ -6,6 +6,7 @@ verbatim from striqt_web_server.py.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 
 import numpy as np
@@ -147,6 +148,126 @@ def stream_buffers_for(source, samples):
     rx    = get_rx_stream(source)
     ports = tuple(getattr(rx, "ports", state.CHANNELS))
     return [samples[state.CHANNELS.index(p)].view(np.float32) for p in ports], ports
+
+
+# ---------------------------------------------------------------------------
+# Source-spec accessors + the finite-capture (recording) mode swap
+#
+# These target the INSTALLED striqt — v0.7.0, pinned by commit in setup.sh —
+# whose source objects expose __setup__/setup_spec/arm_spec/_read_stream. The
+# NEWER striqt snapshot vendored under striqt/ renamed every one of those (see
+# INSTALLED_STRIQT_API.txt). Code written against the vendored tree therefore
+# fails here, so everything below fails LOUDLY on an unexpected API rather than
+# degrading into a silent no-op — which is exactly how the recording overflow
+# bug hid: a hasattr() guard around a method that only exists upstream.
+# ---------------------------------------------------------------------------
+
+#: Attributes live/core drives directly on a striqt source object.
+REQUIRED_SOURCE_API = ("arm_spec", "_read_stream", "setup_spec")
+
+
+def missing_source_api(source):
+    """Names in REQUIRED_SOURCE_API that `source` does not provide.
+
+    A non-empty result means the installed striqt is not the API live/core is
+    written against; the caller should say so plainly instead of waiting for a
+    downstream AttributeError.
+    """
+    return tuple(name for name in REQUIRED_SOURCE_API
+                 if getattr(source, name, None) is None)
+
+
+def get_setup_spec(source):
+    """The immutable source spec this source was opened with (None if absent)."""
+    for name in ("__setup__", "setup_spec", "spec"):
+        spec = getattr(source, name, None)
+        if spec is not None:
+            return spec
+    return None
+
+
+def _set_setup_spec(source, spec):
+    """Rebind the source spec striqt consults at acquire time.
+
+    `setup_spec` is a functools.cached_property over `__setup__`, so the
+    backing attribute and the instance cache have to move together: striqt
+    re-reads `setup_spec` on every read_iq / arm_spec / overlap calculation.
+    """
+    source.__setup__ = spec
+    source.__dict__["setup_spec"] = spec
+    if getattr(source, "setup_spec", None) is not spec:
+        raise RuntimeError(
+            "striqt source spec swap did not take effect — the installed "
+            "striqt does not expose setup_spec the way live/core expects "
+            "(see INSTALLED_STRIQT_API.txt)")
+
+
+def _spec_registry():
+    """striqt's spec → source map, used to resolve source IDs for sink paths."""
+    try:
+        from striqt.sensor.lib.sources import base as _base
+    except Exception:
+        return None, None
+    return getattr(_base, "_source_id_map", None), getattr(_base, "_map_source", None)
+
+
+def _register_source_spec(source, spec):
+    """Make `spec` resolve to `source` in striqt's registry.
+
+    Sink path formatting looks the sweep's source spec up by identity to get a
+    radio ID; a spec striqt has never seen blocks for the lookup timeout and
+    then raises. Any spec handed to a sweep must be registered first.
+    """
+    registry, mapper = _spec_registry()
+    if registry is None:
+        return False
+    if callable(mapper):
+        mapper(spec, source)
+    else:
+        registry[spec] = source
+    return True
+
+
+def _unregister_source_spec(spec):
+    registry, _ = _spec_registry()
+    if registry is not None:
+        registry.pop(spec, None)
+
+
+@contextlib.contextmanager
+def finite_capture_mode(source, *, receive_retries=2):
+    """Run a finite (recording) sweep on a source opened for the gapless live view.
+
+    The live viewer opens the radio with ``gapless=True``. In that mode striqt
+    treats every receive overflow as fatal — a capture's first read uses
+    ``on_overflow='except'`` — and refuses receive retries. But a recording
+    sweep analyzes and archives *between* captures, so unread data piles up in
+    those gaps and the next read overflows by construction. Under gapless that
+    ends the recording after roughly one capture.
+
+    Inside this context the source reports an ordinary finite-capture spec:
+    striqt swallows the expected between-capture overflow and retries a
+    mid-capture one. The live spec is restored on exit, before the viewer
+    resumes, including when the sweep raises.
+
+    Yields the spec now in force (the live one when it was already finite).
+    """
+    live = get_setup_spec(source)
+    if live is None:
+        raise RuntimeError(
+            "striqt source exposes no setup spec — cannot make it safe for "
+            "finite captures (see INSTALLED_STRIQT_API.txt)")
+    if not getattr(live, "gapless", False):
+        yield live
+        return
+    record = live.replace(gapless=False, receive_retries=receive_retries)
+    _register_source_spec(source, record)
+    _set_setup_spec(source, record)
+    try:
+        yield record
+    finally:
+        _set_setup_spec(source, live)
+        _unregister_source_spec(record)
 
 
 def query_device_envelope(source):

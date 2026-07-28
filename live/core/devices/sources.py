@@ -48,52 +48,82 @@ def make_source_spec(device=None, overrides=None):
     return spec_cls(**options)
 
 
+def _hardware_key(source, fallback):
+    """Best-effort SoapySDR hardware key, with a stable fallback."""
+    dev = getattr(source, "_device", getattr(source, "device", None))
+    try:
+        key = dev.getHardwareKey()
+    except Exception:
+        key = None
+    return str(key) if key else fallback
+
+
 if _SENSOR_OK and _SoapySource is not None:
-    class PlutoSource(Airstack1Source):
+    class _NonAirstackSoapySource(Airstack1Source):
         """
-        PlutoSDR adapter (ported from live/legacy/pluto_standalone.py, P3-1).
+        Shared base for non-Deepwave SoapySDR radios (P3-1).
 
-        Subclasses Airstack1Source to reuse all of its striqt stream/arm/read
-        machinery, but overrides __init__ to call SoapySource.__init__ directly.
-        This skips two things in Airstack1Source.__init__ that crash on a Pluto:
-          1. driver='SoapyAIRT'  -- replaced with driver='plutosdr'
-          2. _set_jesd_sysref_delay()  -- AIR-T FPGA register write, absent on Pluto
-        get_id/read_peripherals are overridden because the AirStack versions read
-        the Jetson eth0 MAC and an AirStack-only temperature sensor.
+        Subclasses Airstack1Source to reuse striqt's stream/arm/read machinery
+        while replacing the two things in it that are AIR-T specific and fatal
+        elsewhere:
+          1. driver='SoapyAIRT'        -- replaced with `_soapy_driver`
+          2. _set_jesd_sysref_delay()  -- AIR-T FPGA register write, absent here
+
+        Construct these with ``.from_spec(spec)``, the way the Deepwave adapter
+        does. The installed striqt (v0.7.0) supplies SoapySDR device kwargs ONLY
+        through _connect(); its SourceBase.__init__ signature is
+        ``(reuse_iq=False, **spec_fields)``, so passing a spec positionally binds
+        it to `reuse_iq` and construction fails before the radio is touched.
         """
 
-        def __init__(self, spec, **kwargs):
-            _SoapySource.__init__(self, spec, driver="plutosdr", **kwargs)
+        #: Driver string handed to SoapySDR; bound per subclass.
+        _soapy_driver = "soapy"
+
+        def _connect(self, spec, **kwargs):
+            _SoapySource._connect(self, spec, driver=self._soapy_driver, **kwargs)
+
+        # striqt v0.7.0 reads `source.id` (a cached_property); newer builds call
+        # get_id(). Neither inherited path works here: Airstack1Source resolves
+        # both from the Jetson eth0 MAC, which a Pluto host does not have, and
+        # upstream SoapySource.id has a `raise`/`return` typo. run_sweep looks
+        # the source ID up, so without this a recording dies at startup.
+        @property
+        def id(self):
+            return _hardware_key(self, self._soapy_driver)
 
         def get_id(self):
-            try:
-                return self.device.getHardwareKey()
-            except Exception:
-                return "pluto"
+            return _hardware_key(self, self._soapy_driver)
 
         def read_peripherals(self):
+            # AirStack-only transceiver temperature sensor.
             return {}
 
-    class GenericSoapySource(Airstack1Source):
+    class PlutoSource(_NonAirstackSoapySource):
+        """PlutoSDR adapter (ported from live/legacy/pluto_standalone.py, P3-1)."""
+
+        _soapy_driver = "plutosdr"
+
+    class GenericSoapySource(_NonAirstackSoapySource):
         """
         Best-effort adapter for any other SoapySDR radio: same shape as
-        PlutoSource but with the driver string chosen at construction time
-        (from enumeration). Works wherever the driver tolerates the AirStack
-        spec fields it doesn't implement.
+        PlutoSource but with the driver string chosen from enumeration. Works
+        wherever the driver tolerates the AirStack spec fields it doesn't
+        implement.
         """
 
-        def __init__(self, spec, driver, **kwargs):
-            self._generic_driver = str(driver)
-            _SoapySource.__init__(self, spec, driver=str(driver), **kwargs)
+    def generic_soapy_class(driver):
+        """A GenericSoapySource subclass bound to `driver`.
 
-        def get_id(self):
-            try:
-                return self.device.getHardwareKey()
-            except Exception:
-                return self._generic_driver
-
-        def read_peripherals(self):
-            return {}
+        v0.7.0 builds sources through .from_spec(), which forwards no device
+        kwargs, so the driver string has to live on the class.
+        """
+        safe = "".join(ch if ch.isalnum() else "_" for ch in str(driver))
+        return type(f"GenericSoapySource_{safe}", (GenericSoapySource,),
+                    {"_soapy_driver": str(driver)})
 else:
     PlutoSource = None
     GenericSoapySource = None
+
+    def generic_soapy_class(driver):
+        raise RuntimeError(
+            "striqt SoapySource unavailable — cannot drive a SoapySDR device")

@@ -21,7 +21,8 @@ from .dsp import build_header, compute_blocks, samples_needed
 from .operations import OPERATIONS, verdict_state
 from .shims import (
     _close_rx_stream, close_source, enable_stream, get_stream_mtu, get_stream_ports,
-    get_rx_stream, open_stream, query_device_envelope, stream_buffers_for,
+    get_rx_stream, missing_source_api, open_stream, query_device_envelope,
+    stream_buffers_for,
 )
 from .striqt_compat import ReceiveStreamError, specs
 
@@ -311,6 +312,16 @@ class Acquirer(threading.Thread):
                             if cfg.source_config else ""))
         try:
             self.source = devices.make_source(cfg.source_config)
+            # Fail here, naming the problem, rather than several layers down in
+            # an AttributeError: live/core drives the striqt source object
+            # directly, and those method names differ between striqt releases
+            # (see INSTALLED_STRIQT_API.txt).
+            absent = missing_source_api(self.source)
+            if absent:
+                raise RuntimeError(
+                    f"installed striqt source is missing {', '.join(absent)} — "
+                    f"live/core targets the pinned striqt build; see "
+                    f"INSTALLED_STRIQT_API.txt")
             open_stream(self.source)
             self.source.arm_spec(make_capture(cfg))
             enable_stream(self.source, True)
@@ -365,7 +376,7 @@ class Acquirer(threading.Thread):
         # deactivate/reconfigure/activate can transiently return EBUSY while
         # the kernel releases the prior activation.  Retry activation on the
         # same stream (never rebuild the device); other radios get one attempt.
-        attempts = 6 if state.DEVICE in ("air7101b", "air7201b", "air8201b") else 1
+        attempts = 6 if state.DEVICE in devices.DEEPWAVE_MODELS else 1
         activate_error = None
         for attempt in range(attempts):
             try:
@@ -397,10 +408,35 @@ class Acquirer(threading.Thread):
         buffers, _    = stream_buffers_for(self.source, tmp)
         return read_size, tmp, buffers
 
+    def _resume_rearm(self, cfg: RadioConfig, attempts=None):
+        """Re-arm the existing source after a recording handoff.
+
+        AIR-T keeps one process-lifetime device singleton: close_source()
+        deinitializes its AD9371 management sensors and no reopen inside this
+        process can rebuild them, so a transient failure here must be retried
+        on the SAME source rather than escalated into a close/reopen that would
+        leave the viewer dark until a service restart. Other radios get one
+        attempt and then fall back to a clean reopen.
+        """
+        deepwave = state.DEVICE in devices.DEEPWAVE_MODELS
+        tries = attempts if attempts is not None else (10 if deepwave else 1)
+        for attempt in range(tries):
+            try:
+                self.rearm(cfg, None)
+                return True
+            except Exception as exc:
+                print(f"[radio] resume rearm failed "
+                      f"(attempt {attempt + 1}/{tries}): {exc}")
+                if self._pause_requested.is_set() or self.shared.stopped():
+                    return False
+                if attempt + 1 < tries:
+                    time.sleep(min(0.2 * (attempt + 1), 1.0))
+        return False
+
     def _recover(self, cfg: RadioConfig, reason: str):
         """Close and reopen the radio. Returns new (read_size, tmp, buffers)."""
         print(f"[radio] recovering after: {reason}")
-        if state.DEVICE == "air8201b" and self.source is not None:
+        if state.DEVICE in devices.DEEPWAVE_MODELS and self.source is not None:
             # source.close() deinitializes the AD9371 management sensors for
             # this process. Recover AIR-T by replacing only its RX stream.
             with self._lock:
@@ -449,14 +485,22 @@ class Acquirer(threading.Thread):
                         break
                     cfg = self.shared.snapshot()
                     if self.source is not None:
-                        try:
-                            self.rearm(cfg, None)
+                        if self._resume_rearm(cfg):
                             read_size, tmp, buffers = self._make_read_buffers()
                             continue
-                        except Exception as exc:
-                            print(f"[radio] resume rearm failed: {exc}; reopening")
-                            close_source(self.source)
-                            self.source = None
+                        if state.DEVICE in devices.DEEPWAVE_MODELS:
+                            # Never close an AIR-T here — that would cost the
+                            # AD9371 management sensors for the rest of this
+                            # process. Loop back and keep trying on the same
+                            # open device; the read path's _recover() also
+                            # rebuilds only the RX stream for this family.
+                            print("[radio] keeping the AIR-T device initialized; "
+                                  "retrying from the main loop")
+                            time.sleep(0.5)
+                            continue
+                        print("[radio] reopening the device after resume failure")
+                        close_source(self.source)
+                        self.source = None
                     # AIR-T management sensors can remain unavailable briefly
                     # after another process closes the device. A transient
                     # reopen error must not kill this long-lived thread and

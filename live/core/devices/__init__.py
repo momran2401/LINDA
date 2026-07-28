@@ -14,7 +14,9 @@ import sys
 from .. import state
 from ..striqt_compat import Airstack1Source
 from .base import DeviceAdapter
-from .sources import GenericSoapySource, PlutoSource, make_source_spec
+from .sources import (
+    GenericSoapySource, PlutoSource, generic_soapy_class, make_source_spec,
+)
 
 # SoapySDR driver string → profile name. SoapyAIRT rows are refined to the
 # actual Deepwave model via identify_deepwave(); anything else enumerable
@@ -63,9 +65,9 @@ class PlutoAdapter(DeviceAdapter):
     def create_source(self, source_config=None):
         if PlutoSource is None:
             raise RuntimeError("striqt SoapySource unavailable — cannot drive a PlutoSDR")
-        source = PlutoSource(make_source_spec("pluto", source_config))
-        source.setup()
-        return source
+        # from_spec() connects AND configures in one step on the installed
+        # striqt; there is no separate setup() to call.
+        return PlutoSource.from_spec(make_source_spec("pluto", source_config))
 
 
 class GenericSoapyAdapter(DeviceAdapter):
@@ -78,9 +80,8 @@ class GenericSoapyAdapter(DeviceAdapter):
         if not driver:
             raise RuntimeError("generic soapy adapter needs a driver string "
                                "(select the device via --device auto)")
-        source = GenericSoapySource(make_source_spec("soapy", source_config), driver)
-        source.setup()
-        return source
+        return generic_soapy_class(driver).from_spec(
+            make_source_spec("soapy", source_config))
 
 
 class DemoAdapter(DeviceAdapter):

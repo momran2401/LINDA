@@ -668,13 +668,18 @@ async def record_stop_endpoint(request: Request):
 
 @app.get("/recordings")
 async def recordings_endpoint():
-    return JSONResponse(_json_safe({"recordings": _recording.catalog()}))
+    # Directory walk + stat per archive: off the event loop so a populated
+    # recordings tree can't stall every other client.
+    rows = await asyncio.to_thread(_recording.catalog)
+    return JSONResponse(_json_safe({"recordings": rows}))
 
 
 @app.get("/recordings/{recording_id:path}/inspect")
 async def recording_inspect_endpoint(recording_id: str):
     try:
-        return JSONResponse(_json_safe(_recording.inspect(recording_id)))
+        # CRC-verifies one archive end to end — always in a worker thread.
+        result = await asyncio.to_thread(_recording.inspect, recording_id)
+        return JSONResponse(_json_safe(result))
     except (ValueError, FileNotFoundError, OSError, zipfile.BadZipFile) as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
 

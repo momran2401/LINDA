@@ -10,6 +10,16 @@ in `live/`. The `striqt/` subdirectory is an upstream NIST library (Dr. Dan
 Kuester & Aric Sanders) included as a dependency — treat it as **read-only**
 unless explicitly told otherwise.
 
+> **`striqt/` is NOT the striqt that runs on the radio.** `setup.sh` installs a
+> pinned, radio-verified v0.7.0 (`STRIQT_COMMIT` = `2e7696d`); the vendored
+> directory is a *later* snapshot with a different source API — `arm_spec`,
+> `_read_stream`, `setup_spec`, `RxStream.open`, and one-step `from_spec()`
+> construction all exist only in the installed build. **Never infer runtime
+> behaviour from `striqt/`.** Check `INSTALLED_STRIQT_API.txt` (root) for the
+> divergence table, or read the pinned commit directly. Writing code against
+> the vendored tree has already caused two silent production bugs — see the
+> recording notes below.
+
 ## Architecture (2026-07 refactor)
 
 All radio/DSP/config logic is in the shared package **`live/core/`**; the
@@ -83,6 +93,24 @@ restores the starting configuration afterwards.
 
 The web UI is CDN-free: uPlot is vendored in `live/web/vendor/` (setup.sh
 re-fetches it if missing) so hotspot/ethernet modes work fully offline.
+
+## Recording (Record tab → `core/recording.py` → `sweep_runner.py`)
+
+- The live viewer opens the radio **gapless** (`core/devices/sources.py`), where
+  striqt treats any receive overflow as fatal and forbids receive retries. A
+  recording sweep analyzes and archives *between* captures, so the stream
+  overflows in those gaps by construction. `core.shims.finite_capture_mode()`
+  swaps the source to `gapless=False, receive_retries=2` for the sweep and
+  restores the live spec on exit; `sweep_runner` also disables the RX stream
+  after each pipeline step. Without both, recording dies after ~1 capture.
+- Any spec handed to a sweep must be registered in striqt's spec→source map
+  (`finite_capture_mode` does this) or sink path formatting blocks, then raises.
+- The sweep runs **in-process** on the live source object: AIR-T retains FPGA
+  descriptors for the process lifetime, so a subprocess cannot acquire it.
+- `Acquirer._resume_rearm()` retries on the SAME source for Deepwave models.
+  Never call `close_source()` on an AIR-T to recover — it deinitializes the
+  AD9371 management sensors for the rest of the process and the viewer stays
+  dark until a service restart.
 
 ## Verified operations / Reset Radio
 
