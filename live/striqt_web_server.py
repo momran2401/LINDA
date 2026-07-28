@@ -1153,8 +1153,9 @@ async def _broadcaster():
                 except Exception:
                     pass   # dropped clients are pruned by the frame loop below
 
-        # latest() is fast (threading.Lock + numpy copy) — no executor needed
-        header, blocks = _acquirer.latest()
+        # Copy-on-new-frame only: latest_if_newer skips the (potentially
+        # multi-MB, AHAWI) block copy on the common same-frame tick.
+        header, blocks = _acquirer.latest_if_newer(last_t)
 
         now    = time.time()
         diag   = now - last_diag > 1.0   # throttled heartbeat this tick?
@@ -1163,15 +1164,19 @@ async def _broadcaster():
 
         if header is None:
             if diag:
-                print(f"[ws] tick: latest()=None (no frame yet)  clients={len(_connections)}")
+                print(f"[ws] tick: no new frame  clients={len(_connections)}")
             continue
-        frame_t = header.get("time", 0.0)
-        if frame_t == last_t:
-            continue   # no new frame since last broadcast
-        last_t = frame_t
+        last_t = frame_t = header.get("time", 0.0)
 
         try:
-            msg = serialize_frame(header, blocks, _quantize)
+            # AHAWI captures are always quantized regardless of --quantize: a
+            # float32 multi-segment capture is ~12 MB per message (~70 Mb/s at
+            # the capture cadence) — hostile to the hotspot/tunnel modes for
+            # zero display benefit. The header discloses dtype + scale as
+            # always, and one scale per message IS the per-capture pinned
+            # color contract.
+            msg = serialize_frame(header, blocks,
+                                  _quantize or bool(header.get("ahawi")))
         except Exception as e:
             print(f"[ws] serialize error: {e}")
             continue

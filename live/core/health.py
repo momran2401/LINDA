@@ -53,7 +53,12 @@ def health_snapshot():
 
     header = None
     try:
-        header, _ = _acquirer.latest()
+        # Header only — /health must not copy a multi-MB AHAWI capture just
+        # to read a timestamp.
+        if hasattr(_acquirer, "latest_header"):
+            header = _acquirer.latest_header()
+        else:
+            header, _ = _acquirer.latest()
     except Exception:
         pass
     if header is not None and header.get("time"):

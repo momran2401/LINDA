@@ -123,6 +123,24 @@ class Acquirer(threading.Thread):
                 return None, None
             return dict(self._latest_header), [b.copy() for b in self._latest_blocks]
 
+    def latest_header(self):
+        """Header of the most recent frame WITHOUT copying its blocks."""
+        with self._pub_lock:
+            return dict(self._latest_header) if self._latest_header else None
+
+    def latest_if_newer(self, than: float):
+        """latest(), but (None, None) unless the frame is newer than `than`.
+
+        The broadcaster polls at BROADCAST_FPS and mostly sees the same frame
+        it just sent; copying the blocks before noticing that was ~180 MB/s of
+        pure memcpy with AHAWI's multi-segment captures.
+        """
+        with self._pub_lock:
+            header = self._latest_header
+            if header is None or header.get("time", 0.0) == than:
+                return None, None
+            return dict(header), [b.copy() for b in self._latest_blocks]
+
     def publish(self, cfg: RadioConfig, blocks: list, meta: dict):
         header = build_header(cfg, blocks, meta, demo=False)
         with self._pub_lock:
@@ -713,7 +731,9 @@ class Computer(threading.Thread):
             elif time.time() - self._last_err_notice > 5.0:
                 self.shared.push_notice(f"AHAWI compute error: {e}")
                 self._last_err_notice = time.time()
-            time.sleep(0.25)
+            # A failing full-capture compute is expensive — don't respin
+            # it at 4 Hz; once per capture cadence is plenty.
+            time.sleep(1.0)
             return
         while (time.time() - published < AHAWI_REFRESH_S
                and not self.shared.stopped()):
@@ -832,6 +852,19 @@ class DemoAcquirer(threading.Thread):
                 return None, None
             return dict(self._latest_header), [b.copy() for b in self._latest_blocks]
 
+    def latest_header(self):
+        """Header of the most recent frame WITHOUT copying its blocks."""
+        with self._lock:
+            return dict(self._latest_header) if self._latest_header else None
+
+    def latest_if_newer(self, than: float):
+        """See Acquirer.latest_if_newer — same broadcaster-side copy saver."""
+        with self._lock:
+            header = self._latest_header
+            if header is None or header.get("time", 0.0) == than:
+                return None, None
+            return dict(header), [b.copy() for b in self._latest_blocks]
+
     def _publish(self, cfg: RadioConfig, blocks: list, meta: dict):
         header = build_header(cfg, blocks, meta, demo=True)
         with self._lock:
@@ -851,18 +884,24 @@ class DemoAcquirer(threading.Thread):
         # internally; between chunks time honestly passes.
         pos = round((time.monotonic() - self._t0) * fs)
         self._pos = pos + n
-        idx = pos + np.arange(n, dtype=np.float64)
-        t   = (idx / fs).astype(np.float32)
+        idx = pos + np.arange(n, dtype=np.int64)
         detune = float(DEFAULT_CENTER) - float(cfg.center)
 
+        def tone(amp, off_hz):
+            # Phase as fractional CYCLES mod 1 in float64. Never build an
+            # absolute float32 time axis: its resolution at t=60 s is already
+            # ~4 µs, a 60-radian phase step for a MHz tone — the whole demo
+            # spectrum dissolved into noise within minutes of server uptime.
+            frac = np.mod(idx * (off_hz / fs), 1.0)
+            return (amp * np.exp(2j * np.pi * frac.astype(np.float32))
+                    ).astype(np.complex64)
+
         burst_off = DEMO_BURST["offset_hz"] + detune
-        burst_mask = None
+        burst = None
         if abs(burst_off) <= 0.48 * fs:
             period = max(1, round(DEMO_BURST["period_s"] * fs))
             duty   = max(1, round(DEMO_BURST["duty_s"] * fs))
-            burst_mask = ((idx.astype(np.int64) % period) < duty)
-            burst = (DEMO_BURST["amp"] * np.exp(2j * np.pi * burst_off * t)
-                     ).astype(np.complex64) * burst_mask
+            burst = tone(DEMO_BURST["amp"], burst_off) * ((idx % period) < duty)
 
         chans = []
         for i in range(len(state.CHANNELS)):
@@ -871,9 +910,8 @@ class DemoAcquirer(threading.Thread):
             for amp, offset_hz in tones:
                 off = offset_hz + detune
                 if abs(off) <= 0.48 * fs:
-                    sig += (amp * np.exp(2j * np.pi * off * t)
-                            ).astype(np.complex64)
-            if burst_mask is not None:
+                    sig += tone(amp, off)
+            if burst is not None:
                 sig += burst
             noise = (self._rng.standard_normal(n)
                      + 1j * self._rng.standard_normal(n)
@@ -907,7 +945,9 @@ class DemoAcquirer(threading.Thread):
             reverted = self.shared.revert_analysis(str(e))
             if reverted:
                 print(f"[demo] reverted analysis params: {reverted}")
-            time.sleep(0.25)
+            # A failing full-capture compute is expensive — don't respin
+            # it at 4 Hz; once per capture cadence is plenty.
+            time.sleep(1.0)
             return pending_op
         published = time.time()
         while (time.time() - published < AHAWI_REFRESH_S

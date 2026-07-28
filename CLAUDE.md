@@ -128,10 +128,16 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   drain gap inside the capture (`Acquirer.last_gap_time`); backend fallback is
   disclosed via `backend`/`backend_requested`. AHAWI wraps calibrated/quicklook
   only — PSD/SSB bypass it (client hints instead of silently ignoring).
-- Demo: `DEMO_BURST` is a fake SSB (20 ms period) synthesized with a
-  persistent sample counter, so it honestly swims in Cool mode and pins in
-  AHAWI. `compute_blocks` substitutes quicklook (disclosed) when striqt is
-  absent — a striqt-less host must never freeze in a compute-error loop.
+- AHAWI frames are ALWAYS quantized (uint8 + disclosed scale) regardless of
+  --quantize: a float32 multi-segment capture is ~12 MB per message. The
+  broadcaster copies blocks only for NEW frames (`latest_if_newer`); /health
+  reads `latest_header()` — never copy a capture to read a timestamp.
+- Demo: `DEMO_BURST` is a fake SSB (20 ms period) gated by a wall-clock
+  sample counter, so it honestly swims in Cool mode and pins in AHAWI. Tone
+  phase is computed as fractional cycles mod 1 in float64 — an absolute
+  float32 time axis scrambles MHz-tone phase within a minute of uptime.
+  `compute_blocks` substitutes quicklook (disclosed) when striqt is absent —
+  a striqt-less host must never freeze in a compute-error loop.
 
 ## Recording (Record tab → `core/recording.py` → `sweep_runner.py`)
 
