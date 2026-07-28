@@ -805,9 +805,14 @@ class DemoAcquirer(threading.Thread):
         self._latest_blocks   = None
         self._pause_requested = threading.Event()
         self._paused          = threading.Event()
-        # Running sample counter: tone/burst phase is continuous across frames,
-        # so the periodic demo burst honestly SWIMS in the rolling view and
-        # sits still in AHAWI's aligned replay — same contrast as real SSB.
+        # Wall-clock sample counter: each synth models "the latest n samples
+        # from a radio that never stopped sampling", exactly like the hardware
+        # ring. Advancing by the chunk length instead used to alias the demo
+        # burst stationary in the rolling views whenever the display window
+        # equaled the burst period (20 ms window ≡ 20 ms burst → the burst sat
+        # still in Boring mode too, faking AHAWI's whole point). Samples stay
+        # contiguous WITHIN a chunk — all AHAWI alignment needs.
+        self._t0              = time.monotonic()
         self._pos             = 0
         self._rng             = np.random.default_rng(42)
 
@@ -841,8 +846,11 @@ class DemoAcquirer(threading.Thread):
         continuous across chunks regardless of chunk size.
         """
         fs  = float(cfg.sample_rate)
-        pos = self._pos
-        self._pos += n
+        # Resync to wall clock: the position a continuously-sampling radio
+        # would have reached by now (see __init__). Chunks are contiguous
+        # internally; between chunks time honestly passes.
+        pos = round((time.monotonic() - self._t0) * fs)
+        self._pos = pos + n
         idx = pos + np.arange(n, dtype=np.float64)
         t   = (idx / fs).astype(np.float32)
         detune = float(DEFAULT_CENTER) - float(cfg.center)

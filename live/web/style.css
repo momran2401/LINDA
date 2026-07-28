@@ -756,3 +756,5 @@ body:not(.mode-ahawi) .ahawi-only { display: none !important; }
 .wf-strip { display: block; width: 100%; height: 46px; flex: 0 0 46px;
             background: var(--wf-bg); border-top: 1px solid var(--border);
             cursor: pointer; }
+#ahawi-apply.staged { border-color: var(--accent); color: var(--accent);
+                      box-shadow: 0 0 0 1px var(--accent) inset; }
