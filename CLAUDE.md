@@ -46,8 +46,14 @@ frontend script — fix it once in `live/core/`.**
 
 Frontends: `striqt_web_server.py` (canonical web UI; auth + routes + WS only),
 `striqt_kiosk.py` (web UI fullscreen locally), `striqt_standalone_terminal.py`
-(curses over SSH). **Deprecated, frozen, do not extend:** `striqt_standalone.py`,
-`pluto_standalone.py`, `striqt_server_TCP.py`, `striqt_frontend_TCP.py`.
+(curses over SSH). Every live frontend goes through `live/core/`; the kiosk is
+the standalone (it launches the web server + a fullscreen browser).
+
+**`live/legacy/` is frozen — do not extend or fix.** It holds the four pre-`core`
+scripts (`striqt_standalone.py`, `pluto_standalone.py`, `striqt_server_TCP.py`,
+`striqt_frontend_TCP.py`), each with its own duplicated backend that imports
+`striqt` directly. Nothing imports or launches them. Fix bugs in `live/core/`
+instead — see `live/legacy/README.md`.
 
 ## Running
 
@@ -125,6 +131,13 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 - PSD (uPlot): wheel zoom / drag pan / Shift-drag box zoom / Alt-drag band
   selection / double-click reset; zoom survives frames via
   `setData(data, psdZoomX === null)`.
+- Rail nav is a collapsing tab bar: a 38 px `.rail-strip` names the active tool
+  (label + one tick per visible tab + chevron) and the 3-column `.rail-menu`
+  drops over the panel on hover/click, collapsing again on select. Tabs keep
+  the `.rail-tab[data-tab=…]` hooks app.js binds to and stay plain divs so the
+  read-only guard never blocks them. `.rail-menu` sits at `top: calc(100% - 1px)`
+  so each cell's `border-top` merges with the strip's bottom border instead of
+  double-ruling — that keeps row separators right however many tabs a mode hides.
 - OPS rail tab renders `{"op": ...}` WS events + `/operations` backfill.
 - Waterfall panes are cloned per header `channels`; one channel = full width.
 - Read-only roles: `SAFE_SELECTOR` whitelist in app.js gates what they may touch.

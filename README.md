@@ -311,8 +311,10 @@ deployment:
 ├── live/run_web.sh         manual launcher (optional Cloudflare tunnel)
 └── live/install_radio_web_sudoers.sh   scoped sudo rule for Reset Radio
 
-legacy (frozen, unmaintained): live/striqt_standalone.py,
-live/pluto_standalone.py, live/striqt_server_TCP.py, live/striqt_frontend_TCP.py
+live/legacy/                pre-core scripts, frozen and unlaunched — the two
+                            PyQt standalones and the TCP server/client pair.
+                            Superseded by the kiosk + web server; see
+                            live/legacy/README.md
 
 striqt/                     upstream NIST acquisition/analysis library (READ-ONLY)
 docs/                       audit history + implementation reports
