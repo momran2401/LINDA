@@ -15,9 +15,12 @@ from . import devices, state
 from .config import RadioConfig, SharedConfig
 from .constants import (
     DEVICE_PROFILES, MAX_TAIL, READ_SIZE, DATA_STALE_SEC, DEMO_TONES,
-    DEFAULT_CENTER,
+    DEFAULT_CENTER, DEMO_BURST, AHAWI_REFRESH_S,
 )
-from .dsp import build_header, compute_blocks, samples_needed
+from .dsp import (
+    AHAWI_BACKENDS, ahawi_capture, ahawi_plan, build_header, compute_blocks,
+    samples_needed,
+)
 from .operations import OPERATIONS, verdict_state
 from .shims import (
     _close_rx_stream, close_source, enable_stream, get_stream_mtu, get_stream_ports,
@@ -83,6 +86,11 @@ class Acquirer(threading.Thread):
         self._last_write  = 0.0
         self._healthy     = False
         self._gen         = 0      # bumped on every ring clear (retune/recover) — LV-R5
+        # Wall time of the last suspected drain gap (a zero-sample read while
+        # the stream was healthy — overflow drops surface this way with
+        # on_overflow="log"). AHAWI marks captures overlapping one as
+        # coherent=false instead of pretending.
+        self._last_gap    = 0.0
 
         # Last source_config that demonstrably opened the device — the
         # revert target when a source-spec reconnect fails.
@@ -160,6 +168,10 @@ class Acquirer(threading.Thread):
     def generation(self):
         with self._lock:
             return self._gen
+
+    def last_gap_time(self):
+        """Wall time of the last suspected drain gap (0.0 = none seen)."""
+        return self._last_gap
 
     def get_latest(self, n):
         """
@@ -614,6 +626,8 @@ class Acquirer(threading.Thread):
                     continue
 
                 if got <= 0:
+                    if self._healthy:
+                        self._last_gap = time.time()
                     time.sleep(0.001)
                     continue
 
@@ -655,6 +669,59 @@ class Computer(threading.Thread):
         self.insights = insights
         self._last_err_notice = 0.0
 
+    def _ahawi_cycle(self, cfg):
+        """One AHAWI round: coherent chunk → analyze once → publish → pace.
+
+        Unlike the rolling path (recompute a short window per display tick),
+        this analyzes segments·duration of contiguous IQ in one striqt pass;
+        the CLIENT replays the segments. Publishing is paced to
+        AHAWI_REFRESH_S so replay isn't flooded; a config change breaks the
+        pacing hold early.
+        """
+        plan = ahawi_plan(cfg)
+        need = plan["need_samples"]
+        g0     = self.acquirer.generation()
+        latest = self.acquirer.get_latest(need)
+        if latest is None:
+            time.sleep(0.03)
+            return
+        samples, gen, avail = latest
+        if gen != g0 or avail < need:
+            # Ring not yet coherent across the whole span (startup/retune).
+            time.sleep(0.03)
+            return
+        published = time.time()
+        capture_t0 = published - need / float(cfg.sample_rate)
+        try:
+            blocks, meta = ahawi_capture(samples, cfg, plan)
+            # Honesty about drain gaps: a zero-sample read inside this span
+            # means the "coherent" capture may have a seam.
+            gap = getattr(self.acquirer, "last_gap_time", lambda: 0.0)()
+            meta["ahawi"]["coherent"] = not (capture_t0 <= gap <= published)
+            meta["ahawi"]["capture_t0"] = round(capture_t0, 3)
+            self.acquirer.publish(
+                cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
+            self.shared.note_good_analysis(cfg)
+            self.acquirer.complete_verification(gen)
+        except Exception as e:
+            # Same backstop as the rolling path (P2a-3): revert bad analysis
+            # params, keep the viewer alive, surface the reason.
+            print(f"[compute] ahawi error: {e}")
+            reverted = self.shared.revert_analysis(str(e))
+            if reverted:
+                print(f"[compute] reverted analysis params: {reverted}")
+            elif time.time() - self._last_err_notice > 5.0:
+                self.shared.push_notice(f"AHAWI compute error: {e}")
+                self._last_err_notice = time.time()
+            time.sleep(0.25)
+            return
+        while (time.time() - published < AHAWI_REFRESH_S
+               and not self.shared.stopped()):
+            self.shared.service_probe()
+            if self.shared.snapshot() != cfg:
+                return   # settings changed — replan immediately
+            time.sleep(0.05)
+
     def run(self):
         interval = 1.0 / max(state.BROADCAST_FPS, 1.0)
         next_t   = time.time()
@@ -663,6 +730,10 @@ class Computer(threading.Thread):
             # striqt's thread-bound persistent window cache (P2a-5).
             self.shared.service_probe()
             cfg     = self.shared.snapshot()
+            if cfg.ahawi and cfg.backend in AHAWI_BACKENDS:
+                self._ahawi_cycle(cfg)
+                next_t = time.time()
+                continue
             need    = samples_needed(cfg)
             g0      = self.acquirer.generation()
             latest  = self.acquirer.get_latest(need)
@@ -734,6 +805,11 @@ class DemoAcquirer(threading.Thread):
         self._latest_blocks   = None
         self._pause_requested = threading.Event()
         self._paused          = threading.Event()
+        # Running sample counter: tone/burst phase is continuous across frames,
+        # so the periodic demo burst honestly SWIMS in the rolling view and
+        # sits still in AHAWI's aligned replay — same contrast as real SSB.
+        self._pos             = 0
+        self._rng             = np.random.default_rng(42)
 
     def pause_and_release(self, timeout=10.0):
         self._pause_requested.set()
@@ -757,14 +833,93 @@ class DemoAcquirer(threading.Thread):
             self._latest_header = header
             self._latest_blocks = [np.asarray(b, dtype=np.float32) for b in blocks]
 
+    def _synth_chunk(self, cfg: RadioConfig, n: int) -> np.ndarray:
+        """Synthesize the next n contiguous samples for every channel.
+
+        Fixed STATIONS (tones at absolute RF, P3-2) plus the periodic DEMO_BURST
+        — a fake SSB gated by the running sample counter, so its timing is
+        continuous across chunks regardless of chunk size.
+        """
+        fs  = float(cfg.sample_rate)
+        pos = self._pos
+        self._pos += n
+        idx = pos + np.arange(n, dtype=np.float64)
+        t   = (idx / fs).astype(np.float32)
+        detune = float(DEFAULT_CENTER) - float(cfg.center)
+
+        burst_off = DEMO_BURST["offset_hz"] + detune
+        burst_mask = None
+        if abs(burst_off) <= 0.48 * fs:
+            period = max(1, round(DEMO_BURST["period_s"] * fs))
+            duty   = max(1, round(DEMO_BURST["duty_s"] * fs))
+            burst_mask = ((idx.astype(np.int64) % period) < duty)
+            burst = (DEMO_BURST["amp"] * np.exp(2j * np.pi * burst_off * t)
+                     ).astype(np.complex64) * burst_mask
+
+        chans = []
+        for i in range(len(state.CHANNELS)):
+            tones = DEMO_TONES[i % len(DEMO_TONES)]
+            sig = np.zeros(n, dtype=np.complex64)
+            for amp, offset_hz in tones:
+                off = offset_hz + detune
+                if abs(off) <= 0.48 * fs:
+                    sig += (amp * np.exp(2j * np.pi * off * t)
+                            ).astype(np.complex64)
+            if burst_mask is not None:
+                sig += burst
+            noise = (self._rng.standard_normal(n)
+                     + 1j * self._rng.standard_normal(n)
+                     ).astype(np.complex64) * 0.04
+            chans.append(sig + noise)
+        return np.stack(chans)
+
+    def _ahawi_cycle(self, cfg, pending_op):
+        """Demo AHAWI round: synth one coherent chunk, analyze, publish, pace.
+
+        Returns the still-pending op (None once finished by this frame)."""
+        plan = ahawi_plan(cfg)
+        samples = self._synth_chunk(cfg, plan["need_samples"])
+        try:
+            blocks, meta = ahawi_capture(samples, cfg, plan)
+            meta["ahawi"]["coherent"] = True   # synthesized — no drain to gap
+            meta["ahawi"]["capture_t0"] = round(
+                time.time() - plan["need_samples"] / float(cfg.sample_rate), 3)
+            self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
+            self.shared.note_good_analysis(cfg)
+            if pending_op is not None:
+                OPERATIONS.stage(pending_op, "data-path",
+                                 "first AHAWI capture computed with the new "
+                                 "configuration")
+                OPERATIONS.finish(pending_op, "success",
+                                  "demo apply confirmed by capture frame "
+                                  "(no hardware readback in demo)")
+                pending_op = None
+        except Exception as e:
+            print(f"[demo] ahawi compute error: {e}")
+            reverted = self.shared.revert_analysis(str(e))
+            if reverted:
+                print(f"[demo] reverted analysis params: {reverted}")
+            time.sleep(0.25)
+            return pending_op
+        published = time.time()
+        while (time.time() - published < AHAWI_REFRESH_S
+               and not self.shared.stopped()
+               and not self._pause_requested.is_set()):
+            self.shared.service_probe()
+            if self.shared.snapshot() != cfg:
+                break   # settings changed — replan immediately
+            time.sleep(0.05)
+        return pending_op
+
     def run(self):
-        rng = np.random.default_rng(42)
         last_err_notice = 0.0
         pending_op = None
         print("[demo] Synthetic IQ mode — no radio hardware used.")
         print("[demo] Two CW tones per channel + noise. Controls work normally.")
         print("[demo] Tones are fixed STATIONS near the default center — "
               "retuning moves them across the band like a real signal.")
+        print("[demo] A 20 ms-periodic burst (fake SSB) swims in the rolling "
+              "view and sits still in AHAWI replay.")
 
         interval = 1.0 / max(state.BROADCAST_FPS, 1.0)
         next_t = time.time()
@@ -791,29 +946,15 @@ class DemoAcquirer(threading.Thread):
                 OPERATIONS.stage(op_id, "readback",
                                  "demo device has no driver to query")
                 pending_op = op_id
-            n   = samples_needed(cfg)
-            t   = np.arange(n, dtype=np.float32) / cfg.sample_rate
 
-            # One tone set + noise per channel (P3-2). Tones model fixed
-            # STATIONS at absolute RF (DEFAULT_CENTER + offset), so demo
-            # retunes behave like real hardware: the tones shift across the
-            # band and leave it entirely when tuned far away — the tuning
-            # data-path is therefore actually exercised in demo mode.
-            detune = float(DEFAULT_CENTER) - float(cfg.center)
-            chans = []
-            for i in range(len(state.CHANNELS)):
-                tones = DEMO_TONES[i % len(DEMO_TONES)]
-                sig = np.zeros(n, dtype=np.complex64)
-                for amp, offset_hz in tones:
-                    off = offset_hz + detune
-                    if abs(off) <= 0.48 * cfg.sample_rate:
-                        sig += (amp * np.exp(2j * np.pi * off * t)
-                                ).astype(np.complex64)
-                noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)
-                         ).astype(np.complex64) * 0.04
-                chans.append(sig + noise)
+            if cfg.ahawi and cfg.backend in AHAWI_BACKENDS:
+                pending_op = self._ahawi_cycle(cfg, pending_op)
+                next_t = time.time()
+                continue
 
-            samples = np.stack(chans)
+            # One tone set + noise per channel (P3-2), synthesized with a
+            # persistent sample counter (see _synth_chunk).
+            samples = self._synth_chunk(cfg, samples_needed(cfg))
             try:
                 blocks, meta = compute_blocks(samples, cfg)
                 self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)

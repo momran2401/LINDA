@@ -34,6 +34,19 @@ let showMin     = false;
 let psdYspan    = null;     // null = auto; number = fixed dB span
 let windowMs    = 20;
 let analysisMode = "spectrogram";
+
+// ── AHAWI (coherent capture → segmented replay) ─────────────────────────
+// ahawiSelected mirrors the local Mode select; ahawiActive follows the frames
+// actually arriving (every client — including read-only viewers — replays
+// whatever the server is really producing, LV-F2-style honesty).
+let ahawiSelected = false;
+let ahawiActive   = false;
+let ahawiCap      = null;   // current capture {header, a, channels, blocks, …}
+let ahawiPending  = null;   // newer capture waiting for the pass to finish
+let ahawiSeg      = 0;
+let ahawiPlaying  = true;
+let ahawiDwell    = 200;    // ms per segment (client-side replay speed)
+let ahawiTimer    = null;
 let maxFps      = 15;       // client-side render-rate cap (LV-U1a)
 let nextRender  = 0;        // absolute render deadline (performance.now ms)
 let lastPsdRender = 0;      // standard rolling PSD is intentionally ~5 Hz
@@ -216,7 +229,7 @@ function updateMeta() {
     const buf0 = firstWfBuf();
     const depthRows = buf0 ? buf0.length / curBins : curRows;
     const winMs     = (depthRows * rowHopSamples() / curFs * 1e3).toFixed(0);
-    const mode      = replaceMode ? "flicker" : "waterfall";
+    const mode      = ahawiActive ? "ahawi" : replaceMode ? "flicker" : "waterfall";
     const scale     = autoColor ? "auto" : "manual";
     const analysis  = curBackend;   // executed backend from the header (honest — LV-F2)
     // FFT label discloses radio size → real FFT size (bins × averaging) for the
@@ -330,8 +343,14 @@ function rowsForWindowMs(ms) {
 // client display depth follows windowMs and the server streams fixed 12-row
 // frame chunks (an explicit rows control, which reclaims rows ownership).
 function sendTimeControl() {
-    if (replaceMode) sendControl({ capture: { duration: windowMs / 1000 } });
-    else             sendControl({ rows: 12 });
+    if (ahawiSelected) {
+        // Re-assert AHAWI on reconnect: the segment length rides on duration.
+        sendControl({ ahawi: true, capture: { duration: windowMs / 1000 } });
+    } else if (replaceMode) {
+        sendControl({ capture: { duration: windowMs / 1000 } });
+    } else {
+        sendControl({ rows: 12 });
+    }
 }
 
 // SSB is always selectable now (P2b-5): when the current rate is off the SSB
@@ -511,7 +530,11 @@ const SAFE_SELECTOR =
     ".mode-opt, #ctrl-toggle, #signout-btn, #theme-toggle, " +
     "#peak-chk, #hold-chk, #diff-chk, #min-chk, #clear-hold-btn, #cross-chk, " +
     "#yspan-sel, #pause-btn, #fps-sel, #auto-color, #abs-rf, #csv-btn, #png-btn, " +
-    "#ops-refresh";
+    "#ops-refresh, " +
+    // AHAWI replay controls are pure client-side display (verified: none call
+    // sendControl) — viewers may scrub the capture the admin enabled.
+    "#ahawi-play, #ahawi-prev, #ahawi-next, #ahawi-scrub, #ahawi-dwell, " +
+    "#ahawi-golive, .wf-strip";
 function installReadOnlyGuard() {
     const block = (ev) => {
         if (!currentRole || isAdmin) return;              // admin or not-yet-known
@@ -1000,11 +1023,17 @@ function onFrame(data) {
     if (gain !== undefined && gain !== null) curGain = gain;
 
     // ── Render ────────────────────────────────────────────────────────────
-    if (serverStats) {
+    if (header.ahawi) {
+        // AHAWI capture: one coherent multi-segment frame. Store it and let
+        // the replay engine drive the waterfalls/PSD one segment at a time.
+        ahawiIngest(header, blocks, channels);
+    } else if (serverStats) {
+        if (ahawiActive) ahawiDeactivate();
         // PSD backend (P2b-4): block rows are statistic traces, not time —
         // draw them directly; no waterfall to update.
         renderServerPsd(channels, blocks, rows, nfft);
     } else {
+        if (ahawiActive) ahawiDeactivate();
         psdData.server = null;
         const stdKind = "std:" + channelsKey(channelList);
         if (uplotKind !== stdKind) initUplot(freqsMHz);
@@ -1020,7 +1049,19 @@ function onFrame(data) {
             lastPsdRender = nowRender;
         }
     }
-    updateBandMonitor(channels, blocks, rows, nfft);
+    if (!header.ahawi) updateBandMonitor(channels, blocks, rows, nfft);
+    // AHAWI wraps the spectrogram/quicklook analyses only; PSD and SSB are
+    // already coherent views. Say so instead of silently ignoring the mode.
+    if (ahawiSelected && !header.ahawi
+            && (curBackend === "psd" || curBackend === "ssb")) {
+        if (ahawiBackendHint !== curBackend) {
+            ahawiBackendHint = curBackend;
+            setStatus(`AHAWI needs the Spectrogram or Quicklook analysis — the ${curBackend.toUpperCase()} view bypasses it`, "warn");
+            logMsg(`AHAWI is on but the ${curBackend} analysis bypasses it — choose Spectrogram or Quicklook`, "WARN");
+        }
+    } else if (ahawiBackendHint !== null && (header.ahawi || !ahawiSelected)) {
+        ahawiBackendHint = null;
+    }
     updateMeta();
 
     // ── FPS counter ───────────────────────────────────────────────────────
@@ -1124,7 +1165,7 @@ function ensureChannels(channels) {
 }
 
 function computeDisplayDepth(rows, nfft, fs) {
-    if (replaceMode) return rows;
+    if (replaceMode || ahawiActive) return rows;
     return rowsForWindowMs(windowMs);
 }
 
@@ -1145,8 +1186,8 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
     const buf  = wfBuf[ch];
     const bLen = block.length;   // rows × nfft samples in the new block
 
-    if (replaceMode) {
-        // Replace entire display buffer with the new frame
+    if (replaceMode || ahawiActive) {
+        // Replace entire display buffer with the new frame (AHAWI: one segment)
         buf.fill(-150);
         buf.set(block.subarray(0, Math.min(bLen, size)));
     } else {
@@ -1163,7 +1204,10 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
     }
 
     // ── Auto color levels (5th / 99th percentile of a subsample) ──────────
-    if (autoColor) {
+    // AHAWI pins one scale per CAPTURE (set in renderAhawiSegment): a
+    // per-segment recompute would pump the brightness as bursts enter and
+    // leave segments, exactly the flicker artifact the mode exists to remove.
+    if (autoColor && !ahawiActive) {
         const step = Math.max(1, Math.floor(size / 2000));
         const samp = [];
         for (let i = 0; i < size; i += step) samp.push(buf[i]);
@@ -1183,7 +1227,7 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
     const [vmin, vmax] = levels;
     const rng      = vmax - vmin || 1;
 
-    const fullRender = replaceMode || reallocated;
+    const fullRender = replaceMode || ahawiActive || reallocated;
     const newRows = fullRender ? depth : Math.min(bLen / nfft, depth);
     const renderSize = newRows * nfft;
     for (let i = 0; i < renderSize; i++) {
@@ -1205,6 +1249,316 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
         }
         wfCtx[ch].putImageData(wfImageData[ch], 0, 0, 0, 0, nfft, newRows);
     }
+}
+
+// ---------------------------------------------------------------------------
+// AHAWI replay engine (coherent capture → client-side segmented replay)
+// ---------------------------------------------------------------------------
+// The server analyzes one contiguous multi-segment capture with striqt and
+// ships it as a single frame with header.ahawi geometry. This engine slices it
+// into viewing windows and flips through them: play/pause/step/scrub run
+// entirely client-side, so read-only roles can use them too. The color scale
+// and the power strip are pinned per CAPTURE, never per segment.
+
+let ahawiUserModeChangeAt = 0;   // suppress select flip-flop right after a local change
+let ahawiBackendHint      = null;
+
+function ahawiEls() {
+    return {
+        bar:    document.getElementById("ahawi-bar"),
+        play:   document.getElementById("ahawi-play"),
+        prev:   document.getElementById("ahawi-prev"),
+        next:   document.getElementById("ahawi-next"),
+        scrub:  document.getElementById("ahawi-scrub"),
+        dwell:  document.getElementById("ahawi-dwell"),
+        badge:  document.getElementById("ahawi-badge"),
+        golive: document.getElementById("ahawi-golive"),
+    };
+}
+
+// Per-row channel power in dB across the whole capture (linear mean over
+// bins — a 30 dB burst must dominate, not average away in dB space).
+function ahawiRowPowerDb(block, rows, bins) {
+    const out = new Float32Array(rows);
+    for (let r = 0; r < rows; r++) {
+        let acc = 0;
+        const base = r * bins;
+        for (let b = 0; b < bins; b++) acc += Math.pow(10, block[base + b] / 10);
+        out[r] = 10 * Math.log10(acc / bins + 1e-30);
+    }
+    return out;
+}
+
+// Capture-wide auto-color levels (5th/99th percentile of a subsample) —
+// computed ONCE per capture so replay brightness cannot pump.
+function ahawiCaptureLevels(blocks, channels) {
+    const samp = [];
+    for (const ch of channels) {
+        const b = blocks[ch];
+        const step = Math.max(1, Math.floor(b.length / 4000));
+        for (let i = 0; i < b.length; i += step) samp.push(b[i]);
+    }
+    samp.sort((x, y) => x - y);
+    const vmin = samp[Math.floor(samp.length * 0.05)];
+    const vmax = samp[Math.floor(samp.length * 0.99)];
+    return [vmin, vmax - vmin < 5 ? vmin + 5 : vmax];
+}
+
+function ahawiIngest(header, blocks, channels) {
+    ahawiActivate();
+    const chans = Array.from(channels);
+    const cap = {
+        header, blocks,
+        a:        header.ahawi,
+        channels: chans,
+        rows:     header.rows,
+        bins:     header.nfft,
+        center:   header.center,
+        fs:       header.fs,
+        levels:   ahawiCaptureLevels(blocks, chans),
+        power:    {},
+        powerRange: {},
+    };
+    for (const ch of chans) {
+        const p = ahawiRowPowerDb(blocks[ch], cap.rows, cap.bins);
+        cap.power[ch] = p;
+        let lo = Infinity, hi = -Infinity;
+        for (let i = 0; i < p.length; i++) {
+            if (p[i] < lo) lo = p[i];
+            if (p[i] > hi) hi = p[i];
+        }
+        cap.powerRange[ch] = [lo, hi - lo < 3 ? lo + 3 : hi];
+    }
+    if (!ahawiCap) {
+        ahawiLoadCapture(cap);
+    } else {
+        // Never yank the view mid-pass: queue and swap at the wrap (playing)
+        // or on explicit "go live" (paused/scrubbing).
+        ahawiPending = cap;
+        updateAhawiBadge();
+    }
+}
+
+function ahawiLoadCapture(cap) {
+    ahawiCap     = cap;
+    ahawiPending = null;
+    ahawiSeg     = 0;
+    const els = ahawiEls();
+    if (els.scrub) {
+        els.scrub.max   = String(cap.a.segments - 1);
+        els.scrub.value = "0";
+    }
+    if (els.golive) els.golive.hidden = true;
+    renderAhawiSegment();
+    restartAhawiTimer();
+}
+
+function renderAhawiSegment() {
+    if (!ahawiCap) return;
+    const { blocks, bins, a, channels, center, fs } = ahawiCap;
+    const rps = a.rows_per_segment;
+    if (autoColor) levels = ahawiCap.levels;   // pinned per capture
+    psdData.server = null;
+    const stdKind = "std:" + channelsKey(channelList);
+    if (uplotKind !== stdKind) initUplot(freqsMHz);
+    const segBlocks = {};
+    for (const ch of channels) {
+        segBlocks[ch] = blocks[ch].subarray(ahawiSeg * rps * bins,
+                                            (ahawiSeg + 1) * rps * bins);
+    }
+    for (const ch of channels) {
+        updateWaterfall(ch, segBlocks[ch], rps, bins, center, fs);
+    }
+    updatePSD(channels, segBlocks, rps, bins);
+    updateBandMonitor(channels, segBlocks, rps, bins);
+    const els = ahawiEls();
+    if (els.scrub) els.scrub.value = String(ahawiSeg);
+    drawAhawiStrips();
+    updateAhawiBadge();
+}
+
+function drawAhawiStrips() {
+    if (!ahawiCap) return;
+    ahawiCap.channels.forEach((ch, i) => drawAhawiStrip(ch, i));
+}
+
+function drawAhawiStrip(ch, colorIdx) {
+    const canvas = document.querySelector(`#wf-pane-${ch} .wf-strip`);
+    if (!canvas || !ahawiCap) return;
+    const W = canvas.clientWidth || 600;
+    const H = canvas.clientHeight || 46;
+    if (canvas.width !== W)  canvas.width  = W;
+    if (canvas.height !== H) canvas.height = H;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, W, H);
+
+    const { a, rows } = ahawiCap;
+    const power = ahawiCap.power[ch];
+    const [lo, hi] = ahawiCap.powerRange[ch];
+    const rps  = a.rows_per_segment;
+    const segs = a.segments;
+
+    // Current-segment highlight + boundary ticks.
+    const segW = W * rps / rows;
+    ctx.fillStyle = "rgba(120,160,255,0.20)";
+    ctx.fillRect(ahawiSeg * segW, 0, segW, H);
+    ctx.strokeStyle = "rgba(128,128,128,0.30)";
+    ctx.lineWidth = 1;
+    for (let s = 1; s < segs; s++) {
+        const x = Math.round(s * segW) + 0.5;
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    // Power trace, max-aggregated per pixel column so a 2 ms burst can't
+    // vanish between pixels at narrow widths.
+    ctx.strokeStyle = chColors(colorIdx).mean;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    const rng = hi - lo || 1;
+    for (let x = 0; x < W; x++) {
+        const r0 = Math.floor(x / W * rows);
+        const r1 = Math.max(r0 + 1, Math.floor((x + 1) / W * rows));
+        let v = -Infinity;
+        for (let r = r0; r < r1 && r < rows; r++) if (power[r] > v) v = power[r];
+        const y = H - 3 - (H - 6) * Math.max(0, Math.min(1, (v - lo) / rng));
+        if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+}
+
+function updateAhawiBadge() {
+    const els = ahawiEls();
+    if (!els.badge) return;
+    if (!ahawiCap) {
+        els.badge.textContent = "waiting for the first capture…";
+        return;
+    }
+    const a = ahawiCap.a;
+    const t0 = (ahawiSeg * a.segment_ms).toFixed(0);
+    const t1 = ((ahawiSeg + 1) * a.segment_ms).toFixed(0);
+    let text = `seg ${ahawiSeg + 1}/${a.segments} · +${t0}–${t1} ms · ` +
+               `${a.aligned ? "burst-aligned" : "unaligned"} · ` +
+               `compute ${a.compute_ms} ms`;
+    els.badge.innerHTML = "";
+    els.badge.appendChild(document.createTextNode(text));
+    if (a.coherent === false) {
+        const warn = document.createElement("span");
+        warn.className = "warn";
+        warn.textContent = " · ⚠ possible gap in this capture";
+        els.badge.appendChild(warn);
+    }
+    if (ahawiPending) {
+        const dot = document.createElement("span");
+        dot.textContent = ahawiPlaying ? " · new capture queued" : " · newer capture waiting";
+        els.badge.appendChild(dot);
+    }
+    if (els.golive) els.golive.hidden = !(ahawiPending && !ahawiPlaying);
+}
+
+function ahawiTick() {
+    if (!ahawiActive || !ahawiCap || !ahawiPlaying || paused || document.hidden) return;
+    if (ahawiSeg + 1 >= ahawiCap.a.segments) {
+        if (ahawiPending) { ahawiLoadCapture(ahawiPending); return; }
+        ahawiSeg = 0;
+    } else {
+        ahawiSeg += 1;
+    }
+    renderAhawiSegment();
+}
+
+function restartAhawiTimer() {
+    if (ahawiTimer) clearInterval(ahawiTimer);
+    ahawiTimer = setInterval(ahawiTick, ahawiDwell);
+}
+
+function ahawiSetPlaying(on) {
+    ahawiPlaying = on;
+    const els = ahawiEls();
+    if (els.play) {
+        els.play.textContent = on ? "⏸" : "▶";
+        els.play.title = on ? "Pause the segment replay" : "Resume the segment replay";
+    }
+    updateAhawiBadge();
+}
+
+function ahawiStep(delta) {
+    if (!ahawiCap) return;
+    ahawiSetPlaying(false);
+    const segs = ahawiCap.a.segments;
+    ahawiSeg = ((ahawiSeg + delta) % segs + segs) % segs;
+    renderAhawiSegment();
+}
+
+function ahawiActivate() {
+    if (!ahawiActive) {
+        ahawiActive = true;
+        document.body.classList.add("mode-ahawi");
+        restartAhawiTimer();
+        logMsg("AHAWI replay active — coherent captures, client-side scrubbing");
+    }
+    // Keep the Mode select honest for every client (viewers can't change it
+    // themselves), but never fight a mode change the user made seconds ago —
+    // one stale capture frame can arrive while the server switches over.
+    const sel = document.getElementById("mode-sel");
+    if (sel && sel.value !== "ahawi"
+            && performance.now() - ahawiUserModeChangeAt > 3000) {
+        sel.value = "ahawi";
+        ahawiSelected = true;
+    }
+}
+
+function ahawiDeactivate() {
+    if (!ahawiActive) return;
+    ahawiActive  = false;
+    ahawiCap     = null;
+    ahawiPending = null;
+    ahawiSeg     = 0;
+    if (ahawiTimer) { clearInterval(ahawiTimer); ahawiTimer = null; }
+    document.body.classList.remove("mode-ahawi");
+    clearChannelBufs(wfBuf);
+    const sel = document.getElementById("mode-sel");
+    if (sel && sel.value === "ahawi"
+            && performance.now() - ahawiUserModeChangeAt > 3000) {
+        sel.value = replaceMode ? "replace" : "scroll";
+        ahawiSelected = false;
+    }
+    updateAhawiBadge();
+}
+
+function wireAhawiControls() {
+    const els = ahawiEls();
+    if (els.play) els.play.addEventListener("click", () => {
+        ahawiSetPlaying(!ahawiPlaying);
+        if (ahawiPlaying) restartAhawiTimer();
+    });
+    if (els.prev) els.prev.addEventListener("click", () => ahawiStep(-1));
+    if (els.next) els.next.addEventListener("click", () => ahawiStep(1));
+    if (els.scrub) els.scrub.addEventListener("input", (e) => {
+        if (!ahawiCap) return;
+        ahawiSetPlaying(false);
+        ahawiSeg = Math.max(0, Math.min(ahawiCap.a.segments - 1,
+                                        parseInt(e.target.value, 10) || 0));
+        renderAhawiSegment();
+    });
+    if (els.dwell) els.dwell.addEventListener("change", (e) => {
+        ahawiDwell = parseInt(e.target.value, 10) || 200;
+        restartAhawiTimer();
+    });
+    if (els.golive) els.golive.addEventListener("click", () => {
+        if (ahawiPending) ahawiLoadCapture(ahawiPending);
+        ahawiSetPlaying(true);
+    });
+    // Strip click → jump to that segment (delegated: panes are re-cloned on
+    // channel-set changes and would lose direct listeners).
+    document.addEventListener("click", (ev) => {
+        const strip = ev.target && ev.target.closest && ev.target.closest(".wf-strip");
+        if (!strip || !ahawiCap) return;
+        const rect = strip.getBoundingClientRect();
+        const frac = (ev.clientX - rect.left) / Math.max(1, rect.width);
+        ahawiSetPlaying(false);
+        ahawiSeg = Math.max(0, Math.min(ahawiCap.a.segments - 1,
+                                        Math.floor(frac * ahawiCap.a.segments)));
+        renderAhawiSegment();
+    });
 }
 
 // Populate the waterfall frequency-axis overlays (LV-F7). Five evenly spaced
@@ -2157,10 +2511,39 @@ pauseBtn.addEventListener("click", () => {
 });
 
 document.getElementById("mode-sel").addEventListener("change", (e) => {
-    replaceMode = e.target.value === "replace";
+    const value    = e.target.value;
+    const wasAhawi = ahawiSelected || ahawiActive;
+    ahawiSelected  = value === "ahawi";
+    replaceMode    = value === "replace";
+    ahawiUserModeChangeAt = performance.now();
     // Clear display buffers so mode switch starts clean
     clearChannelBufs(wfBuf);
-    sendTimeControl();
+    if (ahawiSelected) {
+        const capSel  = document.getElementById("ahawi-capture-sel");
+        const alignCk = document.getElementById("ahawi-align-chk");
+        sendControl({
+            ahawi: true,
+            ahawi_capture_ms: capSel ? parseFloat(capSel.value) : 100,
+            ahawi_align: alignCk ? alignCk.checked : true,
+            capture: { duration: windowMs / 1000 },
+        });
+    } else {
+        if (ahawiActive) ahawiDeactivate();
+        // One message: turn AHAWI off (only if it was on — keeps the op log
+        // quiet) and assert the new mode's time control.
+        const ctrl = replaceMode ? { capture: { duration: windowMs / 1000 } }
+                                 : { rows: 12 };
+        if (wasAhawi) ctrl.ahawi = false;
+        sendControl(ctrl);
+    }
+});
+
+// AHAWI capture knobs (admin-only — read-only roles are blocked by the guard).
+document.getElementById("ahawi-capture-sel")?.addEventListener("change", (e) => {
+    sendControl({ ahawi_capture_ms: parseFloat(e.target.value) });
+});
+document.getElementById("ahawi-align-chk")?.addEventListener("change", (e) => {
+    sendControl({ ahawi_align: e.target.checked });
 });
 
 document.getElementById("analysis-sel").addEventListener("change", (e) => {
@@ -2191,9 +2574,12 @@ function applyDuration() {
     if (!isFinite(ms) || ms <= 0) return;
     windowMs = ms;
     // Replace mode: ship the duration itself — the server owns the hop-aware
-    // duration→rows mapping (P2a-4). Scroll mode: the display depth follows
+    // duration→rows mapping (P2a-4). AHAWI: duration is the segment length,
+    // same server-side ownership. Scroll mode: the display depth follows
     // windowMs client-side; the server keeps streaming fixed 12-row chunks.
-    if (replaceMode) sendControl({ capture: { duration: windowMs / 1000 } });
+    if (replaceMode || ahawiSelected) {
+        sendControl({ capture: { duration: windowMs / 1000 } });
+    }
     updateMeta();
 }
 
@@ -2662,6 +3048,25 @@ function seedStaticControls(config) {
             }
         }
     }
+    // AHAWI server state → controls (re-sync path, same contract as nfft/
+    // duration above). Frame arrival — not this — drives the actual replay UI.
+    const ah = config && config.ahawi;
+    if (ah) {
+        const capSel = document.getElementById("ahawi-capture-sel");
+        if (capSel && ah.capture_ms) {
+            const match = Array.from(capSel.options)
+                .find((o) => parseFloat(o.value) === ah.capture_ms);
+            if (match) capSel.value = match.value;
+        }
+        const alignCk = document.getElementById("ahawi-align-chk");
+        if (alignCk) alignCk.checked = !!ah.align;
+        const modeSel = document.getElementById("mode-sel");
+        if (ah.enabled && modeSel && modeSel.value !== "ahawi"
+                && performance.now() - ahawiUserModeChangeAt > 3000) {
+            modeSel.value = "ahawi";
+            ahawiSelected = true;
+        }
+    }
 }
 
 function seedCaptureForm(config) {
@@ -2963,6 +3368,7 @@ if (typeof ResizeObserver !== "undefined" && psdContainer) {
 }
 updateSsbOption();
 installReadOnlyGuard();
+wireAhawiControls();
 
 connect();
 loadSchema().catch((err) => logMsg(`Schema load failed: ${err.message}`, "ERROR"));

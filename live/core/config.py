@@ -20,6 +20,7 @@ from .constants import (
     SSB_SUBCARRIER_SPACING, SSB_SAMPLE_RATE, SSB_DISCOVERY_PERIOD,
     SSB_WINDOW, SSB_LO_BANDSTOP, SSB_MAX_RATE, MAX_TAIL, RING_ROW_FILL,
     NFFT_CHOICES, BACKENDS, CALIBRATED_GRID_BACKENDS,
+    AHAWI_DEFAULT_CAPTURE_MS, AHAWI_MIN_CAPTURE_MS, AHAWI_MAX_CAPTURE_MS,
 )
 from .striqt_compat import _ANALYSIS_OK
 from .dsp import (
@@ -109,6 +110,13 @@ class RadioConfig:
     ssb_max_block_count:       object = None
     ssb_window:                object = SSB_WINDOW
     ssb_lo_bandstop:           object = SSB_LO_BANDSTOP
+    # AHAWI (coherent capture → segmented replay). ahawi_capture_ms is the
+    # REQUESTED coherent span; dsp.ahawi_plan derives the executed geometry
+    # against the ring/backend at compute time and the frame header discloses
+    # it. Segment length is the existing first-class `duration` control.
+    ahawi:            bool  = False
+    ahawi_capture_ms: float = AHAWI_DEFAULT_CAPTURE_MS
+    ahawi_align:      bool  = True
 
     def snapshot(self):
         return RadioConfig(
@@ -146,6 +154,9 @@ class RadioConfig:
             ssb_max_block_count=self.ssb_max_block_count,
             ssb_window=self.ssb_window,
             ssb_lo_bandstop=self.ssb_lo_bandstop,
+            ahawi=bool(self.ahawi),
+            ahawi_capture_ms=float(self.ahawi_capture_ms),
+            ahawi_align=bool(self.ahawi_align),
         )
 
 
@@ -859,7 +870,7 @@ class SharedConfig:
         valid = {
             "center", "sample_rate", "gain", "nfft", "rows", "backend", "lo_null",
             "analysis_bandwidth", "lo_shift", "host_resample", "backend_sample_rate",
-            "duration",
+            "duration", "ahawi", "ahawi_capture_ms", "ahawi_align",
         } | ANALYSIS_CFG_KEYS
         changes = []
         with self._lock:
@@ -933,6 +944,18 @@ class SharedConfig:
                         value = max(0.0, float(value))   # seconds; 0 = rows-driven
                     except (TypeError, ValueError):
                         continue
+                elif key in {"ahawi", "ahawi_align"}:
+                    value = bool(value)
+                elif key == "ahawi_capture_ms":
+                    # Requested coherent span; the per-capture plan re-fits it
+                    # to the ring honestly and the frame header discloses the
+                    # executed value.
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    value = float(max(AHAWI_MIN_CAPTURE_MS,
+                                      min(value, AHAWI_MAX_CAPTURE_MS)))
                 else:
                     value = int(value) if key in {"nfft", "rows"} else float(value)
                 # Clamp rows to what the ring can supply for the current backend/
