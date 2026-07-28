@@ -79,6 +79,14 @@ python3 live/radioctl.py status                     # SSH client for a RUNNING s
 sudo bash setup.sh                                  # full installer + TUI
 ```
 
+Copying recordings off the radio (both run on YOUR machine, never on the radio):
+
+```sh
+bash live/tools/fetch_recordings.sh user@radio.local --dest ~/data/radio
+bash live/tools/fetch_recordings.sh user@radio.local --watch
+python3 live/tools/pull_recordings.py --url <tunnel-url> --user admin --watch
+```
+
 ## Tests
 
 ```sh
@@ -111,6 +119,19 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   Never call `close_source()` on an AIR-T to recover — it deinitializes the
   AD9371 management sensors for the rest of the process and the viewer stays
   dark until a service restart.
+- Recordings stay on the radio under `recordings/` (gitignored — capture output
+  is never source, and this repo's remote is a personal GitHub account). Two
+  workstation-side pullers mirror them off; both are one-way and never delete:
+  - `tools/fetch_recordings.sh` — rsync over SSH. The default. Incremental and
+    resumable, no size limit, no auth beyond your existing SSH access.
+  - `tools/pull_recordings.py` — same job over the authenticated `/recordings`
+    HTTP endpoints, stdlib-only. Use it when SSH can't reach the radio but the
+    `run_web.sh --tunnel` URL can.
+
+  Both skip `*.partial.zarr.zip`: the server renames a recording to its final
+  name only after validating it, so a skipped partial is a recording still
+  being written. Do NOT commit archives or add an upload path without a
+  data-release decision.
 
 ## Verified operations / Reset Radio
 
