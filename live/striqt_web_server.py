@@ -79,7 +79,7 @@ except ImportError:
 WEB_DIR = Path(__file__).parent / "web"
 
 # ---------------------------------------------------------------------------
-# HTTP Basic Auth (three role-bearing credentials, read from the environment)
+# Username-to-role authentication
 # ---------------------------------------------------------------------------
 #
 # The viewer (static page, assets, and the /ws WebSocket) is gated behind one of
@@ -89,20 +89,13 @@ WEB_DIR = Path(__file__).parent / "web"
 #   viewer  → read-only; every control shows an "access denied" popup
 #   interns → read-only; same, with a different popup message
 #
-# Each user/pass is overridable via env vars (ADMIN_USER/ADMIN_PASS,
-# VIEWER_USER/VIEWER_PASS, INTERN_USER/INTERN_PASS) and falls back to a built-in
-# default when unset. Because defaults always exist, auth is effectively ALWAYS
-# ENABLED. Set RADIO_AUTH_DISABLE=1 to turn it off for --demo / local dev, in
-# which case everyone is granted DEFAULT_ROLE. A loud warning prints at startup
-# whenever default passwords or a disabled gate are in effect.
-
-_ROLE_CREDS = {
-    "admin":   (os.environ.get("ADMIN_USER")  or "admin",
-                os.environ.get("ADMIN_PASS")  or "mustafaroxx4321"),
-    "viewer":  (os.environ.get("VIEWER_USER") or "viewer",
-                os.environ.get("VIEWER_PASS") or "aricsfavinternmadethis"),
-    "interns": (os.environ.get("INTERN_USER") or "intern",
-                os.environ.get("INTERN_PASS") or "mustafashandsome"),
+# Each username maps directly to a role. Passwords are intentionally not used:
+# entering "admin", "viewer", or "intern" selects that role. The resulting
+# session cookie is still HMAC-signed, so its role cannot be edited client-side.
+_ROLE_USERS = {
+    "admin":   os.environ.get("ADMIN_USER")  or "admin",
+    "viewer":  os.environ.get("VIEWER_USER") or "viewer",
+    "interns": os.environ.get("INTERN_USER") or "intern",
 }
 WRITE_ROLES   = frozenset({"admin"})            # roles allowed to mutate config
 AUTH_DISABLED = os.environ.get("RADIO_AUTH_DISABLE") == "1"
@@ -114,22 +107,14 @@ AUTH_REALM    = "striqt live viewer"
 RADIO_SERVICE_NAME = os.environ.get("RADIO_SERVICE_NAME") or "radio-web"
 
 
-def match_credentials(user, pw) -> "str | None":
+def match_username(user) -> "str | None":
     """
-    Resolve an explicit username/password pair to a role name, or None when it
-    matches no known login. Constant-time across all three credentials: the
-    supplied user/pass is compared against EVERY row using bitwise `&` (no `and`
-    short-circuit) and no early return, so timing never reveals which usernames
-    exist or which row matched. Used by both the HTTP Basic path and the login
-    form POST.
+    Resolve a username to a role name, or None when it matches no known login.
+    Compare against every row without returning early.
     """
     matched_role = None
-    for role, (u, p) in _ROLE_CREDS.items():
-        # Evaluate BOTH digests every iteration (bitwise &, never short-circuit)
-        # and never break/return early, so total time is independent of which
-        # row — if any — matches.
-        ok = bool(secrets.compare_digest(user, u)) & bool(secrets.compare_digest(pw, p))
-        if ok:
+    for role, known_user in _ROLE_USERS.items():
+        if secrets.compare_digest(user, known_user):
             matched_role = role
     return matched_role
 
@@ -137,13 +122,9 @@ def match_credentials(user, pw) -> "str | None":
 def authenticate(auth_header) -> "str | None":
     """
     Resolve an HTTP `Authorization` header to a role name, or None when the
-    credentials match no known login. Returns DEFAULT_ROLE when auth is disabled
+    username matches no known login. The Basic password field is ignored.
+    Returns DEFAULT_ROLE when auth is disabled
     so --demo / local dev keeps full control.
-
-    Constant-time across all three credentials: the supplied user/pass is
-    compared against EVERY row on every call, using bitwise `&` (no `and`
-    short-circuit) and no early return, so response time never reveals which
-    usernames exist or which row matched.
 
     `auth_header` may be a str (Starlette Request) or bytes (raw ASGI scope).
     """
@@ -158,11 +139,11 @@ def authenticate(auth_header) -> "str | None":
     if scheme.lower() != "basic":
         return None
     try:
-        user, _, pw = base64.b64decode(param).decode("utf-8").partition(":")
+        user, _, _ignored_password = base64.b64decode(param).decode("utf-8").partition(":")
     except Exception:
         return None
 
-    return match_credentials(user, pw)
+    return match_username(user)
 
 
 # ---------------------------------------------------------------------------
@@ -180,15 +161,12 @@ def authenticate(auth_header) -> "str | None":
 # is inside the HMAC, so a viewer cannot self-elevate by editing the cookie.
 #
 # The signing secret comes from RADIO_SESSION_SECRET when set; otherwise it is
-# derived deterministically from ALL three role credentials (not any single
-# password). NOTE: with the built-in default passwords the derived secret is
-# predictable to anyone who reads the source — a real deployment should set
-# RADIO_SESSION_SECRET and override the default passwords so cookies can't be
-# forged (a startup warning nags about this).
+# derived deterministically from the role/user mapping. That fallback is public
+# and forgeable, so production setup always generates RADIO_SESSION_SECRET.
 
 _SESSION_SECRET = hashlib.sha256(
     (os.environ.get("RADIO_SESSION_SECRET")
-     or "|".join(f"{r}:{u}:{p}" for r, (u, p) in _ROLE_CREDS.items())
+     or "|".join(f"{r}:{u}" for r, u in _ROLE_USERS.items())
     ).encode()
 ).digest()
 SESSION_TTL = 86400
@@ -221,7 +199,7 @@ def verify_session_token(token) -> "str | None":
     exp_str, _, mac = rest.partition(".")
     if not role or not mac:
         return None
-    if role not in _ROLE_CREDS:          # reject forged / unknown roles
+    if role not in _ROLE_USERS:          # reject forged / unknown roles
         return None
     try:
         exp = int(exp_str)
@@ -260,16 +238,14 @@ def _session_cookie_from_scope(scope) -> "str | None":
 class BasicAuthMiddleware:
     """
     Pure-ASGI middleware that gates EVERY http and websocket request behind a
-    single shared Basic-Auth credential. Mounted static files and the /ws
+    recognized username. Mounted static files and the /ws
     endpoint are all covered because it wraps the entire app.
 
     On failure:
-      - http      → 401 + `WWW-Authenticate: Basic` so the browser shows the
-                    standard username/password popup.
+      - http      → redirect to the username login form (or 401 for APIs).
       - websocket → the handshake is rejected (browsers replay the page's
-                    cached Basic credentials on the WS upgrade, so a viewer that
-                    authenticated for the page connects fine; anyone else is
-                    refused before `accept()`).
+                    signed login cookie connects; anyone else is refused before
+                    `accept()`).
     """
 
     def __init__(self, app):
@@ -341,7 +317,7 @@ class BasicAuthMiddleware:
             return
 
         headers = dict(scope.get("headers") or [])
-        # Resolve the role from the Basic Auth header, falling back to a valid
+        # Resolve the role from the Basic username, falling back to a valid
         # signed session cookie. The cookie path lets browsers that drop Basic
         # creds on the WS upgrade (Safari / all iOS) still connect to /ws after
         # logging in for the page.
@@ -869,8 +845,6 @@ def _login_page(error: str = "") -> str:
     {err_html}
     <label for="u">Username</label>
     <input id="u" name="username" type="text" autofocus>
-    <label for="p">Password</label>
-    <input id="p" name="password" type="password">
     <button type="submit">Sign in</button>
   </form>
 </body></html>"""
@@ -912,12 +886,10 @@ async def login_submit(request: "Request"):
 
     raw = (await request.body()).decode("utf-8", "replace")
     form = parse_qs(raw, keep_blank_values=True)
-    role = match_credentials(
-        (form.get("username") or [""])[0], (form.get("password") or [""])[0]
-    )
+    role = match_username((form.get("username") or [""])[0])
     if not role:
         return HTMLResponse(
-            _login_page("Incorrect username or password."), status_code=401
+            _login_page("Unknown username."), status_code=401
         )
     resp = RedirectResponse("/", status_code=303)
     resp.set_cookie("radio_auth", make_session_token(role), **_cookie_kwargs(request))
@@ -1456,23 +1428,13 @@ def main():
             f"everyone gets role '{DEFAULT_ROLE}'. Do NOT use in production. ***"
         )
     else:
-        print(f"  auth:     3-role Basic Auth ENABLED (roles: {', '.join(_ROLE_CREDS)})")
-        _env_for = {"admin": "ADMIN", "viewer": "VIEWER", "interns": "INTERN"}
-        using_defaults = any(
-            os.environ.get(f"{p}_USER") is None or os.environ.get(f"{p}_PASS") is None
-            for p in _env_for.values()
-        )
-        if using_defaults:
-            print(
-                "            *** WARNING: one or more roles use built-in DEFAULT "
-                "passwords (visible in source). Override ADMIN/VIEWER/INTERN "
-                "_USER/_PASS for production (setup.sh generates these). ***"
-            )
+        users = ", ".join(f"{user}={role}" for role, user in _ROLE_USERS.items())
+        print(f"  auth:     username-only role login ENABLED ({users})")
         if not os.environ.get("RADIO_SESSION_SECRET"):
             print(
                 "            *** WARNING: RADIO_SESSION_SECRET unset — cookie "
-                "signing key is derived from (possibly default) credentials and "
-                "may be forgeable. Set it for production. ***"
+                "signing key is predictable and sessions may be forgeable. "
+                "Set it for production. ***"
             )
 
     print(f"  listening on http://{args.host}:{args.port}")

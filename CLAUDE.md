@@ -100,14 +100,16 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 
 ## Auth & deployment
 
-- Three roles (`admin`/`viewer`/`interns`); only admin mutates config. Browser
-  auth is cookie-only (`/login` form); Basic Auth still accepted for curl/API.
+- Three roles (`admin`/`viewer`/`interns`); only admin mutates config. Entering
+  the configured username selects its role; there is no password. Browser auth
+  uses a signed cookie (`/login` form); Basic username auth remains accepted
+  for curl/API (`curl -u admin:`).
   `RADIO_AUTH_DISABLE=1` for demo/dev.
-- Production: `setup.sh` GENERATES credentials + `RADIO_SESSION_SECRET` into
+- Production: `setup.sh` configures role usernames and generates
+  `RADIO_SESSION_SECRET` into
   `/etc/radio-web/radio.env` (0600) and installs the systemd unit
   (`deploy/radio-web.service.template` → `deploy/run_service.sh`, mode from
-  `RADIO_MODE`: web/hotspot/ethernet/kiosk). The in-source default passwords
-  are dev-only; the server warns loudly when they're active.
+  `RADIO_MODE`: web/hotspot/ethernet/kiosk).
 - `/health` is auth-exempt but returns only `{status, boot_id, uptime_s}` to
   anonymous callers.
 

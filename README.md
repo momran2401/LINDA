@@ -26,7 +26,7 @@ developed and tested on a laptop.
 - **One shared backend** (`live/core/`) drives every frontend, so fixes and
   features land everywhere at once.
 - **Plug-and-play deployment** — a one-shot installer sets up the service,
-  credentials, mDNS, and (optionally) a Wi-Fi hotspot or direct-Ethernet mode
+  username-only roles, mDNS, and (optionally) a Wi-Fi hotspot or direct-Ethernet mode
   so the viewer works with **zero internet and zero network configuration**.
 - Three login roles (admin / viewer / intern), calibrated striqt analysis
   backends, interactive PSD, CSV/PNG export, and a live operations/journal
@@ -53,10 +53,10 @@ developed and tested on a laptop.
 
 ## Requirements
 
-- **Linux** (Debian-family — Ubuntu, Raspberry Pi OS, the AIR-T's Jetson
-  image — for the automated installer; other platforms work for demo mode and
-  manual setup). macOS works for demo/development.
-- **Python 3.9+**
+- **Linux** (automated full setup: Debian/Raspberry Pi OS 12–13 or Ubuntu
+  22.04/24.04 on x86-64 or 64-bit ARM). Other platforms can use manual demo
+  setup.
+- **Python 3.9–3.12**
 - Python packages: `fastapi`, `uvicorn`, `numpy` (see
   [`live/requirements.txt`](live/requirements.txt))
 - For real radios: **SoapySDR** with your radio's driver module
@@ -80,21 +80,37 @@ Demo mode needs only Python + the pip packages — no SDR stack at all.
 git clone <this-repo> && cd NIST-Omran
 sudo bash setup.sh              # interactive TUI: mode, port, hostname, radio…
 sudo bash setup.sh --defaults   # or: no questions, web mode on port 8000
+# Provision before the selected radio is physically available:
+sudo bash setup.sh --skip-hardware-check
 ```
 
 The installer is **idempotent** (safe to re-run) and takes care of:
 
-- apt packages: SoapySDR + common SDR driver modules, avahi (mDNS), whiptail,
-  NetworkManager (for hotspot/ethernet modes), Chromium (for kiosk mode)
-- a Python virtualenv at `.venv/` with pinned dependencies + striqt
-- **generated credentials** and a session secret written to
-  `/etc/radio-web/radio.env` (mode 0600) — the dev defaults in the source are
-  never used in production
+- apt packages: build tooling, SoapySDR + every common radio driver module
+  available from the configured distro repositories, avahi (mDNS), whiptail,
+  USB/udev permissions, firmware utilities, NetworkManager (for
+  hotspot/ethernet modes), and Chromium/X/LightDM (for kiosk mode)
+- a Python virtualenv at `.venv/` with one consistently resolved
+  FastAPI/uvicorn/numpy/pandas/Seaborn/striqt dependency set; the installer
+  preserves and rebuilds stale environments, then runs `pip check` and import
+  checks before configuring the service
+- username-only role logins and a generated session-signing secret written to
+  `/etc/radio-web/radio.env` (mode 0600)
 - the `radio-web` systemd service (auto-start on boot, hardened, journald
   logging) and the scoped sudoers rule that powers the Reset Radio button
 - mDNS hostname (reach the radio at `http://<name>.local:8000`), a firewall
   rule when UFW is active, and the selected network mode (see below)
-- a post-install health check
+- selected-radio enumeration plus a short streaming/settings qualification
+  (unless `--skip-hardware-check` was given)
+- a strict post-install health check; failures include recent systemd logs and
+  do not print “Setup complete”
+- a reboot-required notice when group, udev, network, display, or package
+  changes need a fresh boot
+
+Deepwave's SoapyAIRT/CUDA software is proprietary and is not published in the
+Debian or Python package repositories. A clean AIR-T must first use Deepwave's
+supported system image/driver installer. `setup.sh` detects this case and stops
+with a specific error instead of reporting a working AIR-T installation.
 
 ### Option B — just the Python deps (no root, e.g. a dev laptop)
 
@@ -104,28 +120,33 @@ bash setup.sh --deps-only       # creates .venv and installs live/requirements.t
 pip install -r live/requirements.txt
 ```
 
+`setup.sh` also applies [`live/constraints.txt`](live/constraints.txt), which
+records the qualified top-level runtime versions. Directly running the plain
+`pip install` command is intended for development, not reproducible appliance
+provisioning.
+
 ## Quick start
 
 ```sh
 # No hardware — synthetic signals, open http://localhost:8000
-python3 live/striqt_web_server.py --demo
+./.venv/bin/python live/striqt_web_server.py --demo
 
 # Real radio (AIR8201B default)
-python3 live/striqt_web_server.py
+./.venv/bin/python live/striqt_web_server.py
 
 # Auto-detect whatever SoapySDR radio is plugged in
-python3 live/striqt_web_server.py --device auto
+./.venv/bin/python live/striqt_web_server.py --device auto
 
 # Terminal waterfall over SSH (no browser, no GUI)
-python3 live/striqt_standalone_terminal.py --demo --backend quicklook
+./.venv/bin/python live/striqt_standalone_terminal.py --demo --backend quicklook
 
 # Fullscreen on the radio's own display
-python3 live/striqt_kiosk.py --demo
+./.venv/bin/python live/striqt_kiosk.py --demo
 ```
 
 If you used the installer, the service is already running — just open
-`http://<hostname>.local:8000` and sign in with the credentials the installer
-printed (also stored in `/etc/radio-web/radio.env`).
+`http://<hostname>.local:8000` and enter `admin`, `viewer`, or `intern` as the
+username. There is no password.
 
 ## Deployment modes
 
@@ -227,8 +248,8 @@ as environment variables:
 
 | Variable | Purpose |
 |---|---|
-| `ADMIN_USER` / `ADMIN_PASS` | admin login (installer generates these) |
-| `VIEWER_USER` / `VIEWER_PASS`, `INTERN_USER` / `INTERN_PASS` | read-only logins |
+| `ADMIN_USER` | admin-role username (default `admin`) |
+| `VIEWER_USER`, `INTERN_USER` | read-only usernames (defaults `viewer`, `intern`) |
 | `RADIO_SESSION_SECRET` | cookie-signing key (generate: `openssl rand -hex 32`) |
 | `RADIO_AUTH_DISABLE=1` | disable auth entirely (demo/dev only — never in production) |
 | `RADIO_MODE` | `web` / `hotspot` / `ethernet` / `kiosk` / `terminal` (service entrypoint) |
@@ -239,8 +260,9 @@ as environment variables:
 | `SPEC_BACKEND` | default analysis backend |
 | `RADIO_KIOSK_BROWSER` | kiosk browser executable override |
 
-The server warns loudly at startup if the built-in dev passwords or a
-disabled auth gate are in effect.
+The server warns loudly if the session-signing secret is missing or the auth
+gate is disabled. Username-only roles are convenience access control, not a
+security boundary: anyone who enters the admin username receives admin access.
 
 ## Testing & hardware qualification
 

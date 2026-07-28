@@ -17,14 +17,12 @@
 #   pip install -r live/requirements.txt          (or: bash setup.sh --deps-only)
 #   --tunnel additionally needs cloudflared in PATH.
 #
-# Authentication (three roles):
-#   Production deployments should use setup.sh, which GENERATES credentials
-#   into /etc/radio-web/radio.env. For ad-hoc runs you can override here:
-#     ADMIN_USER/ADMIN_PASS, VIEWER_USER/VIEWER_PASS, INTERN_USER/INTERN_PASS
+# Authentication (three username-only roles):
+#   Production deployments should use setup.sh. For ad-hoc runs:
+#     ADMIN_USER, VIEWER_USER, INTERN_USER
 #     RADIO_SESSION_SECRET   cookie-signing key, e.g. "$(openssl rand -hex 32)"
 #     RADIO_AUTH_DISABLE=1   auth OFF for local/demo; everyone becomes admin.
-#   Without overrides the server falls back to the built-in dev defaults and
-#   prints a loud warning — do not expose that publicly.
+#   Entering a configured username selects its role; no password is used.
 #
 # "Reset Radio" button (admin-only): restarts the systemd unit named by
 #   RADIO_SERVICE_NAME (default "radio-web") via `sudo -n systemctl restart`.

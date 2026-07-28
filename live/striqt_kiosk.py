@@ -58,6 +58,7 @@ def browser_command(url, kiosk=True):
         if exe:
             args = [exe, "--noerrdialogs", "--disable-session-crashed-bubble",
                     "--no-first-run", "--disable-infobars",
+                    "--ozone-platform-hint=auto",
                     f"--user-data-dir={profile}",
                     f"--app={url}"]
             if kiosk:
