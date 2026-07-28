@@ -701,7 +701,13 @@ def ahawi_plan(cfg: RadioConfig) -> dict:
     rows_per_seg = max(1, round(seg_s * fs / hop))
 
     limit = int(MAX_TAIL * RING_ROW_FILL)
-    max_total_rows = min((limit - (nfft - hop)) // hop, MAX_ROWS_ABS)
+    max_total_rows = max(1, min((limit - (nfft - hop)) // hop, MAX_ROWS_ABS))
+
+    # A huge viewing window (DAN's custom duration accepts anything) must not
+    # plan a capture the ring can never hold — the Computer's avail >= need
+    # gate would simply never pass and AHAWI would starve with no message.
+    # Clamp the SEGMENT to the ring like the live view clamps rows (P1-5).
+    rows_per_seg = min(rows_per_seg, max_total_rows)
 
     align = bool(cfg.ahawi_align)
     extra_rows = rows_per_seg if align else 0
@@ -761,11 +767,17 @@ def ahawi_align_offset(blocks: np.ndarray, rows_per_seg: int, segments: int):
     usable = rows_per_seg * segments
     if blocks.ndim != 3 or blocks.shape[1] < usable:
         return 0, False, 0.0
-    # dB→linear matters: a 30 dB burst must dominate the fold, not average away.
-    lin = np.power(10.0, blocks[:, :usable, :].astype(np.float64) / 10.0)
-    stationary = np.median(lin, axis=1, keepdims=True)   # per bin, per channel
-    residual = np.clip(lin - stationary, 0.0, None)
-    row_power = residual.mean(axis=(0, 2))
+    # dB→linear matters: a 30 dB burst must dominate the fold, not average
+    # away. Per-channel float32 keeps the transient footprint to one channel's
+    # worth of arrays — the whole-capture float64 version peaked at several
+    # hundred MB at max geometry (4096 rows × 4096 bins × 2ch), which is real
+    # memory pressure on the Jetson's shared CPU/GPU pool.
+    row_power = np.zeros(usable, dtype=np.float64)
+    for ch in range(blocks.shape[0]):
+        lin = np.power(10.0, blocks[ch, :usable, :].astype(np.float32) / 10.0)
+        stationary = np.median(lin, axis=0, keepdims=True)   # per bin
+        np.clip(lin - stationary, 0.0, None, out=lin)
+        row_power += lin.mean(axis=1, dtype=np.float64)
     folded = row_power.reshape(segments, rows_per_seg).mean(axis=0)
     # Light circular smoothing so a one-row glitch can't win the argmax.
     k = max(1, rows_per_seg // 64)
@@ -819,7 +831,9 @@ def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
         "segment_ms":        round(plan["segment_ms"], 3),
         "capture_ms":        round(plan["capture_ms"], 3),
         "aligned":           bool(aligned),
-        "align_requested":   bool(plan["align"]),
+        # User INTENT, not the plan's degraded value — the badge distinguishes
+        # "align off" (unchecked) from "n/a — single segment" (nothing to fold).
+        "align_requested":   bool(cfg.ahawi_align),
         "align_offset_rows": int(offset),
         "align_contrast_db": float(contrast_db),
         "compute_ms":        round(1e3 * (time.perf_counter() - started), 1),

@@ -1483,14 +1483,17 @@ function updateAhawiBadge() {
     const a = ahawiCap.a;
     const t0 = (ahawiSeg * a.segment_ms).toFixed(0);
     const t1 = ((ahawiSeg + 1) * a.segment_ms).toFixed(0);
-    // Unaligned is a finding, not a failure — explain it. Off = the toggle;
-    // "no periodic burst" = alignment looked and found nothing to lock onto
-    // (contrast in the header makes the verdict checkable).
+    // Unaligned is a finding, not a failure — explain WHICH finding. Off =
+    // the toggle; single segment = nothing to fold against; otherwise
+    // alignment looked and found nothing periodic (contrast shown so the
+    // verdict is checkable, not a mystery).
     let alignTxt;
     if (a.aligned) {
         alignTxt = "burst-aligned";
     } else if (a.align_requested === false) {
         alignTxt = "align off";
+    } else if (a.segments < 2) {
+        alignTxt = "align n/a — single segment";
     } else {
         alignTxt = `no periodic burst found (${a.align_contrast_db ?? "?"} dB)`;
     }
@@ -1576,11 +1579,20 @@ function ahawiDeactivate() {
     ahawiCap     = null;
     ahawiPending = null;
     ahawiSeg     = 0;
+    ahawiStaleAt = 0;
     if (ahawiTimer) { clearInterval(ahawiTimer); ahawiTimer = null; }
     document.body.classList.remove("mode-ahawi");
     clearChannelBufs(wfBuf);
+    const golive = document.getElementById("ahawi-golive");
+    if (golive) golive.hidden = true;
+    // Keep the Mode select honest — EXCEPT when this deactivation is the
+    // PSD/SSB analysis bypassing a still-selected AHAWI (server cfg.ahawi
+    // stays on; the hint banner explains). Flipping the select there would
+    // contradict the user's standing choice and fight the resurrect on
+    // switching the analysis back.
+    const bypass = ahawiSelected && (curBackend === "psd" || curBackend === "ssb");
     const sel = document.getElementById("mode-sel");
-    if (sel && sel.value === "ahawi"
+    if (sel && sel.value === "ahawi" && !bypass
             && performance.now() - ahawiUserModeChangeAt > 3000) {
         sel.value = replaceMode ? "replace" : "scroll";
         ahawiSelected = false;
@@ -3098,7 +3110,9 @@ function seedStaticControls(config) {
         const sel = document.getElementById("nfft-sel");
         if (sel) sel.value = String(cap.nfft);
     }
-    if (cap.duration) {
+    if (cap.duration && !(ahawiStaged && ahawiSelected)) {
+        // In AHAWI a staged (not yet applied) segment duration must survive
+        // this resync, or Apply would ship the server's old value back.
         const ms = cap.duration * 1000;
         windowMs = ms;
         const preset = Array.from(durSel.options)
@@ -3117,8 +3131,11 @@ function seedStaticControls(config) {
     }
     // AHAWI server state → controls (re-sync path, same contract as nfft/
     // duration above). Frame arrival — not this — drives the actual replay UI.
+    // STAGED edits win over the resync: this runs after every ack, and
+    // clobbering a not-yet-applied selection back to the server value would
+    // silently discard what the user just chose.
     const ah = config && config.ahawi;
-    if (ah) {
+    if (ah && !ahawiStaged) {
         const capSel = document.getElementById("ahawi-capture-sel");
         if (capSel && ah.capture_ms) {
             const match = Array.from(capSel.options)

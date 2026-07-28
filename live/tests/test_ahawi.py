@@ -81,6 +81,35 @@ def test_plan_respects_the_align_toggle():
     assert plan["total_rows"] == plan["segments"] * plan["rows_per_seg"]
 
 
+def test_plan_never_asks_for_more_than_the_ring_holds():
+    """Regression: a huge custom viewing window (DAN's duration box accepts
+    anything) used to plan a capture bigger than the ring itself — the
+    Computer's avail >= need gate could never pass and AHAWI starved forever
+    with no message. The segment must clamp like live rows do (P1-5)."""
+    cfg = _cfg(**{"capture": {"duration": 1.0}, "ahawi_capture_ms": 1000})
+    plan = ahawi_plan(cfg)
+    assert plan["need_samples"] <= int(MAX_TAIL * RING_ROW_FILL), \
+        f"unfillable plan: {plan['need_samples']:,} samples"
+    assert plan["total_rows"] <= MAX_ROWS_ABS
+    assert plan["segments"] >= 1
+
+
+def test_capture_reports_user_align_intent_when_plan_degrades():
+    """One-segment plans can't align (nothing to fold), but the header must
+    report the USER's toggle so the badge can say 'n/a — single segment'
+    instead of the misleading 'align off'."""
+    cfg = _cfg(**{"capture": {"duration": 0.02}, "ahawi_capture_ms": 20})
+    plan = ahawi_plan(cfg)
+    assert plan["segments"] == 1 and plan["align"] is False
+    rng = np.random.default_rng(5)
+    samples = (rng.standard_normal((2, plan["need_samples"]))
+               + 1j * rng.standard_normal((2, plan["need_samples"]))
+               ).astype(np.complex64) * 0.05
+    _, meta = ahawi_capture(samples, cfg, plan)
+    assert meta["ahawi"]["align_requested"] is True   # the checkbox, not the plan
+    assert meta["ahawi"]["aligned"] is False
+
+
 # ── Burst alignment ─────────────────────────────────────────────────────────
 
 def _synthetic_capture(segments, rps, bins, burst_at, burst_rows=3,
@@ -177,6 +206,98 @@ def test_config_rejects_garbage_capture_ms_quietly():
     ack = shared.update({"ahawi_capture_ms": "not-a-number"})
     assert "ahawi_capture_ms" not in ack["applied"]
     assert shared.snapshot().ahawi_capture_ms == before
+
+
+# ── Hardware-side Computer cycle (fake acquirer — no radio) ─────────────────
+
+class FakeRingAcquirer:
+    """Just enough Acquirer surface for Computer._ahawi_cycle."""
+
+    def __init__(self, need, gap_time=0.0):
+        rng = np.random.default_rng(9)
+        self._samples = (rng.standard_normal((2, need))
+                         + 1j * rng.standard_normal((2, need))
+                         ).astype(np.complex64) * 0.05
+        self._gap = gap_time
+        self.published = []
+        self.verified = []
+
+    def generation(self):
+        return 7
+
+    def get_latest(self, n):
+        return self._samples[:, -n:], 7, n
+
+    def last_gap_time(self):
+        return self._gap
+
+    def publish(self, cfg, blocks, meta):
+        self.published.append((cfg, blocks, meta))
+
+    def complete_verification(self, gen):
+        self.verified.append(gen)
+
+
+def _run_computer_cycle(monkeypatch, gap_time=0.0):
+    from core import acquisition
+    from core.acquisition import Computer
+    from core.dsp import ahawi_plan
+
+    monkeypatch.setattr(acquisition, "AHAWI_REFRESH_S", 0.01)
+    shared = SharedConfig()
+    shared.update({"backend": "quicklook", "ahawi": True,
+                   "capture": {"duration": 0.02}})
+    cfg = shared.snapshot()
+    acq = FakeRingAcquirer(ahawi_plan(cfg)["need_samples"], gap_time)
+    computer = Computer(acq, shared)     # not started — cycle driven directly
+    computer._ahawi_cycle(cfg)
+    return acq
+
+
+def test_computer_cycle_publishes_and_verifies(monkeypatch):
+    acq = _run_computer_cycle(monkeypatch)
+    assert len(acq.published) == 1
+    _cfg, blocks, meta = acq.published[0]
+    a = meta["ahawi"]
+    assert len(blocks) == 2
+    assert blocks[0].shape[0] == a["segments"] * a["rows_per_segment"]
+    assert a["coherent"] is True
+    # Data-path proof handed back for the verified-operations pipeline.
+    assert acq.verified == [7]
+
+
+def test_computer_cycle_flags_a_drain_gap_inside_the_capture(monkeypatch):
+    acq = _run_computer_cycle(monkeypatch, gap_time=time.time())
+    assert acq.published[0][2]["ahawi"]["coherent"] is False
+
+
+# ── Demo synthesis numerics ─────────────────────────────────────────────────
+
+def test_demo_tones_stay_pure_after_hours_of_uptime():
+    """Regression: the wall-clock synth briefly built an absolute float32 time
+    axis, whose ~4 µs resolution at t=60 s already scrambles a MHz tone's
+    phase completely — the demo spectrum dissolved into noise within minutes
+    of server uptime. Phase must be computed as fractional cycles in float64."""
+    import time as _time
+    shared = SharedConfig()
+    shared.update({"backend": "quicklook"})
+    acq = DemoAcquirer(shared)
+    acq._t0 = _time.monotonic() - 6 * 3600      # six hours of uptime
+    cfg = shared.snapshot()
+    nfft = 4096
+    samples = acq._synth_chunk(cfg, 64 * nfft)
+
+    x = samples[0].reshape(64, nfft) * np.hanning(nfft)
+    psd = (np.abs(np.fft.fftshift(np.fft.fft(x, axis=-1), axes=-1)) ** 2).mean(axis=0)
+    psd_db = 10 * np.log10(psd + 1e-30)
+    # Strongest tone on channel 0 sits at +2.5 MHz (amp 0.30). A pure tone
+    # towers ~30+ dB over the local floor; phase noise smears it flat.
+    fs = cfg.sample_rate
+    tone_bin = int(round(nfft / 2 + 2.5e6 / fs * nfft))
+    window = psd_db[tone_bin - 3: tone_bin + 4]
+    floor = np.median(psd_db)
+    assert window.max() - floor > 25, \
+        f"tone only {window.max() - floor:.1f} dB above floor — phase is smeared"
 
 
 # ── Demo end-to-end ─────────────────────────────────────────────────────────
