@@ -96,6 +96,10 @@ cd striqt && pytest tests/              # upstream library tests
 ```
 
 The demo pipeline tests use the quicklook backend so they pass without striqt.
+They also run ON the radio host (Python 3.9 + installed striqt): striqt_compat
+skips its LD_LIBRARY_PATH re-exec under pytest (execv used to kill the runner
+silently mid-collection), and RecordingManager creates its asyncio primitives
+lazily because 3.9 binds them to the current event loop at construction.
 `radioctl.py self-test` qualifies settings THROUGH a running server and
 restores the starting configuration afterwards.
 
