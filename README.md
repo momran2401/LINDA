@@ -1,4 +1,9 @@
-# NIST-Omran — Live RF Spectrum Viewer
+# ITWORKS - Integrated Toolkit for Wideband Observation Radio Knowledge, and Spectrum
+# VISARA - Visual Instrument for Spectrum Analysis and Radio Acquisition
+# RIZZ - Radio Interface with Zooming and Zeal
+# MUSTAFAR - Mustafa's Unified Spectrum Toolkit for Analysis, Frequencies, and Radio
+# SUSDR - Utility for Software-Defined Radio
+# FINALLY - Frequency and IQ Navigation, Analysis, Logging, and Live Display
 
 A live RF visualization suite for software-defined radios, built by Mustafa Omran.
 
