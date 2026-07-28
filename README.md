@@ -2,11 +2,12 @@
 
 A live RF visualization suite for software-defined radios, built by Mustafa Omran.
 
-Point it at an SDR and it streams **real-time spectrogram waterfalls and power
-spectral density (PSD)** — one pane per RX channel — to any web browser, to a
-terminal over SSH, or fullscreen on the radio's own display. No hardware?
-A built-in demo mode synthesizes realistic signals so everything can be
-developed and tested on a laptop.
+Streams real-time spectrogram waterfalls and power
+spectral density (PSD) — one pane per RX channel — to any web browser, a
+terminal over SSH, or fullscreen on the radio's own display.
+
+A built-in demo mode also synthesizes realistic signals so everything can be
+developed and tested on a laptop without hardware
 
 **Supported radios**
 
@@ -77,7 +78,7 @@ Demo mode needs only Python + the pip packages — no SDR stack at all.
 ### Option A — one-shot installer (recommended on the radio host)
 
 ```sh
-git clone <this-repo> && cd NIST-Omran
+git clone <this-repo> && cd LINDA
 sudo bash setup.sh              # interactive TUI: mode, port, hostname, radio…
 sudo bash setup.sh --defaults   # or: no questions, web mode on port 8000
 # Provision before the selected radio is physically available:
@@ -337,15 +338,6 @@ The web UI has **no CDN dependencies** — uPlot is vendored in
   disagreed with the request; `unverified` means the driver could not answer.
 - **Health check from scripts** — `curl http://<host>:8000/health` works
   without credentials (minimal liveness info only).
-
-## Further documentation
-
-- [`CLAUDE.md`](CLAUDE.md) — developer/contributor guide (architecture
-  contracts, invariants, test commands)
-- [`docs/MERGE_REPORT_2026-07-18.md`](docs/MERGE_REPORT_2026-07-18.md) — the
-  2026-07 rework: what changed, why, and what still needs on-hardware
-  verification
-- [`docs/`](docs/) — earlier audit reports and fix logs (pre-rework history)
 
 ## License and Attribution
 
