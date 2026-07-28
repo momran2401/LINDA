@@ -1,10 +1,4 @@
-# ITWORKS - Integrated Toolkit for Wideband Observation Radio Knowledge, and Spectrum
-# VISARA - Visual Instrument for Spectrum Analysis and Radio Acquisition
-# RIZZ - Radio Interface with Zooming and Zeal
-# SPECTACLE — SPECtrum Toolkit for Analysis and Calibrated Live Exploration
-# MUSTAFAR - Mustafa's Unified Spectrum Toolkit for Analysis, Frequencies, and Radio
-# SUSDR - Spectrum Utility for Software-Defined Radio
-# FINALLY - Frequency and IQ Navigation, Analysis, Logging, and Live DisplaY
+# LINDA — Live IQ Navigation and Display Application
 
 A live RF visualization suite for software-defined radios, built by Mustafa Omran.
 
