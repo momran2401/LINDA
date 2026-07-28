@@ -29,7 +29,7 @@ DEVICE_PROFILES = {
     "air8201b": {
         "label": "AIR8201B",
         "channels": (0, 1),
-        "defaults": {"center": 1955e6, "sample_rate": 15.36e6, "gain": 0.0},
+        "defaults": {"center": 3750e6, "sample_rate": 15.36e6, "gain": 0.0},
         "envelope": {
             "freq_min": 300e6, "freq_max": 6e9,
             "gain_min": -60.0, "gain_max": 10.0,
@@ -44,7 +44,7 @@ DEVICE_PROFILES = {
     "air7101b": {
         "label": "AIR7101B",
         "channels": (0, 1),
-        "defaults": {"center": 1955e6, "sample_rate": 15.36e6, "gain": 0.0},
+        "defaults": {"center": 3750e6, "sample_rate": 15.36e6, "gain": 0.0},
         "envelope": {
             "freq_min": 300e6, "freq_max": 6e9,
             "gain_min": -60.0, "gain_max": 10.0,
@@ -55,7 +55,7 @@ DEVICE_PROFILES = {
     "air7201b": {
         "label": "AIR7201B",
         "channels": (0, 1),
-        "defaults": {"center": 1955e6, "sample_rate": 15.36e6, "gain": 0.0},
+        "defaults": {"center": 3750e6, "sample_rate": 15.36e6, "gain": 0.0},
         "envelope": {
             "freq_min": 300e6, "freq_max": 6e9,
             "gain_min": -60.0, "gain_max": 10.0,
@@ -72,7 +72,10 @@ DEVICE_PROFILES = {
         "master_clock_rate": 61.44e6,
         # 3.84 MS/s default: sustained 15.36 MS/s over the Pluto's USB link is
         # optimistic; start on the safe LTE grid point and let the user go up.
-        "defaults": {"center": 1955e6, "sample_rate": 3.84e6, "gain": 0.0},
+        # 3750 MHz is the project-wide default center, and it is legal here —
+        # but only 50 MHz below the AD936x ceiling, so a Pluto starts with very
+        # little room to tune up. Nudge it down before sweeping.
+        "defaults": {"center": 3750e6, "sample_rate": 3.84e6, "gain": 0.0},
         "envelope": {
             "freq_min": 325e6,  "freq_max": 3.8e9,
             "gain_min": 0.0,    "gain_max": 73.0,
@@ -86,7 +89,7 @@ DEVICE_PROFILES = {
         # fallbacks only exist so the UI has sane bounds until then.
         "label": "SoapySDR device",
         "channels": (0,),
-        "defaults": {"center": 1955e6, "sample_rate": 3.84e6, "gain": 0.0},
+        "defaults": {"center": 3750e6, "sample_rate": 3.84e6, "gain": 0.0},
         "envelope": {
             "freq_min": 1e6,   "freq_max": 6e9,
             "gain_min": 0.0,   "gain_max": 76.0,
@@ -97,7 +100,7 @@ DEVICE_PROFILES = {
     "demo": {
         "label": "Demo (synthetic IQ)",
         "channels": (0, 1),
-        "defaults": {"center": 1955e6, "sample_rate": 15.36e6, "gain": 0.0},
+        "defaults": {"center": 3750e6, "sample_rate": 15.36e6, "gain": 0.0},
         "envelope": {
             "freq_min": 300e6, "freq_max": 6e9,
             "gain_min": -60.0, "gain_max": 10.0,
@@ -107,7 +110,7 @@ DEVICE_PROFILES = {
     },
 }
 
-DEFAULT_CENTER      = 1955e6
+DEFAULT_CENTER      = 3750e6
 DEFAULT_SAMPLE_RATE = 15.36e6
 DEFAULT_GAIN        = 0.0
 DEFAULT_NFFT        = 1024

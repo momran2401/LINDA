@@ -8,15 +8,24 @@
     <!-- No CDN dependencies: hotspot/ethernet modes run with no internet.
          Fonts fall back to the system stacks declared in style.css; uPlot is
          vendored in web/vendor/ (with a CDN fallback only if it is missing). -->
-    <link rel="stylesheet" href="style.css?v=20260728-3">
+    <link rel="icon" href="favicon.svg">
+    <link rel="stylesheet" href="style.css?v=20260728-4">
     <link rel="stylesheet" href="vendor/uPlot.min.css">
 </head>
 <body class="mode-pro">
 
 <!-- ══ HEADER ═══════════════════════════════════════════════════════════════ -->
 <header id="app-header">
+    <!-- Brand lockup: PSD envelope + wordmark standing on a shared frequency
+         axis. Pure CSS (five empty <i> bars) — no SVG, no image, no font dep;
+         every colour is var(--accent), so the light theme recolours it. -->
     <div class="brand">
-        <div class="brand-title">LINDA</div>
+        <div class="brand-lockup">
+            <span class="brand-mark" aria-hidden="true">
+                <i></i><i></i><i></i><i></i><i></i>
+            </span>
+            <span class="brand-title">LINDA</span>
+        </div>
         <div class="brand-sub" id="brand-device">NIST · CTL</div>
     </div>
 
@@ -88,8 +97,8 @@
 
             <label class="ctrl-row">Mode
                 <select id="mode-sel">
-                    <option value="replace" title="Full-window snapshots; large time windows can reduce frame rate">Boring 🥱</option>
-                    <option value="scroll" selected title="Rolling client-side history; keeps the live stream responsive">Cool 😎</option>
+                    <option value="replace" selected title="Full-window snapshots; large time windows can reduce frame rate">Boring 🥱</option>
+                    <option value="scroll" title="Rolling client-side history; keeps the live stream responsive">Cool 😎</option>
                 </select>
             </label>
 
@@ -336,7 +345,7 @@ if (!window.uPlot) {
     document.write('<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"><\/script>');
 }
 </script>
-<script src="app.js?v=20260728-2"></script>
+<script src="app.js?v=20260728-3"></script>
 
 <!-- Rail tab switching + collapsing menu (layout only — plain divs, never
      sends control) -->

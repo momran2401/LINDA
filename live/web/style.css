@@ -18,7 +18,8 @@
     --rail:    #0b0c0e;
     --inset:   #060708;   /* input wells */
     --black:   #000000;   /* band monitor */
-    --plot-bg: #000000;   /* = PSD_BG in app.js — do not drift */
+    --plot-bg: #000000;   /* read by app.js (psdBg): uPlot bg + PNG export fill */
+    --plot-grid: #22262c; /* read by app.js (psdGrid): uPlot grid lines */
     --log-bg:  #000000;
     --wf-bg:   #050608;
 
@@ -86,9 +87,56 @@ h1, h2 { font-weight: 600; }
     background: var(--bg2);
     border-bottom: 1px solid var(--border);
 }
+/* ── Brand lockup ────────────────────────────────────────────────────────
+ * The mark is a five-bar PSD envelope; the wordmark stands on the same 1 px
+ * frequency axis, and .brand-sub sits under the rule as its axis label.
+ * Bar heights are tuned to the 12 px wordmark's cap height (11 px).
+ * .brand-lockup--lg is the 16 px variant (login / splash); .brand-mark--only
+ * is the mark on its own (favicon-ish contexts, tab strips). */
 .brand { line-height: 1.15; flex: 0 0 auto; }
-.brand-title { font-size: 12px; font-weight: 700; letter-spacing: 0.16em; color: #b3bac4; }
-.brand-sub   { font-size: 9.5px; letter-spacing: 0.08em; color: var(--text-faint); white-space: nowrap; }
+.brand-lockup {
+    display: flex; align-items: flex-end; gap: 7px;
+    padding-bottom: 3px; border-bottom: 1px solid var(--accent);
+}
+.brand-mark {
+    display: flex; align-items: flex-end; gap: 1.5px;
+    height: 11px; flex: 0 0 auto;
+}
+.brand-mark i { width: 2px; background: var(--accent); }
+.brand-mark i:nth-child(1) { height:  4px; opacity: 0.40; }
+.brand-mark i:nth-child(2) { height:  6px; opacity: 0.62; }
+.brand-mark i:nth-child(3) { height: 11px; }
+.brand-mark i:nth-child(4) { height:  6px; opacity: 0.62; }
+.brand-mark i:nth-child(5) { height:  3px; opacity: 0.40; }
+.brand-title {
+    display: block; font-size: 12px; font-weight: 700; letter-spacing: 0.16em;
+    line-height: 0.86;   /* seats the caps on the axis, no descender gap */
+    color: #b3bac4;
+}
+.brand-sub   { font-size: 9.5px; letter-spacing: 0.08em; color: var(--text-faint); white-space: nowrap; margin-top: 2px; }
+
+/* 16 px variant — login form, splash, anywhere the lockup is the subject */
+.brand-lockup--lg { gap: 9px; padding-bottom: 4px; }
+.brand-lockup--lg .brand-mark   { height: 14px; gap: 2px; }
+.brand-lockup--lg .brand-mark i { width: 2.5px; }
+.brand-lockup--lg .brand-mark i:nth-child(1) { height:  5px; }
+.brand-lockup--lg .brand-mark i:nth-child(2) { height:  8px; }
+.brand-lockup--lg .brand-mark i:nth-child(3) { height: 14px; }
+.brand-lockup--lg .brand-mark i:nth-child(4) { height:  7px; }
+.brand-lockup--lg .brand-mark i:nth-child(5) { height:  4px; }
+.brand-lockup--lg .brand-title  { font-size: 16px; color: var(--text); }
+
+/* mark on its own: four bars over the axis, square footprint */
+.brand-mark--only {
+    height: 22px; gap: 2px; padding-bottom: 3px;
+    border-bottom: 2px solid var(--accent);
+}
+.brand-mark--only i { width: 3px; }
+.brand-mark--only i:nth-child(1) { height:  6px; opacity: 0.40; }
+.brand-mark--only i:nth-child(2) { height: 11px; opacity: 0.62; }
+.brand-mark--only i:nth-child(3) { height: 17px; opacity: 1; }
+.brand-mark--only i:nth-child(4) { height:  9px; opacity: 0.62; }
+.brand-mark--only i:nth-child(5) { display: none; }
 .hdiv { width: 1px; height: 30px; background: var(--border); flex: 0 0 auto; }
 
 .freq-readout { display: flex; align-items: baseline; gap: 9px; flex: 0 0 auto; }
@@ -550,6 +598,16 @@ body.light-theme {
     --green:       #1a9d55;
     --yellow:      #9a7500;
     --red:         #cf3a3a;
+
+    /* Data surfaces follow the theme too. app.js reads --plot-bg/--plot-grid
+       (and --text-dim) at draw time, so uPlot, its axes and the PNG export
+       fill pick these up on the next rebuild. The WATERFALL stays dark:
+       viridis is a fixed dark-ended colormap and "dark = quiet" is what
+       operators read, so --wf-bg is deliberately NOT inverted. */
+    --plot-bg:   #ffffff;
+    --plot-grid: rgba(86,96,114,0.14);
+    --log-bg:    #ffffff;
+    --black:     #ffffff;   /* band monitor */
 }
 /* Literal-colour text that would otherwise be near-white on light chrome. */
 body.light-theme .brand-title      { color: #2a323d; }
@@ -561,6 +619,23 @@ body.light-theme .rail-strip-label { color: #10151c; }
 body.light-theme .rail-menu        { box-shadow: 0 14px 28px rgba(24,32,45,0.18); }
 body.light-theme .ctrl-row         { border-bottom-color: #e2e6ec; }
 body.light-theme button:active     { background: #d6dde7; }
+
+/* Data surfaces: literal colours that only worked on a black background. */
+body.light-theme #log-pre           { color: #3a434f; }
+body.light-theme .log-info          { color: #1a63c8; }
+body.light-theme #band-monitor      { color: var(--yellow); }
+body.light-theme .bm-big b          { color: #8a6a00; }   /* #d9b13f fails on white */
+body.light-theme .bm-v              { color: var(--text); }
+body.light-theme .bm-bar            { background: var(--bg0); border-color: var(--border); }
+body.light-theme .bm-bar > i        { background: linear-gradient(90deg, var(--green), #b78a00); }
+body.light-theme .oph-ok            { background: var(--green); }
+body.light-theme .oph-warn          { background: #b78a00; }
+body.light-theme .op-state.op-ok    { color: var(--green);  background: rgba(26,157,85,0.12); }
+body.light-theme .op-state.op-warn  { color: #8a6a00;       background: rgba(154,117,0,0.12); }
+body.light-theme .op-state.op-bad   { color: var(--red);    background: rgba(207,58,58,0.10); }
+body.light-theme .op-lvl-warn       { color: #8a6a00; }
+body.light-theme .op-lvl-error      { color: var(--red); }
+body.light-theme #psd-plot          { background: var(--plot-bg); }
 
 /* ══ SCROLLBAR ════════════════════════════════════════════════════════════ */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
