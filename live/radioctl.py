@@ -14,14 +14,12 @@ Examples:
     python3 live/radioctl.py set --json '{"analysis":{"target":"psd","time_statistic":"mean,max"}}'
     python3 live/radioctl.py self-test          # reversible on-radio settings qual
 
-Auth: --user/--password, or RADIOCTL_USER / RADIOCTL_PASSWORD env vars
-(the password is prompted when a user is given without one). Local
-RADIO_AUTH_DISABLE=1 servers need no credentials.
+Auth: --user or RADIOCTL_USER. The username selects the role; no password is
+used. Local RADIO_AUTH_DISABLE=1 servers need no username.
 """
 
 import argparse
 import base64
-import getpass
 import json
 import os
 import sys
@@ -34,11 +32,11 @@ WARN_STATES = {"unverified"}
 
 
 class Client:
-    def __init__(self, base, user=None, password=None):
+    def __init__(self, base, user=None):
         self.base = base.rstrip("/")
         self.auth = None
         if user:
-            raw = "{}:{}".format(user, password or "").encode("utf-8")
+            raw = "{}:".format(user).encode("utf-8")
             self.auth = "Basic " + base64.b64encode(raw).decode("ascii")
 
     def _headers(self, extra=None):
@@ -210,8 +208,6 @@ def main():
         description="control/inspect the running radio-web backend")
     parser.add_argument("--url", default="http://127.0.0.1:8000")
     parser.add_argument("--user", default=os.environ.get("RADIOCTL_USER"))
-    parser.add_argument("--password", default=os.environ.get("RADIOCTL_PASSWORD"),
-                        help="prefer the prompt or RADIOCTL_PASSWORD over this flag")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
     watch = sub.add_parser("watch")
@@ -230,10 +226,7 @@ def main():
     setting.add_argument("--json", help="raw control payload (merged last)")
     args = parser.parse_args()
 
-    if args.user and args.password is None:
-        args.password = getpass.getpass(
-            "Radio password for {}: ".format(args.user))
-    client = Client(args.url, args.user, args.password)
+    client = Client(args.url, args.user)
 
     if args.command == "status":
         print_status(client)

@@ -19,18 +19,18 @@ import pytest
 
 LIVE = Path(__file__).resolve().parents[1]
 
-ADMIN = ("qa-admin", "qa-admin-pass-1")
-VIEWER = ("qa-viewer", "qa-viewer-pass-1")
+ADMIN = "qa-admin"
+VIEWER = "qa-viewer"
 
 
-def _basic(user, pw):
-    return "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+def _basic(user):
+    return "Basic " + base64.b64encode(f"{user}:".encode()).decode()
 
 
 def _req(base, path, auth=None, payload=None):
     headers = {}
     if auth:
-        headers["Authorization"] = _basic(*auth)
+        headers["Authorization"] = _basic(auth)
     data = None
     if payload is not None:
         data = json.dumps(payload).encode()
@@ -54,10 +54,12 @@ def server():
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     env = dict(os.environ,
-               ADMIN_USER=ADMIN[0], ADMIN_PASS=ADMIN[1],
-               VIEWER_USER=VIEWER[0], VIEWER_PASS=VIEWER[1],
-               INTERN_USER="qa-intern", INTERN_PASS="qa-intern-pass-1",
+               ADMIN_USER=ADMIN,
+               VIEWER_USER=VIEWER,
+               INTERN_USER="qa-intern",
                RADIO_SESSION_SECRET="qa-secret")
+    for name in ("ADMIN_PASS", "VIEWER_PASS", "INTERN_PASS"):
+        env.pop(name, None)
     env.pop("RADIO_AUTH_DISABLE", None)
     proc = subprocess.Popen(
         [sys.executable, str(LIVE / "striqt_web_server.py"),
@@ -101,6 +103,25 @@ def test_anonymous_page_redirects_to_login(server):
     except urllib.error.HTTPError as e:
         assert e.code == 303
         assert e.headers.get("Location") == "/login"
+
+
+def test_username_only_login_sets_session_cookie(server):
+    data = b"username=qa-viewer"
+    req = urllib.request.Request(
+        server + "/login", data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        opener.open(req, timeout=5)
+        raise AssertionError("expected login redirect")
+    except urllib.error.HTTPError as e:
+        assert e.code == 303
+        assert "radio_auth=" in e.headers.get("Set-Cookie", "")
 
 
 def test_viewer_cannot_mutate(server):
