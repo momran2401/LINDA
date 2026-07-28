@@ -575,6 +575,11 @@ def current_config():
         "backend": str(cfg.backend),
         "rows":    int(cfg.rows),
         "lo_null": bool(cfg.lo_null),
+        "ahawi": {
+            "enabled":    bool(cfg.ahawi),
+            "capture_ms": float(cfg.ahawi_capture_ms),
+            "align":      bool(cfg.ahawi_align),
+        },
         "calibration": calibration_status(cfg),
     })
 

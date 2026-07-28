@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import replace
 from fractions import Fraction
 
 import numpy as np
@@ -17,6 +18,8 @@ from .constants import (
     DEFAULT_FRACTIONAL_OVERLAP, AVG_BIN_GROUPS, MAX_TAIL, RING_ROW_FILL,
     MAX_ROWS_ABS, RATES_HZ, SSB_LO_BANDSTOP, SSB_MAX_RATE,
     SSB_SUBCARRIER_SPACING, CALIBRATED_GRID_BACKENDS,
+    AHAWI_ALIGN_MIN_DB, AHAWI_ALIGN_TARGET, AHAWI_MAX_SEGMENTS,
+    AHAWI_MIN_CAPTURE_MS, AHAWI_MAX_CAPTURE_MS,
 )
 from .striqt_compat import (
     analysis_specs, striqt_measurements, striqt_shared,
@@ -613,28 +616,201 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
     used by build_header to ship an honest frame header (LV-F1/F2).
     """
     requested = cfg.backend
+    effective = requested
     if requested == "ssb" and not ssb_grid_compatible(cfg.sample_rate,
                                                       cfg.ssb_subcarrier_spacing):
         # SSB needs the capture rate on the 14·scs grid. Selecting SSB retunes
         # to a compatible rate (P2b-5), so this only covers the transient (or a
         # rate the retune could not reach): run calibrated and REPORT it via
         # backend/backend_requested — never a phantom SSB view (LV-F2).
+        effective = "calibrated"
+    if effective in CALIBRATED_GRID_BACKENDS and not _ANALYSIS_OK:
+        # striqt isn't importable on this host (demo laptops, broken installs).
+        # The old dispatch raised here on EVERY tick; the compute backstop had
+        # no analysis param to revert, so the viewer froze in a silent error
+        # loop. Run the dependency-free quicklook and REPORT the substitution
+        # (LV-F2) — the client banner already renders backend_requested.
+        effective = "quicklook"
+    if effective == "calibrated":
         blocks, meta = calibrated_spectrogram(samples, cfg)
         executed = "calibrated"
-    elif requested == "calibrated":
-        blocks, meta = calibrated_spectrogram(samples, cfg)
-        executed = "calibrated"
-    elif requested == "psd":
+    elif effective == "psd":
         blocks, meta = psd_traces(samples, cfg)
         executed = "psd"
-    elif requested == "ssb":
+    elif effective == "ssb":
         blocks, meta = ssb_spectrogram(samples, cfg)
         executed = "ssb"
     else:
-        blocks, meta = db_spectrogram(samples, cfg.nfft, cfg.rows)
+        # When quicklook substitutes for a striqt backend, cfg.rows was derived
+        # for the OVERLAPPED grid and needs more samples than quicklook's
+        # non-overlapping rows·nfft — honest row count instead of zero-padding
+        # the bottom of the display dark.
+        rows = (max(1, samples.shape[1] // int(cfg.nfft))
+                if requested != "quicklook" else cfg.rows)
+        blocks, meta = db_spectrogram(samples, cfg.nfft, rows)
         executed = "quicklook"
     meta["backend"] = executed
     meta["backend_requested"] = requested
+    return blocks, meta
+
+
+# ---------------------------------------------------------------------------
+# AHAWI: one coherent capture, analyzed once, replayed in aligned segments
+# ---------------------------------------------------------------------------
+# The rolling live view recomputes a short window per display tick, so
+# consecutive frames are neither contiguous nor phase-aligned with the signal's
+# frame structure — TDD slots and SSB bursts "swim". AHAWI instead analyzes one
+# contiguous multi-segment capture with striqt (its intended usage) and the
+# client replays the result one viewing window at a time. With the segment
+# length equal to the burst period (5G SSB: 20 ms), every segment shows the
+# burst at the same row.
+
+# Backends AHAWI wraps. PSD's rows are statistics (not time) and SSB has its
+# own burst geometry — both are already coherent views, so AHAWI stays out.
+AHAWI_BACKENDS = frozenset({"calibrated", "quicklook"})
+
+
+def ahawi_executed_backend(cfg: RadioConfig) -> str:
+    """The backend an AHAWI capture will actually run (honest fallback)."""
+    if cfg.backend == "calibrated" and _ANALYSIS_OK:
+        return "calibrated"
+    return "quicklook"
+
+
+def ahawi_plan(cfg: RadioConfig) -> dict:
+    """
+    Segmentation plan for one AHAWI capture. Pure arithmetic, no I/O.
+
+    Segment length = cfg.duration (the viewing window; 20 ms when unset).
+    Rows-per-segment is hop-exact so segment boundaries land on STFT row
+    boundaries; the capture is `segments` windows plus — when alignment is on —
+    one extra segment of slack the align step may trim from the front. All of
+    it must fit the ring with the same honest bound the live view uses
+    (RING_ROW_FILL·MAX_TAIL, MAX_ROWS_ABS).
+    """
+    executed = ahawi_executed_backend(cfg)
+    fs = float(cfg.sample_rate)
+    if executed == "calibrated":
+        nfft = aligned_nfft(cfg.nfft)
+        hop  = analysis_hop(nfft, cfg.fractional_overlap)
+    else:
+        nfft = int(cfg.nfft)
+        hop  = nfft
+
+    seg_s = float(cfg.duration) if float(cfg.duration) > 0 else 0.02
+    rows_per_seg = max(1, round(seg_s * fs / hop))
+
+    limit = int(MAX_TAIL * RING_ROW_FILL)
+    max_total_rows = min((limit - (nfft - hop)) // hop, MAX_ROWS_ABS)
+
+    align = bool(cfg.ahawi_align)
+    extra_rows = rows_per_seg if align else 0
+    max_segments = max(1, (max_total_rows - extra_rows) // rows_per_seg)
+
+    capture_ms = min(max(float(cfg.ahawi_capture_ms), AHAWI_MIN_CAPTURE_MS),
+                     AHAWI_MAX_CAPTURE_MS)
+    requested = max(1, round((capture_ms / 1e3) / seg_s))
+    segments = int(min(requested, max_segments, AHAWI_MAX_SEGMENTS))
+    if segments < 2:
+        # One segment can't be aligned (nothing to fold against) and the extra
+        # slack would be pure waste.
+        align, extra_rows = False, 0
+
+    total_rows = segments * rows_per_seg + extra_rows
+    if executed == "calibrated":
+        need = calibrated_sample_count(nfft, total_rows, hop)
+    else:
+        need = total_rows * nfft
+    return {
+        "backend":       executed,
+        "nfft":          nfft,
+        "hop":           hop,
+        "rows_per_seg":  int(rows_per_seg),
+        "segments":      segments,
+        "align":         align,
+        "extra_rows":    int(extra_rows),
+        "total_rows":    int(total_rows),
+        "need_samples":  int(need),
+        # Executed spans (disclosed — may differ from the requested ms).
+        "segment_ms":    1e3 * rows_per_seg * hop / fs,
+        "capture_ms":    1e3 * segments * rows_per_seg * hop / fs,
+    }
+
+
+def ahawi_align_offset(blocks: np.ndarray, rows_per_seg: int, segments: int):
+    """
+    Burst-phase alignment: fold per-row power modulo the segment length and
+    find the periodic burst so it can sit at the same row in every segment.
+
+    Returns (offset_rows, aligned). offset_rows ∈ [0, rows_per_seg) is how many
+    rows to trim from the capture's front; aligned=False (offset 0) when the
+    folded profile has no convincing burst (flat spectrum, noise) — alignment
+    then would just add caprice.
+    """
+    if segments < 2 or rows_per_seg < 4:
+        return 0, False
+    usable = rows_per_seg * segments
+    if blocks.ndim != 3 or blocks.shape[1] < usable:
+        return 0, False
+    # Row power in linear units, averaged across channels and bins. dB→linear
+    # matters: a 30 dB burst must dominate the fold, not average away.
+    lin = np.power(10.0, blocks[:, :usable, :].astype(np.float64) / 10.0)
+    row_power = lin.mean(axis=(0, 2))
+    folded = row_power.reshape(segments, rows_per_seg).mean(axis=0)
+    # Light circular smoothing so a one-row glitch can't win the argmax.
+    k = max(1, rows_per_seg // 64)
+    if k > 1:
+        kernel = np.ones(k) / k
+        wrapped = np.concatenate([folded[-k:], folded, folded[:k]])
+        folded = np.convolve(wrapped, kernel, mode="same")[k:-k]
+    peak = int(np.argmax(folded))
+    baseline = float(np.median(folded))
+    contrast_db = 10.0 * math.log10(
+        max(float(folded[peak]), 1e-30) / max(baseline, 1e-30))
+    if contrast_db < AHAWI_ALIGN_MIN_DB:
+        return 0, False
+    target = int(rows_per_seg * AHAWI_ALIGN_TARGET)
+    return int((peak - target) % rows_per_seg), True
+
+
+def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
+    """
+    Analyze one coherent AHAWI capture: full-span spectrogram via the executed
+    backend, optional burst alignment, trim to exactly segments·rows_per_seg
+    rows. Returns (blocks, meta) in the normal compute_blocks contract, with
+    meta["ahawi"] carrying the replay geometry for the client.
+    """
+    started = time.perf_counter()
+    total_rows = plan["total_rows"]
+    if plan["backend"] == "calibrated":
+        # time_aperture would average away exactly the time structure AHAWI
+        # exists to show; duration=0 so nothing re-derives rows underneath us.
+        cfg_capture = replace(cfg, rows=total_rows, backend="calibrated",
+                              time_aperture=None, duration=0.0)
+        blocks, meta = calibrated_spectrogram(samples, cfg_capture)
+    else:
+        blocks, meta = db_spectrogram(samples, plan["nfft"], total_rows)
+    blocks = np.asarray(blocks, dtype=np.float32)
+
+    rows_per_seg, segments = plan["rows_per_seg"], plan["segments"]
+    offset, aligned = (ahawi_align_offset(blocks, rows_per_seg, segments)
+                       if plan["align"] else (0, False))
+    if offset > plan["extra_rows"]:
+        # Never read past the capture: alignment is capped by the slack rows.
+        offset, aligned = plan["extra_rows"], aligned
+    blocks = blocks[:, offset:offset + segments * rows_per_seg, :]
+
+    meta["backend"] = plan["backend"]
+    meta["backend_requested"] = cfg.backend
+    meta["ahawi"] = {
+        "segments":          segments,
+        "rows_per_segment":  rows_per_seg,
+        "segment_ms":        round(plan["segment_ms"], 3),
+        "capture_ms":        round(plan["capture_ms"], 3),
+        "aligned":           bool(aligned),
+        "align_offset_rows": int(offset),
+        "compute_ms":        round(1e3 * (time.perf_counter() - started), 1),
+    }
     return blocks, meta
 
 
@@ -694,6 +870,10 @@ def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False)
         header["psd_stats"] = list(meta["psd_stats"])
     if meta.get("time_span_ms") is not None:
         header["time_span_ms"] = float(meta["time_span_ms"])
+    # AHAWI replay geometry (additive): tells the client this frame is one
+    # coherent capture to slice into rows_per_segment windows client-side.
+    if meta.get("ahawi") is not None:
+        header["ahawi"] = dict(meta["ahawi"])
     requested = str(meta.get("backend_requested", executed))
     if requested != executed:
         header["backend_requested"] = requested

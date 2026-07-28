@@ -99,7 +99,20 @@
                 <select id="mode-sel">
                     <option value="replace" selected title="Full-window snapshots; large time windows can reduce frame rate">Boring 🥱</option>
                     <option value="scroll" title="Rolling client-side history; keeps the live stream responsive">Cool 😎</option>
+                    <option value="ahawi" title="One coherent capture analyzed with striqt, replayed one viewing window at a time — TDD slots and SSB bursts hold still instead of swimming">AHAWI ⚡</option>
                 </select>
+            </label>
+
+            <label class="ctrl-row ahawi-only" title="Length of each coherent capture. The server fits it to the ring and reports the executed value in the frame">Capture (ms)
+                <select id="ahawi-capture-sel">
+                    <option value="60">60</option>
+                    <option value="100" selected>100</option>
+                    <option value="200">200</option>
+                    <option value="500">500</option>
+                </select>
+            </label>
+            <label class="ctrl-row ahawi-only" title="Fold per-row power at the segment period and shift the replay so a periodic burst (e.g. the 20 ms SSB) sits at the same row in every segment">
+                <input type="checkbox" id="ahawi-align-chk" checked> Burst align
             </label>
 
             <label class="ctrl-row">Analysis
@@ -276,6 +289,27 @@
         <div id="noob-freq-groups"></div>
     </section>
 
+    <!-- AHAWI replay bar: client-side scrubber over one coherent capture.
+         Pure display controls (no server round-trip), so read-only roles may
+         use them — whitelisted in SAFE_SELECTOR. -->
+    <section id="ahawi-bar" class="ahawi-only">
+        <button id="ahawi-prev" title="Previous segment (pauses replay)">⏮</button>
+        <button id="ahawi-play" title="Play / pause the segment replay">⏸</button>
+        <button id="ahawi-next" title="Next segment (pauses replay)">⏭</button>
+        <input type="range" id="ahawi-scrub" min="0" max="0" step="1" value="0"
+               title="Scrub through the capture's segments">
+        <label class="ahawi-dwell-label" title="How long each segment stays on screen">dwell
+            <select id="ahawi-dwell">
+                <option value="100">100 ms</option>
+                <option value="200" selected>200 ms</option>
+                <option value="500">500 ms</option>
+                <option value="1000">1 s</option>
+            </select>
+        </label>
+        <span id="ahawi-badge">waiting for the first capture…</span>
+        <button id="ahawi-golive" hidden title="A newer capture arrived while paused — load it">● go live</button>
+    </section>
+
     <!-- Waterfalls — one pane per channel (cloned from template by app.js) -->
     <section id="waterfall-row"></section>
     <template id="wf-pane-tpl">
@@ -285,6 +319,9 @@
                 <canvas class="wf-canvas"></canvas>
                 <div class="wf-freq-axis"></div>
             </div>
+            <!-- AHAWI power-vs-time strip: whole capture, segment highlighted;
+                 click to jump. Hidden outside AHAWI mode. -->
+            <canvas class="wf-strip ahawi-only" title="Channel power over the whole capture — click to jump to a segment"></canvas>
         </div>
     </template>
 

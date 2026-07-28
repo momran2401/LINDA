@@ -102,6 +102,31 @@ restores the starting configuration afterwards.
 The web UI is CDN-free: uPlot is vendored in `live/web/vendor/` (setup.sh
 re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 
+## AHAWI mode (coherent capture → segmented replay)
+
+- Third display mode next to Boring/Cool: the Computer grabs one CONTIGUOUS
+  multi-segment chunk from the ring (`segments × duration`, ~100 ms), analyzes
+  it in ONE striqt pass, and ships it as a single frame with `header.ahawi`
+  geometry; the CLIENT replays it one viewing window at a time
+  (play/pause/step/scrub/dwell — all client-side, whitelisted for read-only
+  roles). The rolling modes recompute per display tick, so TDD slots/SSB
+  bursts swim; AHAWI's segments are phase-coherent, so they hold still.
+- Segment length = the existing `duration` control. `dsp.ahawi_plan()` owns the
+  geometry (hop-exact rows per segment, ring-fit clamps, +1 segment of slack
+  for alignment); the frame header discloses the EXECUTED spans.
+- Burst alignment (`ahawi_align_offset`): fold per-row power at the segment
+  period, shift so the burst (e.g. 20 ms 5G SSB at 3750 MHz) sits at the same
+  row in every segment; reports `aligned=false` on flat spectra instead of
+  aligning to noise.
+- Honesty: color scale pinned per capture (client); `coherent=false` flags a
+  drain gap inside the capture (`Acquirer.last_gap_time`); backend fallback is
+  disclosed via `backend`/`backend_requested`. AHAWI wraps calibrated/quicklook
+  only — PSD/SSB bypass it (client hints instead of silently ignoring).
+- Demo: `DEMO_BURST` is a fake SSB (20 ms period) synthesized with a
+  persistent sample counter, so it honestly swims in Cool mode and pins in
+  AHAWI. `compute_blocks` substitutes quicklook (disclosed) when striqt is
+  absent — a striqt-less host must never freeze in a compute-error loop.
+
 ## Recording (Record tab → `core/recording.py` → `sweep_runner.py`)
 
 - The live viewer opens the radio **gapless** (`core/devices/sources.py`), where

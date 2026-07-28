@@ -145,6 +145,22 @@ DEMO_TONES = (
     ((0.15, -0.9e6), (0.09,  3.3e6)),
 )
 
+# Demo periodic burst (AHAWI): a fake SSB — amplitude, RF offset from the
+# default center, period, and on-time. 20 ms period matches the 5G NR SSB
+# default, so the AHAWI demo behaves like the real 3750 MHz signal: pinned in
+# aligned replay, swimming in the rolling live view. Gating uses the demo's
+# persistent sample counter, so burst timing is continuous across frames.
+DEMO_BURST = {"amp": 0.35, "offset_hz": 0.6e6, "period_s": 0.020, "duty_s": 0.002}
+
+# AHAWI mode (coherent capture → segmented replay).
+AHAWI_MIN_CAPTURE_MS     = 20.0     # below this a "capture" is just one segment
+AHAWI_MAX_CAPTURE_MS     = 1000.0   # sanity ceiling; the ring clamp is stricter
+AHAWI_DEFAULT_CAPTURE_MS = 100.0
+AHAWI_MAX_SEGMENTS       = 64       # keeps the client scrubber sane
+AHAWI_ALIGN_TARGET       = 0.25     # burst sits at this fraction of each segment
+AHAWI_ALIGN_MIN_DB       = 3.0      # folded peak-over-median needed to trust alignment
+AHAWI_REFRESH_S          = 1.0      # min seconds between published captures
+
 # Spectrogram backends. Selection lives in core.state.SPEC_BACKEND.
 BACKENDS = {"calibrated", "quicklook", "ssb", "psd"}
 
