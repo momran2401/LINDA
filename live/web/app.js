@@ -581,6 +581,12 @@ function fmtAckValue(v) {
 function handleAck(ack) {
     const rounded  = ack.rounded  || [];
     const rejected = ack.rejected || [];
+    // Any applied change makes the capture AHAWI is currently replaying stale
+    // — mark it so the badge says "recapturing…" and the next capture loads
+    // immediately instead of waiting behind the queue/pause policy.
+    if ((ahawiActive || ahawiSelected) && (ack.applied || []).length) {
+        ahawiMarkStale();
+    }
     for (const r of rounded) {
         logMsg(`invalid ${r.field}=${fmtAckValue(r.requested)} → using ${fmtAckValue(r.used)} (${r.reason})`, "WARN");
     }
@@ -1262,6 +1268,39 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
 
 let ahawiUserModeChangeAt = 0;   // suppress select flip-flop right after a local change
 let ahawiBackendHint      = null;
+let ahawiStaleAt          = 0;   // >0: settings changed; replayed capture is stale
+let ahawiStaged           = false;   // capture/align/duration edits not yet applied
+
+// Settings changed on the server: whatever AHAWI is replaying no longer
+// reflects them. Say so, and let the NEXT capture jump the queue/pause hold.
+function ahawiMarkStale() {
+    ahawiStaleAt = performance.now();
+    updateAhawiBadge();
+}
+
+// Capture/align/duration edits are STAGED in AHAWI mode and shipped together
+// by the Apply button — so one deliberate action starts the recapture, instead
+// of three selects racing three separate captures.
+function ahawiSetStaged(on) {
+    ahawiStaged = on;
+    const btn = document.getElementById("ahawi-apply");
+    if (btn) {
+        btn.classList.toggle("staged", on);
+        btn.textContent = on ? "Apply •" : "Apply";
+    }
+}
+
+function ahawiSendSettings() {
+    const capSel  = document.getElementById("ahawi-capture-sel");
+    const alignCk = document.getElementById("ahawi-align-chk");
+    sendControl({
+        ahawi: true,
+        ahawi_capture_ms: capSel ? parseFloat(capSel.value) : 100,
+        ahawi_align: alignCk ? alignCk.checked : true,
+        capture: { duration: windowMs / 1000 },
+    });
+    ahawiSetStaged(false);
+}
 
 function ahawiEls() {
     return {
@@ -1328,6 +1367,15 @@ function ahawiIngest(header, blocks, channels) {
             if (p[i] > hi) hi = p[i];
         }
         cap.powerRange[ch] = [lo, hi - lo < 3 ? lo + 3 : hi];
+    }
+    // A capture computed after a settings change clears the stale flag and
+    // loads IMMEDIATELY — the user just changed something and wants to see it,
+    // not wait behind the queue/pause policy. The 300 ms guard skips at most
+    // one already-in-flight capture from before the change.
+    if (ahawiStaleAt && performance.now() - ahawiStaleAt > 300) {
+        ahawiStaleAt = 0;
+        ahawiLoadCapture(cap);
+        return;
     }
     if (!ahawiCap) {
         ahawiLoadCapture(cap);
@@ -1435,11 +1483,27 @@ function updateAhawiBadge() {
     const a = ahawiCap.a;
     const t0 = (ahawiSeg * a.segment_ms).toFixed(0);
     const t1 = ((ahawiSeg + 1) * a.segment_ms).toFixed(0);
+    // Unaligned is a finding, not a failure — explain it. Off = the toggle;
+    // "no periodic burst" = alignment looked and found nothing to lock onto
+    // (contrast in the header makes the verdict checkable).
+    let alignTxt;
+    if (a.aligned) {
+        alignTxt = "burst-aligned";
+    } else if (a.align_requested === false) {
+        alignTxt = "align off";
+    } else {
+        alignTxt = `no periodic burst found (${a.align_contrast_db ?? "?"} dB)`;
+    }
     let text = `seg ${ahawiSeg + 1}/${a.segments} · +${t0}–${t1} ms · ` +
-               `${a.aligned ? "burst-aligned" : "unaligned"} · ` +
-               `compute ${a.compute_ms} ms`;
+               `${alignTxt} · compute ${a.compute_ms} ms`;
     els.badge.innerHTML = "";
     els.badge.appendChild(document.createTextNode(text));
+    if (ahawiStaleAt) {
+        const stale = document.createElement("span");
+        stale.className = "warn";
+        stale.textContent = " · settings changed — recapturing…";
+        els.badge.appendChild(stale);
+    }
     if (a.coherent === false) {
         const warn = document.createElement("span");
         warn.className = "warn";
@@ -2519,14 +2583,9 @@ document.getElementById("mode-sel").addEventListener("change", (e) => {
     // Clear display buffers so mode switch starts clean
     clearChannelBufs(wfBuf);
     if (ahawiSelected) {
-        const capSel  = document.getElementById("ahawi-capture-sel");
-        const alignCk = document.getElementById("ahawi-align-chk");
-        sendControl({
-            ahawi: true,
-            ahawi_capture_ms: capSel ? parseFloat(capSel.value) : 100,
-            ahawi_align: alignCk ? alignCk.checked : true,
-            capture: { duration: windowMs / 1000 },
-        });
+        // Entering the mode applies the currently staged settings in one shot.
+        ahawiSendSettings();
+        ahawiMarkStale();
     } else {
         if (ahawiActive) ahawiDeactivate();
         // One message: turn AHAWI off (only if it was on — keeps the op log
@@ -2538,12 +2597,17 @@ document.getElementById("mode-sel").addEventListener("change", (e) => {
     }
 });
 
-// AHAWI capture knobs (admin-only — read-only roles are blocked by the guard).
-document.getElementById("ahawi-capture-sel")?.addEventListener("change", (e) => {
-    sendControl({ ahawi_capture_ms: parseFloat(e.target.value) });
+// AHAWI capture knobs are STAGED (admin-only — read-only roles are blocked by
+// the guard): edits light up Apply instead of racing one recapture per select.
+document.getElementById("ahawi-capture-sel")?.addEventListener("change", () => {
+    ahawiSetStaged(true);
 });
-document.getElementById("ahawi-align-chk")?.addEventListener("change", (e) => {
-    sendControl({ ahawi_align: e.target.checked });
+document.getElementById("ahawi-align-chk")?.addEventListener("change", () => {
+    ahawiSetStaged(true);
+});
+document.getElementById("ahawi-apply")?.addEventListener("click", () => {
+    ahawiSendSettings();
+    ahawiMarkStale();
 });
 
 document.getElementById("analysis-sel").addEventListener("change", (e) => {
@@ -2574,10 +2638,13 @@ function applyDuration() {
     if (!isFinite(ms) || ms <= 0) return;
     windowMs = ms;
     // Replace mode: ship the duration itself — the server owns the hop-aware
-    // duration→rows mapping (P2a-4). AHAWI: duration is the segment length,
-    // same server-side ownership. Scroll mode: the display depth follows
-    // windowMs client-side; the server keeps streaming fixed 12-row chunks.
-    if (replaceMode || ahawiSelected) {
+    // duration→rows mapping (P2a-4). AHAWI: duration is the segment length —
+    // STAGED with the other capture knobs and shipped by Apply. Scroll mode:
+    // the display depth follows windowMs client-side; the server keeps
+    // streaming fixed 12-row chunks.
+    if (ahawiSelected) {
+        ahawiSetStaged(true);
+    } else if (replaceMode) {
         sendControl({ capture: { duration: windowMs / 1000 } });
     }
     updateMeta();

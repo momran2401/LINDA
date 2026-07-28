@@ -101,8 +101,9 @@ def test_align_offset_puts_the_burst_at_the_target_row():
     # arithmetic precisely. (Wide bursts land within their own width — the
     # demo end-to-end test covers that consistency property.)
     blocks = _synthetic_capture(segments, rps, 64, burst_at=200, burst_rows=3)
-    offset, aligned = ahawi_align_offset(blocks, rps, segments)
+    offset, aligned, contrast = ahawi_align_offset(blocks, rps, segments)
     assert aligned is True
+    assert contrast >= 3.0
     # After trimming `offset` rows, the burst should land at ~rps/4.
     landed = (200 - offset) % rps
     assert abs(landed - rps // 4) <= max(3, rps // 32)
@@ -111,9 +112,35 @@ def test_align_offset_puts_the_burst_at_the_target_row():
 def test_align_reports_unaligned_on_flat_noise():
     rng = np.random.default_rng(11)
     blocks = rng.normal(-90.0, 0.5, size=(2, 1500, 64)).astype(np.float32)
-    offset, aligned = ahawi_align_offset(blocks, 300, 5)
+    offset, aligned, contrast = ahawi_align_offset(blocks, 300, 5)
     assert aligned is False
     assert offset == 0
+    assert contrast < 3.0
+
+
+def test_align_survives_strong_constant_carriers():
+    """Regression: the fold used to run on raw mean-over-bins power, so a
+    constant carrier raised every row's baseline and buried the burst — the
+    demo's own tones left it at ~3.3 dB against a 3.0 dB gate ("unaligned" by
+    luck of the noise). The residual fold must remove stationary bins first."""
+    rps, segments = 300, 5
+    blocks = _synthetic_capture(segments, rps, 64, burst_at=200, burst_rows=3)
+    # A carrier 25 dB above the noise floor in a quarter of the bins, every row.
+    blocks[:, :, :16] += 25.0
+    offset, aligned, contrast = ahawi_align_offset(blocks, rps, segments)
+    assert aligned is True, f"carrier buried the burst (contrast {contrast} dB)"
+    landed = (200 - offset) % rps
+    assert abs(landed - rps // 4) <= max(3, rps // 32)
+
+
+def test_align_refuses_carrier_without_burst():
+    """A constant carrier alone has no segment-periodic component — aligning
+    to it would be caprice."""
+    rng = np.random.default_rng(13)
+    blocks = rng.normal(-90.0, 0.5, size=(2, 1500, 64)).astype(np.float32)
+    blocks[:, :, :16] += 25.0
+    _, aligned, _ = ahawi_align_offset(blocks, 300, 5)
+    assert aligned is False
 
 
 def test_capture_trims_to_exact_segment_rows_and_discloses_geometry():

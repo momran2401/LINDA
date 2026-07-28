@@ -742,20 +742,30 @@ def ahawi_align_offset(blocks: np.ndarray, rows_per_seg: int, segments: int):
     Burst-phase alignment: fold per-row power modulo the segment length and
     find the periodic burst so it can sit at the same row in every segment.
 
-    Returns (offset_rows, aligned). offset_rows ∈ [0, rows_per_seg) is how many
-    rows to trim from the capture's front; aligned=False (offset 0) when the
-    folded profile has no convincing burst (flat spectrum, noise) — alignment
-    then would just add caprice.
+    The fold runs on RESIDUAL power — each bin's stationary level (median over
+    time) is subtracted first. Constant carriers (CW tones, an occupied
+    channel) otherwise raise every row's mean power and bury a genuine burst
+    below any contrast gate: the demo's default tones left the old
+    mean-over-bins metric at ~3.3 dB against a 3.0 dB gate, i.e. aligned by
+    luck. In the residual domain only time-VARYING energy survives, so a real
+    burst clears the gate by orders of magnitude and pure noise folds flat.
+
+    Returns (offset_rows, aligned, contrast_db). offset_rows ∈ [0, rows_per_seg)
+    is how many rows to trim from the capture's front; aligned=False (offset 0)
+    when the folded residual has no convincing periodic burst — alignment then
+    would just add caprice. contrast_db is always reported so an unaligned
+    verdict is diagnosable in the frame header instead of a mystery.
     """
     if segments < 2 or rows_per_seg < 4:
-        return 0, False
+        return 0, False, 0.0
     usable = rows_per_seg * segments
     if blocks.ndim != 3 or blocks.shape[1] < usable:
-        return 0, False
-    # Row power in linear units, averaged across channels and bins. dB→linear
-    # matters: a 30 dB burst must dominate the fold, not average away.
+        return 0, False, 0.0
+    # dB→linear matters: a 30 dB burst must dominate the fold, not average away.
     lin = np.power(10.0, blocks[:, :usable, :].astype(np.float64) / 10.0)
-    row_power = lin.mean(axis=(0, 2))
+    stationary = np.median(lin, axis=1, keepdims=True)   # per bin, per channel
+    residual = np.clip(lin - stationary, 0.0, None)
+    row_power = residual.mean(axis=(0, 2))
     folded = row_power.reshape(segments, rows_per_seg).mean(axis=0)
     # Light circular smoothing so a one-row glitch can't win the argmax.
     k = max(1, rows_per_seg // 64)
@@ -768,9 +778,9 @@ def ahawi_align_offset(blocks: np.ndarray, rows_per_seg: int, segments: int):
     contrast_db = 10.0 * math.log10(
         max(float(folded[peak]), 1e-30) / max(baseline, 1e-30))
     if contrast_db < AHAWI_ALIGN_MIN_DB:
-        return 0, False
+        return 0, False, round(contrast_db, 1)
     target = int(rows_per_seg * AHAWI_ALIGN_TARGET)
-    return int((peak - target) % rows_per_seg), True
+    return int((peak - target) % rows_per_seg), True, round(contrast_db, 1)
 
 
 def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
@@ -793,8 +803,9 @@ def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
     blocks = np.asarray(blocks, dtype=np.float32)
 
     rows_per_seg, segments = plan["rows_per_seg"], plan["segments"]
-    offset, aligned = (ahawi_align_offset(blocks, rows_per_seg, segments)
-                       if plan["align"] else (0, False))
+    offset, aligned, contrast_db = (
+        ahawi_align_offset(blocks, rows_per_seg, segments)
+        if plan["align"] else (0, False, 0.0))
     if offset > plan["extra_rows"]:
         # Never read past the capture: alignment is capped by the slack rows.
         offset, aligned = plan["extra_rows"], aligned
@@ -808,7 +819,9 @@ def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
         "segment_ms":        round(plan["segment_ms"], 3),
         "capture_ms":        round(plan["capture_ms"], 3),
         "aligned":           bool(aligned),
+        "align_requested":   bool(plan["align"]),
         "align_offset_rows": int(offset),
+        "align_contrast_db": float(contrast_db),
         "compute_ms":        round(1e3 * (time.perf_counter() - started), 1),
     }
     return blocks, meta

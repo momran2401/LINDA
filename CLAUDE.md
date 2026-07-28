@@ -114,10 +114,16 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 - Segment length = the existing `duration` control. `dsp.ahawi_plan()` owns the
   geometry (hop-exact rows per segment, ring-fit clamps, +1 segment of slack
   for alignment); the frame header discloses the EXECUTED spans.
-- Burst alignment (`ahawi_align_offset`): fold per-row power at the segment
-  period, shift so the burst (e.g. 20 ms 5G SSB at 3750 MHz) sits at the same
-  row in every segment; reports `aligned=false` on flat spectra instead of
-  aligning to noise.
+- Burst alignment (`ahawi_align_offset`): subtract each bin's stationary power
+  (median over time) so constant carriers can't bury the burst, fold the
+  RESIDUAL per-row power at the segment period, shift so the burst (e.g. 20 ms
+  5G SSB at 3750 MHz) sits at the same row in every segment. Reports
+  `aligned=false` + `align_contrast_db` on flat spectra instead of aligning to
+  noise — the badge explains the verdict either way.
+- AHAWI capture knobs (capture length / segment duration / burst align) are
+  STAGED in the UI and shipped together by the mode's Apply button; any
+  applied config change marks the replayed capture stale ("recapturing…") and
+  the next capture loads immediately, jumping the queue/pause hold.
 - Honesty: color scale pinned per capture (client); `coherent=false` flags a
   drain gap inside the capture (`Acquirer.last_gap_time`); backend fallback is
   disclosed via `backend`/`backend_requested`. AHAWI wraps calibrated/quicklook

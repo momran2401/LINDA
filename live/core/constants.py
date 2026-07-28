@@ -150,7 +150,7 @@ DEMO_TONES = (
 # default, so the AHAWI demo behaves like the real 3750 MHz signal: pinned in
 # aligned replay, swimming in the rolling live view. Gating uses the demo's
 # persistent sample counter, so burst timing is continuous across frames.
-DEMO_BURST = {"amp": 0.35, "offset_hz": 0.6e6, "period_s": 0.020, "duty_s": 0.002}
+DEMO_BURST = {"amp": 0.5, "offset_hz": 0.6e6, "period_s": 0.020, "duty_s": 0.002}
 
 # AHAWI mode (coherent capture → segmented replay).
 AHAWI_MIN_CAPTURE_MS     = 20.0     # below this a "capture" is just one segment
