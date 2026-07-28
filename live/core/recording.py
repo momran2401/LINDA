@@ -28,10 +28,15 @@ class RecordingManager:
         self.acquirer = acquirer
         self.shared = shared
         self.demo = demo
-        self._lock = asyncio.Lock()
+        # asyncio primitives are created lazily in start(): on Python 3.9 (the
+        # radio host) their constructors bind the CURRENT event loop, so a
+        # plain synchronous construction — tests, tooling — raises "no current
+        # event loop" whenever an earlier asyncio.run() cleared it. start()
+        # always runs inside the server's loop, where creation is safe.
+        self._lock = None
         self._task = None
         self._process = None
-        self._stop = asyncio.Event()
+        self._stop = None
         self._thread_stop = threading.Event()
         self._status = {"state": "idle"}
 
@@ -108,6 +113,8 @@ class RecordingManager:
         }
 
     async def start(self, request):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         async with self._lock:
             if self.active():
                 raise RuntimeError("a recording is already running")

@@ -18,6 +18,13 @@ def _ensure_pixi_runtime_libs():
     """
     if os.name != "posix":
         return
+    if "pytest" in sys.modules:
+        # Never re-exec a test runner: execv replaces the pytest process
+        # mid-collection and the suite dies without printing a byte (observed
+        # on the radio host). The pixi shell that runs tests already has the
+        # right libraries; anything import-level that still breaks will fail
+        # loudly in the tests themselves.
+        return
     try:
         lib_dir = Path(sys.executable).resolve().parents[1] / "lib"
     except Exception:

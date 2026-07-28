@@ -213,12 +213,12 @@ def test_config_rejects_garbage_capture_ms_quietly():
 class FakeRingAcquirer:
     """Just enough Acquirer surface for Computer._ahawi_cycle."""
 
-    def __init__(self, need, gap_time=0.0):
+    def __init__(self, need):
         rng = np.random.default_rng(9)
         self._samples = (rng.standard_normal((2, need))
                          + 1j * rng.standard_normal((2, need))
                          ).astype(np.complex64) * 0.05
-        self._gap = gap_time
+        self._gap = 0.0
         self.published = []
         self.verified = []
 
@@ -238,7 +238,7 @@ class FakeRingAcquirer:
         self.verified.append(gen)
 
 
-def _run_computer_cycle(monkeypatch, gap_time=0.0):
+def _run_computer_cycle(monkeypatch, with_gap=False):
     from core import acquisition
     from core.acquisition import Computer
     from core.dsp import ahawi_plan
@@ -248,7 +248,13 @@ def _run_computer_cycle(monkeypatch, gap_time=0.0):
     shared.update({"backend": "quicklook", "ahawi": True,
                    "capture": {"duration": 0.02}})
     cfg = shared.snapshot()
-    acq = FakeRingAcquirer(ahawi_plan(cfg)["need_samples"], gap_time)
+    acq = FakeRingAcquirer(ahawi_plan(cfg)["need_samples"])
+    if with_gap:
+        # Stamp the gap immediately before the cycle so it falls inside the
+        # capture's ~120 ms wall-clock span even on slow hosts — stamping it
+        # before the fake ring's 30 MB random fill made the test flaky on the
+        # Jetson, where that generation alone outlasts the span.
+        acq._gap = time.time()
     computer = Computer(acq, shared)     # not started — cycle driven directly
     computer._ahawi_cycle(cfg)
     return acq
@@ -267,7 +273,7 @@ def test_computer_cycle_publishes_and_verifies(monkeypatch):
 
 
 def test_computer_cycle_flags_a_drain_gap_inside_the_capture(monkeypatch):
-    acq = _run_computer_cycle(monkeypatch, gap_time=time.time())
+    acq = _run_computer_cycle(monkeypatch, with_gap=True)
     assert acq.published[0][2]["ahawi"]["coherent"] is False
 
 
@@ -365,6 +371,10 @@ def test_demo_ahawi_switches_cleanly_back_to_rolling():
         acq.join(timeout=3.0)
 
 
+@pytest.mark.skipif(
+    __import__("core.striqt_compat", fromlist=["_ANALYSIS_OK"])._ANALYSIS_OK,
+    reason="needs a striqt-less host — with striqt installed the calibrated "
+           "backend genuinely runs and no substitution happens")
 def test_striqtless_calibrated_backend_falls_back_honestly():
     """Regression: with striqt absent, requesting the calibrated backend used
     to raise on every compute tick — nothing for the backstop to revert, so
