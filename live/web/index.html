@@ -8,7 +8,7 @@
     <!-- No CDN dependencies: hotspot/ethernet modes run with no internet.
          Fonts fall back to the system stacks declared in style.css; uPlot is
          vendored in web/vendor/ (with a CDN fallback only if it is missing). -->
-    <link rel="stylesheet" href="style.css?v=20260722-9">
+    <link rel="stylesheet" href="style.css?v=20260728-3">
     <link rel="stylesheet" href="vendor/uPlot.min.css">
 </head>
 <body class="mode-pro">
@@ -56,14 +56,25 @@
 
 <!-- ══ LEFT INSPECTOR RAIL ══════════════════════════════════════════════════ -->
 <aside id="rail">
-    <!-- tabs (plain divs, not buttons, so the read-only guard never blocks them) -->
-    <div class="rail-tabs" role="tablist">
-        <div class="rail-tab active" data-tab="display" role="tab">DISPLAY</div>
-        <div class="rail-tab pro-only" data-tab="psd" role="tab">PSD</div>
-        <div class="rail-tab pro-only" data-tab="insights" role="tab">MEASURE</div>
-        <div class="rail-tab pro-only" data-tab="capture" role="tab">CAPTURE</div>
-        <div class="rail-tab pro-only admin-only" data-tab="record" role="tab">RECORD</div>
-        <div class="rail-tab" data-tab="ops" role="tab">OPS</div>
+    <!-- Collapsing tab bar: a 38px strip names the active tool, the full menu
+         drops over the panel on hover / click. Tabs stay plain divs, not
+         buttons, so the read-only guard never blocks them. -->
+    <div class="rail-tabs" id="rail-tabs">
+        <div class="rail-strip" id="rail-strip" role="button" tabindex="0"
+             aria-expanded="false" aria-controls="rail-menu"
+             aria-label="Inspector tool — open the tool menu">
+            <span class="rail-strip-label" id="rail-strip-label">DISPLAY</span>
+            <span class="rail-strip-ticks" id="rail-strip-ticks" aria-hidden="true"></span>
+            <span class="rail-strip-chevron" aria-hidden="true">▾</span>
+        </div>
+        <div class="rail-menu" id="rail-menu" role="tablist" aria-label="Inspector tools">
+            <div class="rail-tab active" data-tab="display" role="tab" aria-selected="true">DISPLAY</div>
+            <div class="rail-tab pro-only" data-tab="psd" role="tab" aria-selected="false">PSD</div>
+            <div class="rail-tab pro-only" data-tab="insights" role="tab" aria-selected="false">MEASURE</div>
+            <div class="rail-tab pro-only" data-tab="capture" role="tab" aria-selected="false">CAPTURE</div>
+            <div class="rail-tab pro-only admin-only" data-tab="record" role="tab" aria-selected="false">RECORD</div>
+            <div class="rail-tab" data-tab="ops" role="tab" aria-selected="false">OPS</div>
+        </div>
     </div>
 
     <div class="rail-scroll">
@@ -280,6 +291,14 @@
         <div id="psd-container">
             <div id="psd-plot"></div>
             <canvas id="band-canvas"></canvas>
+            <!-- Trace keys share the axis-label row: RX1 left, RX2 (and the
+                 diff) right, "Frequency (MHz)" centred between them — costs no
+                 vertical space beyond the label itself. Filled by app.js. -->
+            <div id="psd-legend">
+                <div class="psd-keys" id="psd-keys-left"></div>
+                <span id="psd-axis-label">Frequency (MHz)</span>
+                <div class="psd-keys right" id="psd-keys-right"></div>
+            </div>
         </div>
     </section>
 
@@ -317,24 +336,78 @@ if (!window.uPlot) {
     document.write('<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"><\/script>');
 }
 </script>
-<script src="app.js?v=20260722-12"></script>
+<script src="app.js?v=20260728-2"></script>
 
-<!-- Rail tab switching (layout only — plain divs, never sends control) -->
+<!-- Rail tab switching + collapsing menu (layout only — plain divs, never
+     sends control) -->
 <script>
 (function () {
+    var wrap   = document.getElementById("rail-tabs");
+    var strip  = document.getElementById("rail-strip");
+    var label  = document.getElementById("rail-strip-label");
+    var ticks  = document.getElementById("rail-strip-ticks");
     var tabs   = Array.prototype.slice.call(document.querySelectorAll(".rail-tab"));
     var panels = Array.prototype.slice.call(document.querySelectorAll(".rail-panel"));
-    function select(name) {
-        tabs.forEach(function (t) { t.classList.toggle("active", t.dataset.tab === name); });
-        panels.forEach(function (p) { p.classList.toggle("active", p.dataset.panel === name); });
+
+    // One tick per tab, in menu order; a tab hidden by the current mode/role
+    // drops its tick, so the strip always reflects what is actually reachable.
+    tabs.forEach(function () { ticks.appendChild(document.createElement("i")); });
+
+    function shown(el) { return getComputedStyle(el).display !== "none"; }
+
+    function paintTicks() {
+        tabs.forEach(function (t, i) {
+            var tick = ticks.children[i];
+            tick.hidden = !shown(t);
+            tick.classList.toggle("on", t.classList.contains("active"));
+        });
     }
+
+    function setOpen(on) {
+        wrap.classList.toggle("open", on);
+        strip.setAttribute("aria-expanded", String(on));
+        if (on) paintTicks();
+    }
+
+    function select(name) {
+        tabs.forEach(function (t) {
+            var on = t.dataset.tab === name;
+            t.classList.toggle("active", on);
+            t.setAttribute("aria-selected", String(on));
+            if (on) label.textContent = t.textContent;
+        });
+        panels.forEach(function (p) { p.classList.toggle("active", p.dataset.panel === name); });
+        paintTicks();
+    }
+
+    strip.addEventListener("click", function () { setOpen(!wrap.classList.contains("open")); });
+    strip.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
+            ev.preventDefault();
+            setOpen(!wrap.classList.contains("open"));
+        } else if (ev.key === "Escape") {
+            setOpen(false);
+        }
+    });
+    wrap.addEventListener("mouseenter", function () { setOpen(true); });
+    wrap.addEventListener("mouseleave", function () { setOpen(false); });
+
     tabs.forEach(function (t) {
         t.addEventListener("click", function () {
             // Ignore clicks on tabs hidden in the current mode (pro-only in ARIC).
-            if (getComputedStyle(t).display === "none") return;
+            if (!shown(t)) return;
             select(t.dataset.tab);
+            setOpen(false);        // collapse back to the strip after choosing
         });
     });
+
+    // The DAN/ARIC switch changes which tabs exist; this listener bubbles, so
+    // it runs after the mode handler has already retagged <body>.
+    document.addEventListener("click", function (ev) {
+        if (ev.target && ev.target.closest && ev.target.closest(".mode-opt")) paintTicks();
+    });
+
+    select("display");
 })();
 </script>
 

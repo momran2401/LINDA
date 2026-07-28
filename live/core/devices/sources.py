@@ -1,6 +1,6 @@
 """striqt source classes for non-AIR-T SoapySDR radios.
 
-PlutoSource is ported from live/pluto_standalone.py (P3-1); GenericSoapySource
+PlutoSource is ported from live/legacy/pluto_standalone.py (P3-1); GenericSoapySource
 extends the same trick to any SoapySDR driver string, best-effort. Both reuse
 the Air8201BSourceSpec values — the Soapy drivers ignore the AirStack
 master-clock/time-source fields they don't implement. striqt/ itself is never
@@ -51,7 +51,7 @@ def make_source_spec(device=None, overrides=None):
 if _SENSOR_OK and _SoapySource is not None:
     class PlutoSource(Airstack1Source):
         """
-        PlutoSDR adapter (ported from live/pluto_standalone.py, P3-1).
+        PlutoSDR adapter (ported from live/legacy/pluto_standalone.py, P3-1).
 
         Subclasses Airstack1Source to reuse all of its striqt stream/arm/read
         machinery, but overrides __init__ to call SoapySource.__init__ directly.

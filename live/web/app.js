@@ -1218,8 +1218,9 @@ function renderWfAxis() {
 // PSD (uPlot)
 // ---------------------------------------------------------------------------
 
-const PSD_BG    = "#0e1726";
+const PSD_BG    = "#000000";
 const PSD_FG    = "#8b97a8";
+const PSD_GRID  = "#22262c";
 
 // Per-channel PSD trace colors live in CH_COLORS (P3-4); only the two-channel
 // difference trace keeps a dedicated color.
@@ -1233,6 +1234,36 @@ function psdYLabel() {
         : "Integrated power (dB rel. FS)";
 }
 
+// Height of the #psd-legend band plus its 4px inset — reserved out of the plot
+// so the canvas, its x ticks, and the key row all fit inside #psd-container.
+// Replaces measuring uPlot's own legend, which is now off.
+const PSD_LEGEND_H = 16;
+
+// uPlot reserves `size + labelSize` per axis and defaults to 50 + 30 = 80 px.
+// Fresh objects per call — uPlot mutates the axis descriptors it is handed.
+function psdAxis(opts) {
+    return Object.assign({
+        gap:    3,
+        stroke: PSD_FG,
+        ticks:  { stroke: PSD_FG, size: 4 },
+        grid:   { stroke: PSD_GRID },
+        font:   "11px Menlo,monospace",
+    }, opts);
+}
+
+function psdAxes() {
+    return [
+        // No x label here: "Frequency (MHz)" lives in the #psd-legend row below,
+        // flanked by the trace keys, so the label band is not paid for twice.
+        // 22 px = 4 px ticks + 3 px gap + one row of 11 px tick text.
+        psdAxis({ size: 22 }),
+        // The y gutter carries the tick values, so it stays wide; 14 px of it is
+        // the rotated axis label (vs uPlot's default 30).
+        psdAxis({ label: psdYLabel(), size: 54,
+                  labelSize: 14, labelFont: "10px Menlo,monospace" }),
+    ];
+}
+
 function psdPlotDimensions() {
     const container = document.getElementById("psd-container");
     const style = getComputedStyle(container);
@@ -1240,13 +1271,79 @@ function psdPlotDimensions() {
         - parseFloat(style.paddingLeft || 0) - parseFloat(style.paddingRight || 0);
     const innerHeight = container.clientHeight
         - parseFloat(style.paddingTop || 0) - parseFloat(style.paddingBottom || 0);
-    const legend = container.querySelector(".u-legend");
-    const legendHeight = legend ? legend.getBoundingClientRect().height : 28;
     return {
         width: Math.max(240, Math.floor(innerWidth || 900)),
-        height: Math.max(140, Math.floor((innerHeight || 300) - legendHeight)),
+        height: Math.max(120, Math.floor((innerHeight || 300) - PSD_LEGEND_H)),
     };
 }
+
+// ── PSD trace keys (the DOM legend) ──────────────────────────────────────────
+// Built from the series descriptors we hand uPlot, where `stroke` is still a
+// plain colour string (uPlot normalises it into a function afterwards).
+let psdSeriesSpec = [];
+
+function buildPsdLegend() {
+    const left  = document.getElementById("psd-keys-left");
+    const right = document.getElementById("psd-keys-right");
+    if (!left || !right) return;
+    left.innerHTML = "";
+    right.innerHTML = "";
+
+    // "RX1 Mean" → group 1. Anything without an RXn prefix (the RX1−RX2 diff)
+    // is group 0 and rides along on the right, keeping its full label.
+    const groupOf = (label) => {
+        const m = /^RX(\d+)\s+/.exec(label || "");
+        return m ? Number(m[1]) : 0;
+    };
+
+    const entries = [];
+    psdSeriesSpec.forEach((s, i) => {
+        if (i === 0 || !s.label) return;
+        entries.push({ i, label: s.label, stroke: s.stroke, group: groupOf(s.label) });
+    });
+
+    const firstGroup = entries.find((e) => e.group > 0)?.group ?? 0;
+    const seen = new Set();
+    for (const e of entries) {
+        const host = e.group === firstGroup && e.group > 0 ? left : right;
+        // Only the first key of a channel spells out "RX1 Mean"; the rest drop
+        // the prefix ("Max", "Hold", "Min") the way the design row does.
+        const bare = seen.has(e.group) && e.group > 0;
+        seen.add(e.group);
+
+        const el = document.createElement("span");
+        el.className = "psd-key";
+        el.dataset.series = String(e.i);
+        el.title = e.label;
+        const swatch = document.createElement("i");
+        swatch.style.background = e.stroke || PSD_FG;
+        const text = document.createElement("span");
+        text.textContent = bare ? e.label.replace(/^RX\d+\s+/, "") : e.label;
+        el.append(swatch, text);
+        host.appendChild(el);
+    }
+    paintPsdLegend();
+}
+
+// Dim the keys whose series is hidden. renderPsd() re-derives visibility from
+// the Hold/Min/diff checkboxes every frame, so this runs there too.
+function paintPsdLegend() {
+    if (!uplot) return;
+    document.querySelectorAll("#psd-legend .psd-key").forEach((el) => {
+        const s = uplot.series[Number(el.dataset.series)];
+        el.classList.toggle("is-off", !s || s.show === false);
+    });
+}
+
+document.getElementById("psd-legend")?.addEventListener("click", (ev) => {
+    const key = ev.target.closest && ev.target.closest(".psd-key");
+    if (!key || !uplot) return;
+    const i = Number(key.dataset.series);
+    const s = uplot.series[i];
+    if (!s) return;
+    uplot.setSeries(i, { show: s.show === false });
+    paintPsdLegend();
+});
 
 let psdResizeQueued = false;
 function fitUplotToContainer() {
@@ -1313,23 +1410,12 @@ function initUplot(freqs) {
             drag:  { x: false, y: false },
             focus: { prox: 32 },
         },
-        legend: { show: true, live: false },
+        legend: { show: false },   // replaced by the #psd-legend key row
         scales: {
             x: { time: false },
             y: { auto: true },
         },
-        axes: [
-            {
-                label:  "Frequency (MHz)",
-                stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
-                font:   "11px Menlo,monospace",
-            },
-            {
-                label:  psdYLabel(),
-                stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
-                font:   "11px Menlo,monospace",
-            },
-        ],
+        axes: psdAxes(),
         series,
         hooks: {
             draw: [drawPsdOverlays],
@@ -1344,6 +1430,8 @@ function initUplot(freqs) {
                               () => new Array(nfft).fill(null));
     uplot = new uPlot(opts, [Array.from(freqs), ...empty], container);
     uplotKind = "std:" + channelsKey(chans);
+    psdSeriesSpec = series;
+    buildPsdLegend();
 
     // Preserve the crosshair toggle across re-inits (a retune rebuilds the plot,
     // which would otherwise silently reset the cursor to "on") — LV-R9a.
@@ -1435,20 +1523,9 @@ function initUplotPsdStats(freqs, stats) {
             drag:  { x: false, y: false },
             focus: { prox: 32 },
         },
-        legend: { show: true, live: false },
+        legend: { show: false },   // replaced by the #psd-legend key row
         scales: { x: { time: false }, y: { auto: true } },
-        axes: [
-            {
-                label:  "Frequency (MHz)",
-                stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
-                font:   "11px Menlo,monospace",
-            },
-            {
-                label:  psdYLabel(),
-                stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
-                font:   "11px Menlo,monospace",
-            },
-        ],
+        axes: psdAxes(),
         series,
         hooks: { draw: [drawPsdOverlays] },
     };
@@ -1458,6 +1535,8 @@ function initUplotPsdStats(freqs, stats) {
                              () => new Array(nfft).fill(null));
     uplot = new uPlot(opts, [Array.from(freqs), ...empty], container);
     uplotKind = "psd:" + channelsKey(chans) + ":" + stats.join(",");
+    psdSeriesSpec = series;
+    buildPsdLegend();
 
     const crossChk = document.getElementById("cross-chk");
     if (crossChk) uplot.cursor.show = crossChk.checked;
@@ -1609,6 +1688,7 @@ function updatePSD(channels, blocks, rows, nfft) {
 
     uplot.setData(data);
     vis.forEach((v, i) => { if (i > 0) uplot.setSeries(i, { show: v }); });
+    paintPsdLegend();
 
     // Peak markers (strongest bin per visible channel) — LV-U1b
     if (peakMarker && !diffActive) {
@@ -1980,7 +2060,7 @@ function exportPng() {
     out.width  = W;
     out.height = H;
     const ctx = out.getContext("2d");
-    ctx.fillStyle = "#0e1726";
+    ctx.fillStyle = PSD_BG;
     ctx.fillRect(0, 0, W, H);
     let x = 0;
     for (const c of canvases) {

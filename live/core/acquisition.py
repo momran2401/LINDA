@@ -58,7 +58,7 @@ class Acquirer(threading.Thread):
 
     Keeping compute off this loop is what prevents DMA overflow: while a frame is
     being computed, _read_stream keeps draining the radio. This mirrors the
-    Acquirer/LocalReceiver split in striqt_standalone.py.
+    Acquirer/LocalReceiver split in legacy/striqt_standalone.py.
     """
 
     def __init__(self, shared: SharedConfig):
@@ -120,7 +120,7 @@ class Acquirer(threading.Thread):
             self._latest_header = header
             self._latest_blocks = [np.asarray(b, dtype=np.float32) for b in blocks]
 
-    # --- Ring buffer (thread-safe; ported from striqt_standalone.py) ---
+    # --- Ring buffer (thread-safe; ported from legacy/striqt_standalone.py) ---
 
     def _clear_ring_locked(self):
         self._write      = 0

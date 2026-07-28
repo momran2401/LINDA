@@ -2,7 +2,7 @@
  * Neutral-black instrument theme, fixed-viewport (no-scroll) layout.
  * Visual-only: every id, class, data-attr, and JS hook from index.html is
  * preserved. Palette anchors that CSS shares with app.js constants:
- *   --plot-bg #0e1726 (= PSD_BG, PNG export fill), --text-dim #8b97a8 (= PSD_FG),
+ *   --plot-bg #000000 (= PSD_BG, PNG export fill), --text-dim #8b97a8 (= PSD_FG),
  *   --mean #4ea3ff (= CH_COLORS[0].mean), --max #ff5252 (= CH_COLORS[0].max).
  *   Keep these in sync with app.js.
  */
@@ -18,7 +18,7 @@
     --rail:    #0b0c0e;
     --inset:   #060708;   /* input wells */
     --black:   #000000;   /* band monitor */
-    --plot-bg: #0e1726;   /* = PSD_BG in app.js — do not drift */
+    --plot-bg: #000000;   /* = PSD_BG in app.js — do not drift */
     --log-bg:  #000000;
     --wf-bg:   #050608;
 
@@ -33,8 +33,9 @@
     --text-mute:  #4a5059;
 
     /* accents — data + state only */
-    --accent:      #4ea3ff;
-    --accent-soft: rgba(78,163,255,0.13);
+    --accent:       #4ea3ff;
+    --accent-soft:  rgba(78,163,255,0.13);
+    --accent-faint: rgba(78,163,255,0.07);   /* active cell in the rail menu */
     --mean:        #4ea3ff;
     --max:         #ff5252;
     --ch2:         #9ac8ff;
@@ -163,15 +164,61 @@ h1, h2 { font-weight: 600; }
     background: var(--rail); border-right: 1px solid var(--border);
     display: flex; flex-direction: column; overflow: hidden;
 }
-.rail-tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg2); flex: 0 0 auto; }
-.rail-tab {
-    flex: 1 1 0; min-width: 0; display: flex; align-items: center; justify-content: center;
-    text-align: center; padding: 10px 0; font-size: 11px; font-weight: 700;
-    letter-spacing: 0.06em; color: var(--text-faint); border-bottom: 2px solid transparent;
-    cursor: pointer; user-select: none;
+/* ── Collapsing tab bar ──────────────────────────────────────────────────
+ * A 38 px strip names the active tool and keeps a tick per tab; the full
+ * 3-column menu drops OVER the panel on hover (or on click, for touch and
+ * keyboard). Menu items keep the .rail-tab class and data-tab hooks that
+ * app.js binds to, and stay plain divs so the read-only guard never blocks
+ * them. */
+.rail-tabs { position: relative; flex: 0 0 auto; z-index: 40; }
+
+.rail-strip {
+    display: flex; align-items: center; gap: 10px; height: 38px;
+    padding: 0 13px 0 14px; background: var(--bg2);
+    border-bottom: 1px solid var(--border); cursor: pointer; user-select: none;
 }
-.rail-tab:hover  { color: var(--text-dim); }
-.rail-tab.active { color: #eef1f5; border-bottom-color: var(--accent); }
+.rail-strip:hover { background: var(--bg3); }
+.rail-strip-label {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+    color: #eef1f5; white-space: nowrap;
+}
+.rail-strip-ticks { display: flex; align-items: flex-end; gap: 3px; margin-left: auto; }
+.rail-strip-ticks i { display: block; width: 3px; height: 9px; border-radius: 1px; background: var(--border2); }
+.rail-strip-ticks i.on { background: var(--accent); }
+.rail-strip-chevron {
+    font-size: 9px; line-height: 1; color: var(--text-faint);
+    transition: transform 180ms cubic-bezier(.2,.7,.2,1);
+}
+.rail-tabs.open .rail-strip-chevron { transform: rotate(180deg); }
+
+.rail-menu {
+    position: absolute; left: 0; right: 0; top: calc(100% - 1px);
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    background: var(--bg2); border-bottom: 1px solid var(--border);
+    box-shadow: 0 14px 28px rgba(0,0,0,0.55);
+    transform-origin: top center;
+    opacity: 0; transform: translateY(-8px) scaleY(0.94); pointer-events: none;
+    transition: opacity 160ms cubic-bezier(.2,.7,.2,1),
+                transform 200ms cubic-bezier(.2,.7,.2,1);
+}
+.rail-tabs.open .rail-menu {
+    opacity: 1; transform: translateY(0) scaleY(1); pointer-events: auto;
+}
+
+.rail-tab {
+    min-width: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 9px 0; font-size: 11px; font-weight: 700;
+    letter-spacing: 0.06em; color: var(--text-faint);
+    cursor: pointer; user-select: none;
+    /* Hairline above every cell. The menu overlaps the strip's own bottom
+     * border by 1 px (top: calc(100% - 1px)) so the first row reads as that
+     * single line rather than a double rule — which keeps the separators
+     * correct no matter how many tabs the current mode/role hides. */
+    border-top: 1px solid var(--border);
+    border-bottom: 2px solid transparent;
+}
+.rail-tab:hover  { color: #eef1f5; }
+.rail-tab.active { color: #eef1f5; border-bottom-color: var(--accent); background: var(--accent-faint); }
 
 /* The one deliberate exception to the no-scroll rule: the inspector tool list
  * can be taller than the rail (esp. the CAPTURE forms), so this region scrolls
@@ -334,6 +381,25 @@ body.analysis-psd #psd-row .legend-key { display: none; }
 .uplot .u-axis { color: var(--text-dim); font-size: 10px; }
 #band-canvas, #band-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; pointer-events: none; z-index: 10; }
 
+/* uPlot's own legend (a 24 px row) and the x-axis label band (another 14 px)
+ * carried the same information in 38 px of a panel that is mostly plot. Both
+ * are folded into this single 14 px band pinned to the bottom of the plot box:
+ * RX1 keys left, RX2 (and the RX1−RX2 diff) right, the axis label centred.
+ * Keys stay clickable — for the psd-stats backend they are the only trace
+ * toggle there is. */
+#psd-legend {
+    position: absolute; left: 6px; right: 6px; bottom: 4px; height: 14px;
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+    gap: 12px; z-index: 11; pointer-events: none;
+    font-family: var(--mono); font-size: 9.5px; line-height: 1;
+    color: var(--text-dim); white-space: nowrap; overflow: hidden;
+}
+.psd-keys { display: flex; align-items: center; gap: 11px; min-width: 0; overflow: hidden; }
+.psd-keys.right { justify-content: flex-end; }
+.psd-key { display: inline-flex; align-items: center; gap: 5px; pointer-events: auto; cursor: pointer; }
+.psd-key i { width: 11px; height: 2px; border-radius: 1px; flex: 0 0 auto; }
+.psd-key.is-off { opacity: 0.45; }
+
 /* log */
 #log-row { flex: 0 0 auto; }
 #log-pre {
@@ -478,8 +544,9 @@ body.light-theme {
     --text-dim:   #566072;
     --text-faint: #8892a1;
     --text-mute:  #a2abb8;
-    --accent:      #2563eb;
-    --accent-soft: rgba(37,99,235,0.12);
+    --accent:       #2563eb;
+    --accent-soft:  rgba(37,99,235,0.12);
+    --accent-faint: rgba(37,99,235,0.07);
     --green:       #1a9d55;
     --yellow:      #9a7500;
     --red:         #cf3a3a;
@@ -488,7 +555,10 @@ body.light-theme {
 body.light-theme .brand-title      { color: #2a323d; }
 body.light-theme #freq-mhz         { color: #10151c; }
 body.light-theme #applied-settings { color: #3a434f; }
-body.light-theme .rail-tab.active  { color: #10151c; }
+body.light-theme .rail-tab.active,
+body.light-theme .rail-tab:hover,
+body.light-theme .rail-strip-label { color: #10151c; }
+body.light-theme .rail-menu        { box-shadow: 0 14px 28px rgba(24,32,45,0.18); }
 body.light-theme .ctrl-row         { border-bottom-color: #e2e6ec; }
 body.light-theme button:active     { background: #d6dde7; }
 

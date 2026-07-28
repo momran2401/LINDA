@@ -14,7 +14,7 @@ from . import state
 
 # ---------------------------------------------------------------------------
 # striqt hardware shims
-# (match the getattr pattern used in striqt_server_TCP.py so this works
+# (match the getattr pattern used in legacy/striqt_server_TCP.py so this works
 #  against the installed striqt build which may differ from the vendored source)
 # ---------------------------------------------------------------------------
 
