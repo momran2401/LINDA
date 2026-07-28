@@ -339,7 +339,7 @@ The web UI has **no CDN dependencies** — uPlot is vendored in
 - **Health check from scripts** — `curl http://<host>:8000/health` works
   without credentials (minimal liveness info only).
 
-## 🤖 AI Assistance
+## AI Assistance
 Parts of this project were built with the help of generative AI tools, such as Claude Code, and OpenAI Codex. 
 All AI-generated outputs were reviewed, tested, and edited by the human project maintainer.
 
