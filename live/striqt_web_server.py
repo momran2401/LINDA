@@ -841,7 +841,7 @@ def _login_page(error: str = "") -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<title>Sign in · SDR LIVE Viewer - Div. 675</title>
+<title>Sign in · Live IQ Navigation & Display Application</title>
 <style>
   :root {{ --bg:#0b0f14; --panel:#111823; --border:#22303f; --text:#e6edf3;
           --dim:#8aa0b3; --accent:#4ea3ff; }}
