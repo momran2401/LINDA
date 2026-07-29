@@ -431,6 +431,12 @@ async def lifespan(app: FastAPI):
     _acquirer.start()
     if _computer is not None:
         _computer.start()
+    # Connect to gpsd now rather than on the first /gps request, so the Record
+    # tab shows a real fix (or a real error) instead of "connecting" to
+    # whoever happens to look first. Recordings never wait on this.
+    gps_reader = gps.get_reader()
+    if gps_reader is not None:
+        print(f"[gps] watching gpsd at {gps_reader.host}:{gps_reader.port}")
     # Give the radio (or demo) a moment to produce the first frame
     await asyncio.sleep(1.2)
     task = asyncio.create_task(_broadcaster())
@@ -440,6 +446,8 @@ async def lifespan(app: FastAPI):
     finally:
         if _recording is not None:
             await _recording.shutdown()
+        if gps_reader is not None:
+            gps_reader.stop()
         _shared.stop()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError,

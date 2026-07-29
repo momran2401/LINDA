@@ -203,6 +203,51 @@ def self_test(client, timeout=30.0):
     return 0
 
 
+def print_gps(client):
+    """Show the fix recordings will stamp on every capture.
+
+    Exit status is the useful part for scripts: 0 only when a recording
+    started now would carry real coordinates.
+    """
+    try:
+        gps = client.get("/gps")["gps"]
+    except Exception as exc:
+        print(f"gps: cannot reach the server — {exc}", file=sys.stderr)
+        return 2
+    if not gps.get("enabled"):
+        print("gps          : disabled (RADIO_GPS=0)")
+        return 1
+    lat, lon = gps.get("latitude"), gps.get("longitude")
+    if gps.get("valid") and lat is not None and lon is not None:
+        alt = gps.get("altitude_m")
+        print(f"gps          : {gps['mode']}-D fix")
+        print(f"position     : {lat:.6f}, {lon:.6f}"
+              + (f"  alt {alt:.1f} m" if isinstance(alt, (int, float)) else ""))
+        sats = gps.get("satellites_used")
+        eph = gps.get("error_horizontal_m")
+        print(f"quality      : {sats if sats is not None else '?'} satellites"
+              + (f", ±{eph:.1f} m horizontal" if isinstance(eph, (int, float)) else ""))
+        print(f"age          : {gps.get('age_s')} s   device: {gps.get('device') or '?'}")
+        print("\nRecordings will stamp these coordinates on every capture.")
+        return 0
+    # Not valid: say which of the several reasons applies.
+    if not gps.get("connected"):
+        reason = (f"gpsd unreachable ({gps['error']})" if gps.get("error")
+                  else "connecting to gpsd…")
+    elif gps.get("error"):
+        reason = gps["error"]
+    elif gps.get("stale"):
+        reason = f"fix is stale ({gps.get('age_s')} s old)"
+    elif (gps.get("mode") or 0) <= 1:
+        reason = "no fix yet — the receiver needs a view of the sky"
+    else:
+        reason = "no position"
+    print(f"gps          : NO FIX — {reason}")
+    print("\nRecordings will still run; every capture records gps_valid=0 and")
+    print("NaN coordinates (never 0.0/0.0).")
+    return 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="control/inspect the running radio-web backend")
@@ -216,6 +261,11 @@ def main():
     logs.add_argument("--interval", type=float, default=1.0)
     check = sub.add_parser("self-test")
     check.add_argument("--timeout", type=float, default=30.0)
+    gps_cmd = sub.add_parser(
+        "gps", help="show the GPS fix that recordings will stamp on captures")
+    gps_cmd.add_argument("--watch", action="store_true",
+                         help="keep polling until interrupted")
+    gps_cmd.add_argument("--interval", type=float, default=2.0)
     setting = sub.add_parser("set")
     setting.add_argument("--center-mhz", type=float)
     setting.add_argument("--rate-msps", type=float)
@@ -239,6 +289,16 @@ def main():
         stream_logs(client, args.interval)
     elif args.command == "self-test":
         return self_test(client, args.timeout)
+    elif args.command == "gps":
+        if not args.watch:
+            return print_gps(client)
+        try:
+            while True:
+                print("\033[2J\033[H", end="")
+                print_gps(client)
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            return 0
     else:  # set
         payload = json.loads(args.json) if args.json else {}
         capture = {}

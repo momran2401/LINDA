@@ -168,9 +168,17 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   research dataset are worse than an honest gap. A 2-D fix records position but
   NaN altitude. `acquire()` only reads a cached snapshot, so a wedged receiver
   can never slow or fail a sweep.
-- `GET /gps` and the Record tab show the live fix (and name WHY it isn't valid:
-  daemon unreachable / no device attached / no fix yet / stale). `RADIO_GPS=0`
-  disables the integration; `RADIO_GPS_HOST`/`RADIO_GPS_PORT` relocate gpsd.
+- `GET /gps`, `radioctl.py gps` (exit 0 only on a real fix — scriptable), and
+  the Record tab all show the live fix and name WHY it isn't valid: daemon
+  unreachable / no device attached / no fix yet / stale. The reader starts with
+  the server, not on first request. `RADIO_GPS=0` disables the integration;
+  `RADIO_GPS_HOST`/`RADIO_GPS_PORT` relocate gpsd.
+- `setup.sh install_gps()` provisions gpsd on a FRESH host: installs it, probes
+  `ttyACM*`/`ttyUSB*` for a device actually emitting NMEA (never claims an
+  Arduino or FTDI cable found on the same port class), binds it in
+  `/etc/default/gpsd` so it survives reboot, and warns without failing setup
+  when there is no receiver. `RADIO_GPS_DEVICE=/dev/ttyTHS1 bash setup.sh`
+  names a UART-wired module explicitly.
 - Recordings therefore embed the precise site location — relevant to any
   data-release decision (see the recordings note below).
 

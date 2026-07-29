@@ -776,7 +776,8 @@ function updateGpsStatus(g) {
     // Every not-valid case names itself: the operator should know whether to
     // wait for satellites or go fix the daemon.
     let why;
-    if (!g.connected) why = `gpsd unreachable${g.error ? " (" + g.error + ")" : ""}`;
+    if (!g.connected) why = g.error ? `gpsd unreachable (${g.error})`
+                                    : "connecting to gpsd…";
     else if (g.error) why = g.error;
     else if (g.stale) why = `fix is stale (${g.age_s}s old)`;
     else if (g.mode <= 1) why = "no fix yet — receiver needs sky view";
