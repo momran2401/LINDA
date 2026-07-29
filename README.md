@@ -55,22 +55,6 @@ starts the server plus a Cloudflare Tunnel and prints a public URL.
 
 ---
 
-## Command-line reference
-
-`striqt_web_server.py` (the same flags pass through `run_web.sh` and
-`striqt_kiosk.py -- …`):
-
-| Flag | Meaning |
-|---|---|
-| `--device X` | `air8201b` (default) · `air7201b` · `air7101b` · `pluto` · `demo` · `auto` (enumerate; must find exactly one) · `driver=X[,serial=Y]` (pick one of several; a USRP B205mini uses `driver=uhd`) |
-| `--demo` | alias for `--device demo` |
-| `--ports 0,1` | explicit RX port list (default `auto`: probe the driver, fall back to the profile) |
-| `--channels N` | use the first N channels (demo: create N) |
-| `--backend X` | `calibrated` (default) · `quicklook` · `psd` · `ssb` |
-| `--quantize` | uint8 waterfall frames (~4× smaller, good for slow links) |
-| `--fps N` | max broadcast frame rate |
-| `--host` / `--port` | bind address / port (default 0.0.0.0:8000) |
-
 ## Troubleshooting
 - **Setup fails after Installing GPS support** — no GPS serial device was
     detected. Re-run with sudo env RADIO_GPS_DEVICE=none bash setup.sh; this
