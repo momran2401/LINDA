@@ -70,14 +70,6 @@ for arg in "$@"; do
     esac
 done
 
-# Keep the friendly installer spelling out of the service configuration: the
-# runtime selector is deliberately explicit so a generic Soapy adapter knows
-# which driver to open.  B205mini/B2xx radios enumerate as driver=uhd.
-normalize_device_selector() {
-    [[ "$DEVICE" == "uhd" || "$DEVICE" == "usrp" ]] && DEVICE="driver=uhd"
-}
-normalize_device_selector
-
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33mWARNING: %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -96,7 +88,26 @@ failure_report() {
         echo "  Previous service restart was attempted after setup failure." >&2
     fi
 }
+# Installed before any other logic runs. An `set -e` abort with no trap in
+# place exits SILENTLY, which on the console is indistinguishable from "the
+# installer did nothing" — that is exactly how the bug below went unnoticed.
 trap failure_report EXIT
+
+# Keep the friendly installer spelling out of the service configuration: the
+# runtime selector is deliberately explicit so a generic Soapy adapter knows
+# which driver to open.  B205mini/B2xx radios enumerate as driver=uhd.
+#
+# The `if` and the explicit `return 0` are load-bearing: written as a bare
+# `[[ test ]] && assignment`, the function returns the status of the FAILED
+# test whenever the device is not a USRP, and `set -e` then killed the whole
+# installer at this line — before the trap above existed, so with no output.
+normalize_device_selector() {
+    if [[ "$DEVICE" == "uhd" || "$DEVICE" == "usrp" ]]; then
+        DEVICE="driver=uhd"
+    fi
+    return 0
+}
+normalize_device_selector
 
 # ── 0. Environment detection ────────────────────────────────────────────────
 HAVE_APT=0;     command -v apt-get   >/dev/null && HAVE_APT=1
