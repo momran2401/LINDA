@@ -13,6 +13,9 @@ Examples:
     python3 live/radioctl.py set --center-mhz 2593 --gain 5
     python3 live/radioctl.py set --json '{"analysis":{"target":"psd","time_statistic":"mean,max"}}'
     python3 live/radioctl.py self-test          # reversible on-radio settings qual
+    python3 live/radioctl.py tx status          # is the PA keyed? (exit 0 = yes)
+    python3 live/radioctl.py tx start --freq-mhz 2450 --seconds 5 --i-have-a-license
+    python3 live/radioctl.py tx stop
 
 Auth: --user or RADIOCTL_USER. The username selects the role; no password is
 used. Local RADIO_AUTH_DISABLE=1 servers need no username.
@@ -248,6 +251,83 @@ def print_gps(client):
     return 1
 
 
+def print_tx(client):
+    """Show whether this radio is transmitting, and what it can transmit.
+
+    Exit 0 only when a carrier is actually up, so a script can gate on it —
+    and so `radioctl tx status` is a usable "is the PA keyed?" check from a
+    terminal with no browser anywhere near it.
+    """
+    try:
+        status = client.get("/tx")["tx"]
+    except Exception as exc:
+        print(f"tx: cannot reach the server — {exc}", file=sys.stderr)
+        return 2
+    if not status.get("available"):
+        print("transmit     : unavailable — {}".format(
+            status.get("reason") or "unknown reason"))
+        return 1
+    caps = status.get("capabilities") or {}
+    env = caps.get("envelope") or {}
+    sim = " (SIMULATED — nothing is radiated)" if status.get("simulated") else ""
+    print("transmit     : available{}  {} channel(s)".format(
+        sim, caps.get("channels")))
+    if env.get("freq_min") is not None:
+        print("tx range     : {:.6g}–{:.6g} MHz".format(
+            env["freq_min"] / 1e6, env["freq_max"] / 1e6))
+    if env.get("gain_min") is not None:
+        print("tx gain      : {:g}–{:g} dB".format(env["gain_min"], env["gain_max"]))
+    plan = status.get("plan")
+    if not status.get("active") or not plan:
+        print("state        : idle — nothing is being transmitted")
+        return 1
+    print("state        : {} ({})".format(status["state"], plan["waveform"]))
+    print("carrier      : {:.6g} MHz  {:g} dB  {:.6g} MS/s  ch{}".format(
+        plan["frequency_hz"] / 1e6, plan["gain_db"],
+        plan["sample_rate_hz"] / 1e6, plan["channel"]))
+    print("elapsed      : {:.1f} s{}".format(
+        status.get("elapsed_s") or 0.0,
+        "  remaining {:.1f} s".format(status["remaining_s"])
+        if status.get("remaining_s") is not None else "  (until Stop)"))
+    print("samples      : {}  underflows: {}".format(
+        status.get("samples_written"), status.get("underflows")))
+    return 0
+
+
+def tx_start(client, args):
+    payload = {
+        "waveform": args.waveform,
+        "frequency_hz": args.freq_mhz * 1e6,
+        "offset_hz": (args.offset_khz or 0.0) * 1e3,
+        "channel": args.channel,
+    }
+    if args.gain is not None:
+        payload["gain_db"] = args.gain
+    if args.amplitude is not None:
+        payload["amplitude"] = args.amplitude
+    if args.seconds is not None:
+        payload["duration_s"] = args.seconds
+    # The legal notice is a server-side gate, not a UI decoration; a CLI
+    # transmitter accepts the same terms the browser does.
+    if not args.i_have_a_license:
+        print("radioctl: refusing to transmit without --i-have-a-license\n"
+              "  Transmitting on frequencies you are not authorized to use is a\n"
+              "  federal offense. Pass the flag only if you hold a license for\n"
+              "  this frequency or the output is going into a shielded load.",
+              file=sys.stderr)
+        return 2
+    client.post("/tx/acknowledge", {})
+    result = client.post("/tx/start", payload)["tx"]
+    plan = result.get("plan") or {}
+    print("TX started: {} at {:.6g} MHz, {:g} dB{} (op #{})".format(
+        plan.get("waveform"), plan.get("frequency_hz", 0) / 1e6,
+        plan.get("gain_db", 0),
+        ", {:g} s".format(plan["duration_s"]) if plan.get("duration_s")
+        else ", until stop",
+        result.get("op_id")))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="control/inspect the running radio-web backend")
@@ -266,6 +346,27 @@ def main():
     gps_cmd.add_argument("--watch", action="store_true",
                          help="keep polling until interrupted")
     gps_cmd.add_argument("--interval", type=float, default=2.0)
+    tx_cmd = sub.add_parser("tx", help="transmit mode: status / start / stop")
+    tx_sub = tx_cmd.add_subparsers(dest="tx_command", required=True)
+    tx_sub.add_parser("status", help="is this radio transmitting? (exit 0 if yes)")
+    tx_sub.add_parser("stop", help="stop transmitting immediately")
+    tx_go = tx_sub.add_parser("start", help="begin transmitting")
+    tx_go.add_argument("--waveform", default="cw",
+                       choices=("cw", "two_tone", "chirp", "noise"))
+    tx_go.add_argument("--freq-mhz", type=float, required=True)
+    tx_go.add_argument("--offset-khz", type=float, default=0.0,
+                       help="baseband offset of the tone from the TX centre")
+    tx_go.add_argument("--gain", type=float,
+                       help="TX gain in dB (default: the radio's minimum)")
+    tx_go.add_argument("--amplitude", type=float,
+                       help="IQ amplitude, 0-1 of full scale (default 0.5)")
+    tx_go.add_argument("--seconds", type=float,
+                       help="stop after this long (omit to transmit until stop)")
+    tx_go.add_argument("--channel", type=int, default=0)
+    tx_go.add_argument("--i-have-a-license", action="store_true",
+                       help="required: you are licensed for this frequency, or "
+                            "the output goes into a shielded load")
+
     setting = sub.add_parser("set")
     setting.add_argument("--center-mhz", type=float)
     setting.add_argument("--rate-msps", type=float)
@@ -289,6 +390,14 @@ def main():
         stream_logs(client, args.interval)
     elif args.command == "self-test":
         return self_test(client, args.timeout)
+    elif args.command == "tx":
+        if args.tx_command == "status":
+            return print_tx(client)
+        if args.tx_command == "stop":
+            client.post("/tx/stop", {})
+            print("TX stop requested")
+            return 0
+        return tx_start(client, args)
     elif args.command == "gps":
         if not args.watch:
             return print_gps(client)

@@ -158,6 +158,11 @@
             <label class="ctrl-row check pro-only"><span>Absolute RF</span><input type="checkbox" id="abs-rf" checked></label>
 
             <button id="reset-radio-btn" class="rail-danger pro-only admin-only" title="Restart the radio-web service (all viewers briefly disconnect)">Reset Radio</button>
+            <!-- Transmit mode. Hidden entirely unless the server reports a
+                 radio with TX channels and RADIO_TX enabled — a receive-only
+                 SDR must never be offered a button that can only fail. -->
+            <button id="tx-open-btn" class="rail-danger pro-only admin-only" hidden
+                    title="Transmit on the hardware's TX port">I'm feeling like a bad boy</button>
         </section>
 
         <section class="rail-panel pro-only admin-only" data-panel="record">
@@ -283,6 +288,92 @@
 </aside>
 
 <div id="recording-banner" hidden>Recording in progress — live display will resume automatically.</div>
+
+<!-- Transmit banner. Every connected client gets the TX state, not just the
+     admin driving it: people sharing an instrument are entitled to know it is
+     radiating. Admins see what is being transmitted; read-only roles are told
+     to stand by. -->
+<div id="tx-banner" hidden></div>
+
+<!-- ══ TRANSMIT MODAL (admin only) ═══════════════════════════════════════════
+     Two views in one dialog: the legal notice, then the controls. The notice
+     is not decoration — /tx/start refuses until POST /tx/acknowledge has been
+     made, so deleting this from the DOM buys nothing. -->
+<div id="tx-modal" class="tx-modal" hidden>
+    <div class="tx-dialog" role="dialog" aria-modal="true" aria-labelledby="tx-legal-title">
+
+        <section id="tx-legal" class="tx-view">
+            <h2 id="tx-legal-title" class="tx-legal-title">⚠ Transmit mode</h2>
+            <div id="tx-legal-body" class="tx-legal-body"></div>
+            <div class="tx-actions">
+                <button id="tx-accept" type="button" class="tx-danger">I have a license or a dummy load — arm TX</button>
+                <button id="tx-decline" type="button">Take me back</button>
+            </div>
+        </section>
+
+        <section id="tx-control" class="tx-view" hidden>
+            <div class="tx-head">
+                <h2>Transmit</h2>
+                <button id="tx-close" type="button" class="tx-close" aria-label="Close">✕</button>
+            </div>
+            <div id="tx-envelope" class="tx-envelope">Reading the radio's TX capability…</div>
+
+            <div class="tx-grid">
+                <label class="tx-field">Waveform
+                    <select id="tx-waveform"></select>
+                </label>
+                <label class="tx-field">Frequency (MHz)
+                    <input id="tx-frequency" type="number" step="0.001" placeholder="2450">
+                </label>
+                <label class="tx-field">Baseband offset (kHz)
+                    <input id="tx-offset" type="number" step="1" value="0"
+                           title="Where the tone sits relative to the TX centre frequency">
+                </label>
+                <label class="tx-field" id="tx-spacing-field" hidden>Tone spacing (kHz)
+                    <input id="tx-spacing" type="number" step="1" value="100">
+                </label>
+                <label class="tx-field" id="tx-chirp-bw-field" hidden>Chirp bandwidth (MHz)
+                    <input id="tx-chirp-bw" type="number" step="0.01" value="1">
+                </label>
+                <label class="tx-field" id="tx-chirp-period-field" hidden>Chirp period (ms)
+                    <input id="tx-chirp-period" type="number" step="0.1" value="10">
+                </label>
+                <label class="tx-field">TX gain (dB)
+                    <input id="tx-gain" type="number" step="0.5"
+                           title="Defaults to the quietest setting this radio supports">
+                </label>
+                <label class="tx-field">Amplitude (0–1 full scale)
+                    <input id="tx-amplitude" type="number" step="0.05" min="0.01" max="1" value="0.5">
+                </label>
+                <label class="tx-field">Sample rate (MS/s)
+                    <input id="tx-rate" type="number" step="0.01" placeholder="follow RX">
+                </label>
+                <label class="tx-field">Duration (seconds; blank = until Stop)
+                    <input id="tx-duration" type="number" min="0.1" step="0.1" placeholder="until Stop">
+                </label>
+                <label class="tx-field" id="tx-channel-field" hidden>TX channel
+                    <select id="tx-channel"></select>
+                </label>
+            </div>
+
+            <div class="btn-row">
+                <button id="tx-start" type="button" class="tx-danger">▲ Transmit</button>
+                <button id="tx-stop" type="button" disabled>■ Stop</button>
+            </div>
+
+            <!-- Live transmission readout: the animated wave, the word, and
+                 the settings actually in force underneath it. -->
+            <div id="tx-live" class="tx-live" hidden>
+                <div class="tx-live-title"><span class="tx-dot"></span><span id="tx-live-word">Transmitting</span></div>
+                <div id="tx-live-settings" class="tx-live-settings"></div>
+                <canvas id="tx-wave" class="tx-wave" width="640" height="96"></canvas>
+                <div class="tx-wave-note">Waveform shape only — the time axis is illustrative, not the real RF.</div>
+            </div>
+
+            <div id="tx-status" class="tx-status">idle</div>
+        </section>
+    </div>
+</div>
 
 <!-- ══ MAIN DASHBOARD ═══════════════════════════════════════════════════════ -->
 <main id="dashboard">

@@ -28,6 +28,7 @@ from .shims import (
     stream_buffers_for,
 )
 from .striqt_compat import ReceiveStreamError, specs
+from .tx import TX
 
 def make_capture(cfg):
     # port stays fixed at state.CHANNELS — the two-waterfall UI depends on both RX ports
@@ -360,6 +361,9 @@ class Acquirer(threading.Thread):
                 OPERATIONS.finish(op_id, "failed", "source open/arm raised")
             raise
         OPERATIONS.stage(op_id, "applied", "arm_spec completed, stream enabled")
+        # A new device handle means new TX capabilities (and invalidates any
+        # cached "not open yet"). core.tx re-probes on the next query.
+        TX.invalidate_capabilities()
         self.stream_mtu   = get_stream_mtu(self.source)
         self.stream_ports = get_stream_ports(self.source)
         # Capability envelope (P3-3): profiles that opt in get their tier-1
@@ -466,6 +470,11 @@ class Acquirer(threading.Thread):
     def _recover(self, cfg: RadioConfig, reason: str):
         """Close and reopen the radio. Returns new (read_size, tmp, buffers)."""
         print(f"[radio] recovering after: {reason}")
+        # Stop transmitting BEFORE the device handle is disturbed. The writer
+        # thread notices a swapped handle on its own, but that is the backstop;
+        # keying a PA into a stream whose device is being torn down is not
+        # something to leave to a race.
+        TX.shutdown()
         if state.DEVICE in devices.DEEPWAVE_MODELS and self.source is not None:
             # source.close() deinitializes the AD9371 management sensors for
             # this process. Recover AIR-T by replacing only its RX stream.
@@ -903,6 +912,18 @@ class DemoAcquirer(threading.Thread):
             duty   = max(1, round(DEMO_BURST["duty_s"] * fs))
             burst = tone(DEMO_BURST["amp"], burst_off) * ((idx % period) < duty)
 
+        # Simulated transmit: a demo TX has to SHOW something, or the operator
+        # cannot tell a correctly-tuned transmission from a no-op. The carrier
+        # is injected into the synthetic IQ at the offset a real receiver would
+        # see it, so "did I tune where I meant to" is answerable with no radio
+        # and nothing radiated.
+        inject = TX.demo_injection()
+        tx_tone = None
+        if inject is not None:
+            tx_off, tx_amp = inject
+            if abs(tx_off) <= 0.48 * fs:
+                tx_tone = tone(tx_amp, tx_off)
+
         chans = []
         for i in range(len(state.CHANNELS)):
             tones = DEMO_TONES[i % len(DEMO_TONES)]
@@ -913,6 +934,8 @@ class DemoAcquirer(threading.Thread):
                     sig += tone(amp, off)
             if burst is not None:
                 sig += burst
+            if tx_tone is not None:
+                sig += tx_tone
             noise = (self._rng.standard_normal(n)
                      + 1j * self._rng.standard_normal(n)
                      ).astype(np.complex64) * 0.04

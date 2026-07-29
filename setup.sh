@@ -931,9 +931,71 @@ wait_for_radio_release() {
 # ── 12. Service configuration ───────────────────────────────────────────────
 genpw() { openssl rand -hex 12 2>/dev/null || head -c24 /dev/urandom | base64 | tr -d '+/='; }
 
+# Transmit ships ENABLED — a radio with a TX port is expected to be able to use
+# it, and the operator meets the legal notice in the UI. What must NOT happen is
+# offering the feature on hardware that physically cannot transmit: an RTL-SDR
+# has no TX port, and a button whose only possible outcome is an error is worse
+# than no button. So ask the driver how many TX channels it has, and fall back
+# to what the radio family is known to be when the driver cannot be asked.
+RADIO_TX_DEFAULT=1
+TX_NOTE=""
+detect_tx_support() {
+    case "$RADIO_KIND" in
+        demo)
+            TX_NOTE="enabled, simulated (the demo source radiates nothing)"
+            return 0 ;;
+        rtlsdr|airspy)
+            RADIO_TX_DEFAULT=0
+            TX_NOTE="disabled — $RADIO_LABEL is receive-only"
+            return 0 ;;
+    esac
+    local channels=""
+    if [[ -x "$VENV_PY" ]]; then
+        channels="$("$VENV_PY" - <<'PY' 2>/dev/null
+import SoapySDR
+best = 0
+try:
+    rows = SoapySDR.Device.enumerate()
+except Exception:
+    rows = []
+for row in rows:
+    dev = None
+    try:
+        dev = SoapySDR.Device(dict(row))
+        best = max(best, int(dev.getNumChannels(SoapySDR.SOAPY_SDR_TX)))
+    except Exception:
+        pass
+    finally:
+        if dev is not None:
+            try:
+                SoapySDR.Device.unmake(dev)
+            except Exception:
+                pass
+print(best)
+PY
+)"
+    fi
+    if [[ "$channels" =~ ^[0-9]+$ ]]; then
+        if (( channels > 0 )); then
+            TX_NOTE="enabled — $channels TX channel(s) detected"
+        else
+            RADIO_TX_DEFAULT=0
+            TX_NOTE="disabled — the radio reports no TX channels"
+        fi
+    else
+        # Could not ask (no radio attached yet, driver busy, SoapySDR absent).
+        # Leave it on: the server re-probes the live device at runtime and
+        # hides the control itself if there is no TX port.
+        TX_NOTE="enabled — could not probe the radio; the server re-checks at runtime"
+    fi
+    return 0
+}
+
 write_env_file() {
     [[ $IS_ROOT -eq 1 ]] || return 0
     say "Writing $ENV_FILE"
+    detect_tx_support
+    info "transmit: $TX_NOTE"
     mkdir -p "$ENV_DIR"
     local secret
     if [[ -f "$ENV_FILE" ]] && grep -q RADIO_SESSION_SECRET "$ENV_FILE"; then
@@ -955,6 +1017,10 @@ ADMIN_USER="admin"
 VIEWER_USER="viewer"
 INTERN_USER="intern"
 RADIO_SESSION_SECRET="$secret"
+# Transmit mode. 1 = the "I'm feeling like a bad boy" control is offered to the
+# admin (the radio still has to have a TX port). Set to 0 on any deployment
+# where nobody should be able to key the PA — a kiosk in a public space, say.
+RADIO_TX="$RADIO_TX_DEFAULT"
 EOF
     # UHD locates a B2xx FPGA image through this variable. Debian's downloader
     # and Debian's libuhd disagree about the default path, so state it.
@@ -1217,6 +1283,7 @@ echo "    open        http://${MDNS_HOST}.local:$PORT     (or this host's IP)"
 echo "    sign in as  admin        — username only, no password"
 echo "    radio       $DEVICE  ($RADIO_LABEL)"
 echo "    radio check $RADIO_CHECK_STATUS"
+echo "    transmit    ${TX_NOTE:-enabled}"
 echo "    mode        $MODE"
 [[ -n "${HOTSPOT_NOTE:-}" ]]  && echo "    hotspot     $HOTSPOT_NOTE"
 [[ -n "${ETHERNET_NOTE:-}" ]] && echo "    ethernet    $ETHERNET_NOTE"

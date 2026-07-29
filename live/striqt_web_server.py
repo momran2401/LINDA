@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # core.striqt_compat (imported first, via the package) handles the AIR-T pixi
 # LD_LIBRARY_PATH re-exec before any scipy/striqt import.
-from core import devices, gps, health, state
+from core import devices, gps, health, state, tx
 from core.acquisition import Acquirer, Computer, DemoAcquirer
 from core.config import SharedConfig
 from core.constants import BACKENDS, CALIBRATED_GRID_BACKENDS, DEVICE_PROFILES
@@ -444,6 +444,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Kill the carrier FIRST. Every other shutdown step can be retried; a
+        # transmitter left keyed by a dying process cannot.
+        tx.TX.shutdown()
         if _recording is not None:
             await _recording.shutdown()
         if gps_reader is not None:
@@ -655,6 +658,104 @@ async def gps_status_endpoint():
     return JSONResponse(_json_safe({"gps": gps.status()}))
 
 
+# ---------------------------------------------------------------------------
+# Transmit mode
+# ---------------------------------------------------------------------------
+#
+# The legal notice lives HERE, server-side, and acknowledging it is a real API
+# call — a modal the browser can delete from the DOM is not a gate. /tx/start
+# refuses until the caller has acknowledged in this server process.
+
+TX_DISCLAIMER = {
+    "title": "Transmit mode",
+    "body": [
+        "This keys the radio's TX port and radiates real RF into whatever is "
+        "connected to it.",
+
+        "Transmitting on frequencies you are not licensed or authorized to use "
+        "is a federal offense. The FCC will come for your ass and they WILL "
+        "find you. Unlicensed emissions can also jam safety-of-life services — "
+        "GPS, aviation, public safety — which carries consequences well past a "
+        "fine.",
+
+        "You alone are responsible for making every transmission lawful where "
+        "you are: an appropriate license, an ISM band inside its power limits, "
+        "or a shielded enclosure or dummy load. NIST and this repository's "
+        "maintainers accept no responsibility for what you do with this "
+        "button.",
+
+        "Connect an antenna or a 50 Ω load before transmitting. Keying a power "
+        "amplifier into an open port can damage the radio.",
+
+        "Every transmission is logged: frequency, power, waveform, duration, "
+        "and operator.",
+    ],
+    "accept": "I have a license or a dummy load — arm TX",
+    "decline": "Take me back",
+}
+
+
+@app.get("/tx")
+async def tx_status_endpoint(request: Request):
+    """TX capability + live state. Any authenticated role may READ this — a
+    shared instrument that is radiating should say so to everyone on it."""
+    role = request.scope.get("role", DEFAULT_ROLE)
+    status = tx.TX.status()
+    status["acknowledged"] = tx.TX.is_acknowledged(role)
+    status["may_transmit"] = role in WRITE_ROLES
+    status["disclaimer"] = TX_DISCLAIMER
+    return JSONResponse(_json_safe({"tx": status}))
+
+
+@app.post("/tx/acknowledge")
+async def tx_acknowledge_endpoint(request: Request):
+    if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
+        return JSONResponse({"error": "admin privileges required"}, status_code=403)
+    role = request.scope.get("role", DEFAULT_ROLE)
+    tx.TX.acknowledge(role)
+    OPERATIONS.stage(
+        OPERATIONS.begin("tx", f"transmit legal notice acknowledged by {role}"),
+        "validated", "operator accepted responsibility for lawful transmission")
+    return JSONResponse(_json_safe({"tx": {"acknowledged": True}}))
+
+
+@app.post("/tx/start")
+async def tx_start_endpoint(request: Request):
+    role = request.scope.get("role", DEFAULT_ROLE)
+    if role not in WRITE_ROLES:
+        return JSONResponse({"error": "admin privileges required"}, status_code=403)
+    if _recording.active():
+        # One owner of the radio at a time. Recording swaps the source spec out
+        # from under the live view (core.shims.finite_capture_mode); a TX stream
+        # opened across that is a handle to a source being reconfigured.
+        return JSONResponse(
+            {"error": "cannot transmit while a recording is running"},
+            status_code=409)
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    try:
+        status = await asyncio.to_thread(tx.TX.start, payload, role)
+        return JSONResponse(_json_safe({"tx": status}), status_code=202)
+    except PermissionError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=428)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+
+
+@app.post("/tx/stop")
+async def tx_stop_endpoint(request: Request):
+    if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
+        return JSONResponse({"error": "admin privileges required"}, status_code=403)
+    status = await asyncio.to_thread(tx.TX.stop, "stopped by operator")
+    return JSONResponse(_json_safe({"tx": status}), status_code=202)
+
+
 @app.get("/record")
 async def record_status_endpoint():
     """Recording state plus a form seed derived from the current live view."""
@@ -670,6 +771,12 @@ async def record_status_endpoint():
 async def record_start_endpoint(request: Request):
     if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
+    if tx.TX.active():
+        # Mirror of the guard in /tx/start — the recording sweep reconfigures
+        # the very source object the TX stream is riding on.
+        return JSONResponse(
+            {"error": "cannot record while transmitting — stop TX first"},
+            status_code=409)
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -973,6 +1080,11 @@ async def reset_radio(request: Request):
     if role not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
 
+    # A restart tears this process down; anything still keyed goes with it, so
+    # unkey deliberately and log it rather than letting SIGTERM decide.
+    if tx.TX.active():
+        await asyncio.to_thread(tx.TX.stop, "radio reset requested")
+
     op_id = OPERATIONS.begin("reset", f"restart service {RADIO_SERVICE_NAME}")
 
     def _supervised_by_requested_unit():
@@ -1162,6 +1274,10 @@ async def _broadcaster():
         for ev in OPERATIONS.drain_events():
             texts.append(json.dumps({"op": _json_safe(ev)}))
         texts.append(json.dumps({"recording": _json_safe(_recording.status())}))
+        # TX state goes to EVERY client, not just the admin driving it. People
+        # sharing an instrument are entitled to know it is radiating, and
+        # read-only roles need it to raise their standby banner.
+        texts.append(json.dumps({"tx": _json_safe(tx.TX.status())}))
         for text in texts:
             for ws in list(_connections):
                 try:
@@ -1453,6 +1569,8 @@ def main():
         _computer = Computer(_acquirer, _shared, _insights)
     health.bind(_acquirer, _shared)
     _recording = RecordingManager(_acquirer, _shared, demo=is_demo)
+    # TX borrows the acquirer's live device handle — it never opens its own.
+    tx.TX.bind(_acquirer, demo=is_demo)
 
     try:
         import uvicorn
@@ -1484,6 +1602,17 @@ def main():
                 "signing key is predictable and sessions may be forgeable. "
                 "Set it for production. ***"
             )
+
+    # Transmit is the one feature that can get a person fined; say plainly at
+    # boot whether this host can key its PA, and why not when it can't.
+    tx_caps = tx.TX.capabilities()
+    if tx_caps["available"]:
+        print("  transmit: ENABLED"
+              + (" (simulated — demo radiates nothing)" if tx_caps["simulated"]
+                 else f" — {tx_caps['channels']} TX channel(s); "
+                      f"set RADIO_TX=0 to remove it"))
+    else:
+        print(f"  transmit: unavailable — {tx_caps['reason']}")
 
     print(f"  listening on http://{args.host}:{args.port}")
     if args.host in ("0.0.0.0", "::"):

@@ -398,6 +398,7 @@ function connect() {
                     return;
                 }
                 if (msg.recording) { updateRecordingUI(msg.recording); return; }
+                if (msg.tx) { updateTxUI(msg.tx); return; }
                 if (msg.op) { handleOpEvent(msg.op); return; }
                 if (msg.message && msg.message !== "ping") logMsg(msg.message);
                 if (msg.ack) {
@@ -472,6 +473,9 @@ function applyRole(role, authEnabled = true) {
     if (signout) signout.hidden = !authEnabled;
     logMsg(`Signed in as '${role}'${isAdmin ? " (full control)" : " (read-only)"}`);
     if (isAdmin && typeof connectJournal === "function") connectJournal();
+    // Whether the TX button exists at all depends on the role AND on the radio
+    // having a TX port — re-ask now that we know which role we are.
+    if (typeof refreshTx === "function") refreshTx();
 }
 
 let _denyHideTimer = null;
@@ -754,6 +758,399 @@ function updateRecordingUI(rec) {
     if (stop) stop.disabled = !active || rec.state === "stopping";
 }
 
+// ---------------------------------------------------------------------------
+// Transmit mode
+// ---------------------------------------------------------------------------
+//
+// Two views in one modal: the legal notice, then the controls. The notice is
+// server-enforced — POST /tx/acknowledge must succeed before /tx/start will do
+// anything — so this is the presentation of a gate, not the gate itself.
+//
+// TX state arrives on the SAME broadcast every client receives, so the banner
+// is honest for everyone: the admin driving it sees what is being transmitted,
+// read-only roles see that the instrument is busy.
+
+let txCaps        = null;   // capabilities from /tx
+let txAcked       = false;  // has THIS session acknowledged the notice?
+let txActive      = false;
+let txWaveKind    = "cw";   // waveform the animation should draw
+let txWaveRaf     = null;
+let txWavePhase   = 0;
+
+function txEl(id) { return document.getElementById(id); }
+
+// The animation draws the SHAPE of the selected waveform — a sine for CW, a
+// beat for two-tone, a sweep for chirp, noise for noise. It is deliberately
+// not to scale (the note under the canvas says so): a real 2.4 GHz carrier
+// cannot be drawn at 60 fps, and pretending otherwise would be a lie on a
+// screen whose whole job is honest measurement.
+function drawTxWave() {
+    const cv = txEl("tx-wave");
+    if (!cv || !txActive) { txWaveRaf = null; return; }
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth || 640, h = cv.clientHeight || 96;
+    if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+        cv.width = Math.round(w * dpr);
+        cv.height = Math.round(h * dpr);
+    }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+
+    // Centre line
+    g.strokeStyle = "#22262c";
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke();
+
+    txWavePhase += 0.06;
+    const mid = h / 2, amp = h * 0.36;
+    g.strokeStyle = "#e5766e";
+    g.lineWidth = 2;
+    g.beginPath();
+    for (let x = 0; x <= w; x++) {
+        const u = x / w;                      // 0..1 across the canvas
+        let y;
+        if (txWaveKind === "two_tone") {
+            // Two closely spaced tones = a visible beat envelope.
+            const t = u * 18 + txWavePhase;
+            y = 0.5 * Math.sin(t) + 0.5 * Math.sin(t * 1.18);
+        } else if (txWaveKind === "chirp") {
+            // Frequency rising left→right, retracing each sweep.
+            const t = (u + txWavePhase * 0.05) % 1;
+            y = Math.sin(2 * Math.PI * (4 * t + 14 * t * t));
+        } else if (txWaveKind === "noise") {
+            // Deterministic hash so the trace scrolls instead of flickering.
+            const s = Math.sin((x + txWavePhase * 40) * 12.9898) * 43758.5453;
+            y = ((s - Math.floor(s)) * 2 - 1) * 0.85;
+        } else {
+            y = Math.sin(u * 22 + txWavePhase);
+        }
+        const py = mid - y * amp;
+        if (x === 0) g.moveTo(x, py); else g.lineTo(x, py);
+    }
+    g.stroke();
+    txWaveRaf = requestAnimationFrame(drawTxWave);
+}
+
+function startTxWave() { if (txWaveRaf === null) drawTxWave(); }
+function stopTxWave() {
+    if (txWaveRaf !== null) { cancelAnimationFrame(txWaveRaf); txWaveRaf = null; }
+}
+
+function fmtTxPlan(plan) {
+    if (!plan) return "";
+    const p = plan.params || {};
+    const lines = [
+        `${plan.waveform}  ${(plan.frequency_hz / 1e6).toFixed(6)} MHz` +
+        (p.offset_hz ? `  (offset ${(p.offset_hz / 1e3).toFixed(1)} kHz)` : ""),
+        `gain ${plan.gain_db} dB   amplitude ${p.amplitude}   ` +
+        `${(plan.sample_rate_hz / 1e6).toFixed(4)} MS/s   ch${plan.channel}`,
+    ];
+    if (p.spacing_hz) lines.push(`tone spacing ${(p.spacing_hz / 1e3).toFixed(1)} kHz`);
+    if (p.chirp_bandwidth_hz) {
+        lines.push(`chirp ${(p.chirp_bandwidth_hz / 1e6).toFixed(3)} MHz over ` +
+                   `${(p.chirp_period_s * 1e3).toFixed(2)} ms`);
+    }
+    // Readback: what the DRIVER says it tuned to, which is the only number
+    // worth trusting. Shown whenever it disagrees with the request.
+    const a = plan.actual;
+    if (a && a.frequency_hz) {
+        const off = Math.abs(a.frequency_hz - plan.frequency_hz);
+        lines.push(`driver readback ${(a.frequency_hz / 1e6).toFixed(6)} MHz` +
+                   (off > 10 ? `  ⚠ requested ${(plan.frequency_hz / 1e6).toFixed(6)}` : " ✓"));
+    }
+    return lines.join("\n");
+}
+
+function updateTxUI(tx) {
+    if (!tx) return;
+    txCaps = tx.capabilities || txCaps;
+    txActive = !!tx.active;
+    document.body.classList.toggle("transmitting", txActive);
+
+    // The button only exists on a radio that can actually transmit.
+    const openBtn = txEl("tx-open-btn");
+    if (openBtn) openBtn.hidden = !(tx.available && isAdmin);
+
+    // Banner for EVERY role.
+    const banner = txEl("tx-banner");
+    if (banner) {
+        banner.hidden = !txActive;
+        if (txActive) {
+            const plan = tx.plan || {};
+            if (isAdmin) {
+                banner.classList.remove("tx-standby");
+                banner.textContent =
+                    (tx.simulated ? "⚡ SIMULATED TRANSMIT · " : "⚡ TRANSMITTING · ") +
+                    `${(plan.frequency_hz / 1e6).toFixed(3)} MHz · ${plan.gain_db} dB · ` +
+                    `${plan.waveform} · ${(tx.elapsed_s || 0).toFixed(0)} s` +
+                    (tx.remaining_s != null ? ` (${tx.remaining_s.toFixed(0)} s left)` : "");
+            } else {
+                // Read-only roles are told to stand by, not what is radiating
+                // — they cannot act on it either way, and the instrument being
+                // busy is the operative fact.
+                banner.classList.add("tx-standby");
+                banner.textContent = "VIEWER BUSY — STANDBY";
+            }
+        }
+    }
+
+    if (!isAdmin) return;   // the rest is the admin's control panel
+
+    if (tx.acknowledged) txAcked = true;
+    const start = txEl("tx-start"), stop = txEl("tx-stop");
+    if (start) start.disabled = txActive || !tx.available;
+    if (stop) stop.disabled = !txActive;
+
+    const live = txEl("tx-live");
+    if (live) {
+        live.hidden = !txActive;
+        if (txActive) {
+            txWaveKind = (tx.plan && tx.plan.waveform) || "cw";
+            const word = txEl("tx-live-word");
+            if (word) word.textContent = tx.simulated ? "Transmitting (simulated)"
+                                                      : "Transmitting";
+            const s = txEl("tx-live-settings");
+            if (s) {
+                s.textContent = fmtTxPlan(tx.plan) +
+                    `\nelapsed ${(tx.elapsed_s || 0).toFixed(1)} s   ` +
+                    `${tx.samples_written || 0} samples` +
+                    (tx.underflows ? `   ⚠ ${tx.underflows} underflow(s)` : "");
+            }
+            startTxWave();
+        } else {
+            stopTxWave();
+        }
+    }
+
+    const st = txEl("tx-status");
+    if (st) {
+        st.textContent = tx.available
+            ? `${tx.state}${tx.error ? "\n" + tx.error : ""}` +
+              (tx.simulated ? "\ndemo device — nothing is radiated" : "")
+            : `unavailable — ${tx.reason || "unknown"}`;
+    }
+}
+
+// Populate the form from server capabilities: waveform list, TX channels, and
+// the radio's real frequency/gain limits. Defaults come from the RADIO, never
+// from a hardcoded guess — gain starts at the quietest the hardware supports.
+function seedTxForm() {
+    if (!txCaps) return;
+    const sel = txEl("tx-waveform");
+    if (sel && !sel.options.length) {
+        for (const [k, label] of Object.entries(txCaps.waveforms || {})) {
+            const o = document.createElement("option");
+            o.value = k; o.textContent = label;
+            sel.appendChild(o);
+        }
+    }
+    const chField = txEl("tx-channel-field"), chSel = txEl("tx-channel");
+    if (chSel && chField) {
+        const n = txCaps.channels || 1;
+        chField.hidden = n <= 1;
+        if (!chSel.options.length) {
+            for (let i = 0; i < n; i++) {
+                const o = document.createElement("option");
+                o.value = String(i); o.textContent = `TX${i}`;
+                chSel.appendChild(o);
+            }
+        }
+    }
+    const env = txCaps.envelope || {};
+    const gain = txEl("tx-gain");
+    if (gain && gain.value === "" && env.gain_min != null) {
+        gain.value = env.gain_min;
+        gain.min = env.gain_min;
+        gain.max = env.gain_max;
+    }
+    const freq = txEl("tx-frequency");
+    if (freq && env.freq_min != null) {
+        freq.min = (env.freq_min / 1e6).toFixed(3);
+        freq.max = (env.freq_max / 1e6).toFixed(3);
+        if (freq.value === "") freq.value = (curCenter / 1e6).toFixed(3);
+    }
+    const envEl = txEl("tx-envelope");
+    if (envEl) {
+        const parts = [`${txCaps.device} · ${txCaps.channels} TX channel(s)`];
+        if (env.freq_min != null) {
+            parts.push(`frequency ${(env.freq_min / 1e6).toFixed(3)}–` +
+                       `${(env.freq_max / 1e6).toFixed(3)} MHz`);
+        }
+        if (env.gain_min != null) parts.push(`gain ${env.gain_min}–${env.gain_max} dB`);
+        if (txCaps.simulated) parts.push("SIMULATED — nothing is radiated");
+        envEl.textContent = parts.join("\n");
+    }
+    txSyncWaveformFields();
+}
+
+// Only show the parameters the selected waveform actually uses.
+function txSyncWaveformFields() {
+    const kind = (txEl("tx-waveform") || {}).value || "cw";
+    txWaveKind = kind;
+    const show = (id, on) => { const e = txEl(id); if (e) e.hidden = !on; };
+    show("tx-spacing-field", kind === "two_tone");
+    show("tx-chirp-bw-field", kind === "chirp");
+    show("tx-chirp-period-field", kind === "chirp");
+}
+
+async function refreshTx() {
+    try {
+        const r = await fetch("/tx", { cache: "no-store" });
+        if (!r.ok) return;
+        const data = (await r.json()).tx;
+        txCaps = data.capabilities || null;
+        if (data.acknowledged) txAcked = true;
+        renderTxDisclaimer(data.disclaimer);
+        updateTxUI(data);
+        seedTxForm();
+    } catch (_) {}
+}
+
+// The legal text is served by the API, not hardcoded here — one copy, and the
+// server can never enforce terms the operator was not actually shown.
+function renderTxDisclaimer(d) {
+    if (!d) return;
+    const title = txEl("tx-legal-title");
+    if (title) title.textContent = "⚠ " + d.title;
+    const body = txEl("tx-legal-body");
+    if (body && !body.childElementCount) {
+        for (const para of d.body || []) {
+            const p = document.createElement("p");
+            p.textContent = para;
+            body.appendChild(p);
+        }
+    }
+    const accept = txEl("tx-accept"), decline = txEl("tx-decline");
+    if (accept && d.accept) accept.textContent = d.accept;
+    if (decline && d.decline) decline.textContent = d.decline;
+}
+
+function openTxModal() {
+    const modal = txEl("tx-modal");
+    if (!modal) return;
+    // The notice shows on the FIRST open of a session; after that the operator
+    // goes straight to the controls.
+    txEl("tx-legal").hidden = txAcked;
+    txEl("tx-control").hidden = !txAcked;
+    modal.hidden = false;
+    seedTxForm();
+}
+
+function closeTxModal() {
+    const modal = txEl("tx-modal");
+    if (modal) modal.hidden = true;
+}
+
+function txPayload() {
+    const num = (id) => {
+        const v = (txEl(id) || {}).value;
+        return v === "" || v == null ? null : Number(v);
+    };
+    const kind = (txEl("tx-waveform") || {}).value || "cw";
+    const payload = {
+        waveform: kind,
+        frequency_hz: (num("tx-frequency") || 0) * 1e6,
+        offset_hz: (num("tx-offset") || 0) * 1e3,
+        gain_db: num("tx-gain"),
+        amplitude: num("tx-amplitude"),
+        duration_s: num("tx-duration"),          // null ⇒ until Stop
+        channel: Number((txEl("tx-channel") || {}).value || 0),
+    };
+    const rate = num("tx-rate");
+    if (rate) payload.sample_rate_hz = rate * 1e6;
+    if (kind === "two_tone") payload.spacing_hz = (num("tx-spacing") || 100) * 1e3;
+    if (kind === "chirp") {
+        payload.chirp_bandwidth_hz = (num("tx-chirp-bw") || 1) * 1e6;
+        payload.chirp_period_s = (num("tx-chirp-period") || 10) / 1e3;
+    }
+    return payload;
+}
+
+(function installTxHandlers() {
+    const open = txEl("tx-open-btn");
+    if (open) open.addEventListener("click", () => { if (isAdmin) openTxModal(); });
+    const decline = txEl("tx-decline");
+    if (decline) decline.addEventListener("click", closeTxModal);
+    const close = txEl("tx-close");
+    if (close) close.addEventListener("click", closeTxModal);
+
+    const accept = txEl("tx-accept");
+    if (accept) accept.addEventListener("click", async () => {
+        try {
+            const r = await fetch("/tx/acknowledge", { method: "POST" });
+            if (!r.ok) {
+                logMsg(`[tx] acknowledge failed (${r.status})`, "ERROR");
+                return;
+            }
+            txAcked = true;
+            logMsg("[tx] transmit legal notice acknowledged", "WARN");
+            txEl("tx-legal").hidden = true;
+            txEl("tx-control").hidden = false;
+            seedTxForm();
+        } catch (err) {
+            logMsg(`[tx] acknowledge failed: ${err.message}`, "ERROR");
+        }
+    });
+
+    const wf = txEl("tx-waveform");
+    if (wf) wf.addEventListener("change", txSyncWaveformFields);
+
+    const start = txEl("tx-start");
+    if (start) start.addEventListener("click", async () => {
+        if (!isAdmin) return;
+        const payload = txPayload();
+        if (!payload.frequency_hz) {
+            logMsg("[tx] enter a transmit frequency first", "ERROR");
+            return;
+        }
+        const dur = payload.duration_s
+            ? `${payload.duration_s} s`
+            : "until you press Stop (no automatic cutoff)";
+        if (!window.confirm(
+            `Transmit ${payload.waveform} at ` +
+            `${(payload.frequency_hz / 1e6).toFixed(3)} MHz, ` +
+            `${payload.gain_db} dB, for ${dur}?\n\n` +
+            "Confirm the antenna or dummy load is connected and you are " +
+            "authorized to transmit on this frequency.")) return;
+        try {
+            const r = await fetch("/tx/start", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+            const data = await r.json();
+            if (!r.ok) {
+                logMsg(`[tx] start refused (${r.status}): ${data.error}`, "ERROR");
+                setStatus(`transmit refused — ${data.error}`, "error");
+                return;
+            }
+            logMsg(`[tx] transmitting (op #${data.tx.op_id})`, "WARN");
+            updateTxUI(data.tx);
+        } catch (err) {
+            logMsg(`[tx] start failed: ${err.message}`, "ERROR");
+        }
+    });
+
+    const stop = txEl("tx-stop");
+    if (stop) stop.addEventListener("click", async () => {
+        try {
+            const r = await fetch("/tx/stop", { method: "POST" });
+            const data = await r.json();
+            logMsg("[tx] stop requested", "WARN");
+            if (data.tx) updateTxUI(data.tx);
+        } catch (err) {
+            logMsg(`[tx] stop failed: ${err.message}`, "ERROR");
+        }
+    });
+
+    // Escape closes the dialog — but never stops a transmission. Unkeying is
+    // an explicit act, not a side effect of dismissing a window.
+    document.addEventListener("keydown", (ev) => {
+        if (ev.key === "Escape") closeTxModal();
+    });
+})();
+
 // GPS fix shown in the Record panel: recordings stamp every capture with this
 // (gps_valid=0 when there is no fix), so it must be checkable BEFORE a run.
 function updateGpsStatus(g) {
@@ -955,7 +1352,7 @@ document.querySelector('.rail-tab[data-tab="insights"]')?.addEventListener("clic
     refreshInsights(); loadPresets();
 });
 setInterval(refreshInsights, 2000);
-setTimeout(() => { refreshInsights(); loadPresets(); }, 900);
+setTimeout(() => { refreshInsights(); loadPresets(); refreshTx(); }, 900);
 
 // ── Service journal tail (admin only): journalctl over /ws/logs ──────────
 let journalWs = null;
