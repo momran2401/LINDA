@@ -253,24 +253,42 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   acquire the radio. `TxController._pump` re-checks device identity every chunk
   and aborts if the Acquirer reopened the source underneath it; `_recover()`
   also calls `TX.shutdown()` *before* disturbing the handle.
-- **The AIR-T has ONE stream trigger, and the live RX stream holds it.**
-  Observed on a real AIR8201B: `setupStream(SOAPY_SDR_TX)` raises
-  `Trigger in use, can't set up new stream!` while the viewer is running. The
-  AD9371 is full duplex; AirStack's SoapyAIRT above it is not, because every
-  stream arms from one FPGA trigger block. Do NOT assume RX and TX coexist on
-  this radio. `_acquire_tx_stream()` is an escalation ladder that gives up as
-  little as possible and DISCLOSES which rung it needed
-  (`plan.rx_mode`/`rx_note`, banner, op log):
-  `coexist` (true full duplex — other radios) → `rx_quiesced` (RX deactivated
-  just for the setup call) → `rx_released` (RX stream closed for the whole
-  transmission via `acquirer.pause_and_release()`, the same handoff recording
-  uses; the waterfall freezes and the UI says **LIVE VIEW PAUSED**). Only
-  driver messages matching `_STREAM_CONFLICT_MARKERS` escalate — a bad request
-  must fail fast rather than cost the operator their live view. The TX stream
-  is closed BEFORE the RX stream is restored: it holds the very trigger RX
-  needs back. Deepwave's own TX example passes `tx_buffer_size`, so
-  `setupStream` is called with it (with a no-args retry for bindings that
-  reject kwargs).
+- **The AIR-T has ONE stream trigger, the live RX stream holds it, and it gates
+  TUNING as well as streams.** Two distinct refusals were observed on a real
+  AIR8201B, in this order:
+
+      Trigger in use, can't set up new stream!     (setupStream)
+      Trigger in use, can't change frequency!      (setFrequency)
+
+  The AD9371 is full duplex; AirStack's SoapyAIRT above it is not, because
+  every stream arms from one FPGA trigger block. **Do NOT assume RX and TX
+  coexist on this radio, and do NOT tune the TX chain before freeing the
+  trigger.** The second error is why `_arm_with_escalation()` treats
+  tune + readback + `setupStream` as ONE atomic unit and retries the whole
+  sequence per rung: an earlier version tuned first and only escalated around
+  `setupStream`, so `setFrequency` still ran against a busy trigger —
+  sometimes raising, sometimes just failing its readback and reporting
+  `MISMATCH` with 0 samples, depending on whether the Computer happened to
+  have the RX stream disabled at that instant.
+- The ladder gives up as little as possible and DISCLOSES which rung it needed
+  (`plan.rx_mode`/`rx_note`, banner, op log): `coexist` (true full duplex —
+  other radios) → `rx_quiesced` (RX deactivated for the arming window, then
+  restored) → `rx_released` (RX stream closed for the whole transmission via
+  `acquirer.pause_and_release()`, the same handoff recording uses; the
+  waterfall freezes and the UI says **LIVE VIEW PAUSED**). Only driver messages
+  matching `_STREAM_CONFLICT_MARKERS` escalate — a bad request must fail fast
+  rather than cost the operator their live view. The TX stream is closed BEFORE
+  the RX stream is restored: it holds the very trigger RX needs back.
+- `_tune_tx()` writes only settings the radio is not ALREADY on. Not an
+  optimization: asking this driver to "change" the rate to the value it is
+  already running earns a `Trigger in use` for nothing. Since the TX rate
+  defaults to the live RX rate, the common case touches the rate not at all.
+  Deepwave's own TX example passes `tx_buffer_size`, so `setupStream` is called
+  with it (no-args retry for bindings that reject kwargs).
+- `_pump()` returns WHY it stopped (`duration elapsed`, `stopped by request`,
+  `stopped before the first write`, `radio was reopened underneath the
+  transmission`) and the verdict quotes it. A transmission reporting "0
+  samples" with no reason costs a trip to the radio to diagnose.
 - Waveforms (`Waveform`): `cw`, `two_tone`, `chirp`, `noise`. Phase is carried
   as fractional cycles mod 1 in float64 — an absolute float32 time axis
   scrambles a MHz tone within a minute, and a transmitter runs far longer than

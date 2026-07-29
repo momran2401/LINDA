@@ -98,6 +98,19 @@ def _is_stream_conflict(exc):
     return any(marker in text for marker in _STREAM_CONFLICT_MARKERS)
 
 
+def _close_stream(dev, stream):
+    """Unkey and release a TX stream. Never raises: this runs on failure paths
+    where a stream left active would keep the PA keyed."""
+    if stream is None:
+        return
+    for action in (lambda: dev.deactivateStream(stream),
+                   lambda: dev.closeStream(stream)):
+        try:
+            action()
+        except Exception:
+            pass
+
+
 class Waveform:
     """Chunked IQ generator with continuous phase across chunks.
 
@@ -664,60 +677,21 @@ class TxController:
         d = _tx_dir()
         ch = plan["channel"]
 
-        OPERATIONS.stage(op_id, "applying",
-                         f"tuning TX{ch}: {plan['frequency_hz']/1e6:.6g} MHz, "
-                         f"{plan['gain_db']:g} dB, "
-                         f"{plan['sample_rate_hz']/1e6:.6g} MS/s")
-        # Sample rate FIRST: on AD936x parts the rate reprograms the filter
-        # chain, which can move the achievable frequency/gain settings.
-        for label, fn, value in (
-            ("sample_rate", getattr(dev, "setSampleRate", None), plan["sample_rate_hz"]),
-            ("frequency",   getattr(dev, "setFrequency", None),  plan["frequency_hz"]),
-            ("gain",        getattr(dev, "setGain", None),       plan["gain_db"]),
-        ):
-            if fn is None:
-                raise RuntimeError(f"driver cannot set TX {label}")
-            fn(d, ch, value)
-
-        # Readback — the same contract as every other operation in this app: a
-        # setting is not trusted because the setter returned, it is trusted
-        # because the driver says so. The waveform is generated at the rate the
-        # radio ACTUALLY runs, not the one we asked for.
-        actual = {}
-        for key, meth in (("sample_rate_hz", "getSampleRate"),
-                          ("frequency_hz", "getFrequency"),
-                          ("gain_db", "getGain")):
-            try:
-                actual[key] = float(getattr(dev, meth)(d, ch))
-            except Exception:
-                actual[key] = None
-        OPERATIONS.stage(
-            op_id, "readback",
-            "TX driver reports "
-            + ", ".join(
-                f"{k}={'?' if v is None else (f'{v/1e6:.6g} MHz' if k.endswith('frequency_hz') else (f'{v/1e6:.6g} MS/s' if k.startswith('sample_rate') else f'{v:g} dB'))}"
-                for k, v in actual.items()))
-        mismatched = [
-            k for k in ("frequency_hz", "sample_rate_hz")
-            if actual[k] is not None
-            and abs(actual[k] - plan[k]) > max(10.0, 1e-6 * abs(plan[k]))
-        ]
-        if actual["sample_rate_hz"]:
-            # Regenerate against the real rate so a driver that snapped the
-            # rate does not silently shift every offset in the waveform.
-            if abs(actual["sample_rate_hz"] - wave.fs) > 1.0:
-                wave = Waveform(plan["waveform"], actual["sample_rate_hz"],
-                                plan["params"])
-        with self._lock:
-            self._plan["actual"] = dict(actual)
-
         stream = None
         rx_mode = TX_COEXIST
         try:
-            stream, rx_mode = self._acquire_tx_stream(dev, d, ch, op_id)
+            stream, actual, mismatched, rx_mode = self._arm_with_escalation(
+                dev, d, ch, plan, op_id)
             with self._lock:
+                self._plan["actual"] = dict(actual)
                 self._plan["rx_mode"] = rx_mode
                 self._plan["rx_note"] = TX_RX_MODE_NOTES[rx_mode]
+            if actual.get("sample_rate_hz") and abs(
+                    actual["sample_rate_hz"] - wave.fs) > 1.0:
+                # Regenerate against the real rate so a driver that snapped the
+                # rate does not silently shift every offset in the waveform.
+                wave = Waveform(plan["waveform"], actual["sample_rate_hz"],
+                                plan["params"])
             try:
                 mtu = int(dev.getStreamMTU(stream))
             except Exception:
@@ -729,21 +703,23 @@ class TxController:
                 self._started_at = time.time()
             OPERATIONS.stage(
                 op_id, "data-path",
-                f"TX stream active ({chunk} samples/write)"
+                f"TX stream active ({chunk} samples/write, "
+                f"{TX_RX_MODE_NOTES[rx_mode]})"
                 + (f" — WARNING: driver did not honour {', '.join(mismatched)}"
                    if mismatched else ""),
                 level="warn" if mismatched else "info")
 
-            self._pump(dev, stream, wave, plan, chunk, op_id)
+            why = self._pump(dev, stream, wave, plan, chunk, op_id)
 
             elapsed = time.time() - (self._started_at or time.time())
             verdict = "mismatch" if mismatched else (
-                "unverified" if actual["frequency_hz"] is None else "verified")
+                "unverified" if actual.get("frequency_hz") is None else "verified")
             with self._lock:
                 samples, unders = self._samples, self._underflows
             self._finish(
                 op_id, verdict,
-                f"transmitted {elapsed:.1f} s, {samples} samples"
+                f"transmitted {elapsed:.1f} s, {samples} samples "
+                f"({why})"
                 + (f", {unders} underflow(s)" if unders else "")
                 + (f" — readback disagreed on {', '.join(mismatched)}"
                    if mismatched else ""))
@@ -752,109 +728,196 @@ class TxController:
             # active keeps the PA keyed. This MUST happen before the RX stream
             # is restored — the TX stream holds the same trigger the RX stream
             # needs back, so resuming first would just move the conflict.
-            for action in (lambda: dev.deactivateStream(stream),
-                           lambda: dev.closeStream(stream)):
-                if stream is None:
-                    break
-                try:
-                    action()
-                except Exception:
-                    pass
+            _close_stream(dev, stream)
             self._restore_rx(rx_mode, op_id)
 
-    def _acquire_tx_stream(self, dev, d, ch, op_id):
-        """Get a TX stream, giving up as little of the live view as necessary.
+    #: The ladder, cheapest first.
+    _RX_RUNGS = (TX_COEXIST, TX_RX_QUIESCED, TX_RX_RELEASED)
 
-        Returns (stream, rx_mode). See TX_COEXIST/TX_RX_QUIESCED/
-        TX_RX_RELEASED — the caller discloses whichever rung was needed.
+    def _source(self):
+        return getattr(self._acquirer, "source", None)
+
+    def _arm_with_escalation(self, dev, d, ch, plan, op_id):
+        """Free the trigger, program the TX chain, and open its stream.
+
+        Returns (stream, actual, mismatched, rx_mode).
+
+        On the AIR-T the FPGA trigger gates the TUNING CALLS as well as
+        `setupStream`. Both failures were observed on real hardware, in this
+        order, as the ladder was built:
+
+            Trigger in use, can't set up new stream!
+            Trigger in use, can't change frequency!
+
+        The second one is why arming is one atomic unit here. An earlier version
+        tuned first and only escalated around `setupStream`, so `setFrequency`
+        still ran while the live RX stream held the trigger — sometimes
+        silently failing its readback (a MISMATCH verdict with the rate
+        unchanged), sometimes raising outright, depending on whether the
+        Computer happened to have the RX stream disabled at that instant. That
+        race is the whole reason the ladder retries the ENTIRE tune + setup
+        sequence at each rung instead of just the stream call.
         """
-        # Deepwave's own TX example passes this; drivers that don't know the
-        # key ignore it, and the no-args form is retried for bindings whose
-        # setupStream takes no kwargs at all.
-        args = {"tx_buffer_size": str(DEFAULT_CHUNK)}
-
-        def attempt():
+        last = None
+        for index, rung in enumerate(self._RX_RUNGS):
+            final = index == len(self._RX_RUNGS) - 1
             try:
-                return dev.setupStream(d, _cf32(), [ch], args)
-            except TypeError:
-                return dev.setupStream(d, _cf32(), [ch])
-
-        # Rung 0 — just ask. Works on any genuinely full-duplex driver.
-        try:
-            return attempt(), TX_COEXIST
-        except Exception as exc:
-            if not _is_stream_conflict(exc):
-                raise
-            OPERATIONS.stage(
-                op_id, "applying",
-                f"TX stream refused while the live RX stream is up ({exc}) — "
-                f"deactivating RX and retrying", level="warn")
-
-        source = getattr(self._acquirer, "source", None)
-
-        # Rung 1 — deactivate RX, create the TX stream, put RX back. Costs the
-        # viewer a blip. Some drivers release the trigger on deactivate.
-        quiesced = False
-        try:
-            enable_stream(source, False)
-            quiesced = True
-            stream = attempt()
-        except Exception as exc:
-            if quiesced:
-                # Put the viewer back before deciding anything else.
-                try:
-                    enable_stream(source, True)
-                except Exception:
-                    pass
-            if not _is_stream_conflict(exc):
-                raise
-            stream = None
-        if stream is not None:
+                self._enter_rung(rung, op_id)
+            except Exception as exc:                      # could not even free it
+                last = exc
+                if final:
+                    raise
+                continue
             try:
-                enable_stream(source, True)
-                OPERATIONS.stage(op_id, "applying",
-                                 "TX stream created with RX briefly "
-                                 "deactivated; live view is back")
-                return stream, TX_RX_QUIESCED
+                actual, mismatched = self._tune_tx(dev, d, ch, plan, op_id)
+                stream = self._setup_tx_stream(dev, d, ch)
             except Exception as exc:
-                # TX stream exists but RX will not restart alongside it. Drop
-                # the TX stream and fall through to the honest option rather
-                # than leaving the viewer silently dead.
+                self._abandon_rung(rung, op_id)
+                last = exc
+                if final or not _is_stream_conflict(exc):
+                    raise
                 OPERATIONS.stage(
                     op_id, "applying",
-                    f"RX would not restart alongside the TX stream ({exc}) — "
-                    f"releasing the radio instead", level="warn")
-                for action in (lambda: dev.deactivateStream(stream),
-                               lambda: dev.closeStream(stream)):
-                    try:
-                        action()
-                    except Exception:
-                        pass
+                    f"the radio refused while the live RX stream held the "
+                    f"trigger ({exc}) — giving up more of the live view and "
+                    f"retrying", level="warn")
+                continue
+            # Armed. On the quiesced rung the viewer is only owed a blip, so
+            # put RX back; if it will not restart alongside the TX stream, drop
+            # the stream and escalate rather than leave the waterfall silently
+            # dead.
+            if rung == TX_RX_QUIESCED:
+                try:
+                    enable_stream(self._source(), True)
+                except Exception as exc:
+                    OPERATIONS.stage(
+                        op_id, "applying",
+                        f"RX would not restart alongside the TX stream "
+                        f"({exc}) — releasing the radio instead", level="warn")
+                    _close_stream(dev, stream)
+                    last = exc
+                    if final:
+                        raise
+                    continue
+            return stream, actual, mismatched, rung
+        raise last or RuntimeError("could not arm the transmitter")
 
-        # Rung 2 — hand the radio over exactly the way a recording does. The
-        # Acquirer's pause path closes the RX stream while KEEPING the AIR-T
-        # device initialized (source.close() would deinitialize the AD9371
-        # management sensors for the life of the process), and resume()
+    def _enter_rung(self, rung, op_id):
+        """Free as much of the trigger as this rung calls for."""
+        if rung == TX_COEXIST:
+            return
+        if self._stop_evt.is_set():
+            # Stop was requested while we were climbing. Do not take the
+            # viewer down for a transmission nobody is waiting for.
+            raise RuntimeError("transmission cancelled before it started")
+        if rung == TX_RX_QUIESCED:
+            enable_stream(self._source(), False)
+            return
+        # TX_RX_RELEASED — hand the radio over exactly the way a recording
+        # does. The Acquirer's pause path closes the RX stream while KEEPING
+        # the AIR-T device initialized (source.close() would deinitialize the
+        # AD9371 management sensors for the life of the process); resume()
         # rearms it afterwards.
         OPERATIONS.stage(
             op_id, "applying",
-            "this radio cannot hold an RX and a TX stream at once — pausing "
-            "live acquisition for the duration of the transmission",
+            "this radio cannot tune or stream TX while it is receiving — "
+            "pausing live acquisition for the duration of the transmission",
             level="warn")
-        if self._stop_evt.is_set():
-            # Stop was requested while we were climbing the ladder. Do not take
-            # the viewer down for a transmission nobody is waiting for.
-            raise RuntimeError("transmission cancelled before it started")
         if not self._acquirer.pause_and_release(15.0):
             raise RuntimeError(
                 "live acquisition did not release the radio within 15 s, so "
-                "the TX stream cannot be created (the radio only has one "
-                "stream trigger)")
+                "the transmitter cannot be armed (this radio has one trigger)")
+
+    def _abandon_rung(self, rung, op_id):
+        """Undo whatever _enter_rung took, so the next rung starts clean."""
         try:
-            return attempt(), TX_RX_RELEASED
+            if rung == TX_RX_QUIESCED:
+                enable_stream(self._source(), True)
+            elif rung == TX_RX_RELEASED:
+                self._acquirer.resume()
         except Exception:
-            self._acquirer.resume()
-            raise
+            pass
+
+    def _tune_tx(self, dev, d, ch, plan, op_id):
+        """Program the TX chain, then require the driver to confirm it.
+
+        Only writes a setting the radio is not ALREADY on. That is not an
+        optimization: on this hardware TX and RX share converter plumbing, and
+        asking the driver to "change" the sample rate to the value it is
+        already running is both pointless and a way to earn a
+        "Trigger in use, can't change ..." for nothing. Since the TX rate
+        defaults to the live RX rate, the common case now touches the rate not
+        at all.
+        """
+        OPERATIONS.stage(op_id, "applying",
+                         f"tuning TX{ch}: {plan['frequency_hz']/1e6:.6g} MHz, "
+                         f"{plan['gain_db']:g} dB, "
+                         f"{plan['sample_rate_hz']/1e6:.6g} MS/s")
+        # Sample rate FIRST: on AD936x parts the rate reprograms the filter
+        # chain, which can move the achievable frequency/gain settings.
+        plan_keys = (
+            ("sample_rate_hz", "getSampleRate", "setSampleRate",
+             max(1.0, 1e-4 * abs(plan["sample_rate_hz"]))),
+            ("frequency_hz", "getFrequency", "setFrequency",
+             max(10.0, 1e-6 * abs(plan["frequency_hz"]))),
+            ("gain_db", "getGain", "setGain", 0.01),
+        )
+        untouched = []
+        for key, getter, setter, tol in plan_keys:
+            want = float(plan[key])
+            current = None
+            try:
+                current = float(getattr(dev, getter)(d, ch))
+            except Exception:
+                pass
+            if current is not None and abs(current - want) <= tol:
+                untouched.append(key)
+                continue
+            fn = getattr(dev, setter, None)
+            if fn is None:
+                raise RuntimeError(f"driver cannot set TX {key}")
+            fn(d, ch, want)
+        if untouched:
+            OPERATIONS.stage(op_id, "applying",
+                             "already correct, left alone: "
+                             + ", ".join(untouched))
+
+        # Readback — the same contract as every other operation in this app: a
+        # setting is not trusted because the setter returned, it is trusted
+        # because the driver says so.
+        actual = {}
+        for key, getter, _setter, _tol in plan_keys:
+            try:
+                actual[key] = float(getattr(dev, getter)(d, ch))
+            except Exception:
+                actual[key] = None
+
+        def _fmt(key, value):
+            if value is None:
+                return f"{key}=?"
+            if key == "gain_db":
+                return f"{key}={value:g} dB"
+            unit = "MHz" if key == "frequency_hz" else "MS/s"
+            return f"{key}={value/1e6:.6g} {unit}"
+
+        OPERATIONS.stage(op_id, "readback", "TX driver reports "
+                         + ", ".join(_fmt(k, v) for k, v in actual.items()))
+        mismatched = [
+            key for key, _g, _s, tol in plan_keys
+            if key != "gain_db" and actual[key] is not None
+            and abs(actual[key] - float(plan[key])) > tol
+        ]
+        return actual, mismatched
+
+    def _setup_tx_stream(self, dev, d, ch):
+        # Deepwave's own TX example passes tx_buffer_size; drivers that do not
+        # know the key ignore it, and the no-args form is retried for bindings
+        # whose setupStream takes no kwargs at all.
+        try:
+            return dev.setupStream(d, _cf32(), [ch],
+                                   {"tx_buffer_size": str(DEFAULT_CHUNK)})
+        except TypeError:
+            return dev.setupStream(d, _cf32(), [ch])
 
     def _restore_rx(self, rx_mode, op_id):
         """Give the live view back. Only rung 2 actually took it away."""
@@ -870,7 +933,12 @@ class TxController:
                              level="error")
 
     def _pump(self, dev, stream, wave, plan, chunk, op_id):
-        """Feed the TX stream until stop, duration, or the device disappears."""
+        """Feed the TX stream until stop, duration, or the device disappears.
+
+        Returns a short reason for WHY it returned. A transmission that reports
+        "0 samples" is otherwise unexplainable from the log, and guessing at it
+        after the fact wastes a trip to the radio.
+        """
         try:
             from SoapySDR import SOAPY_SDR_TIMEOUT
         except Exception:
@@ -884,11 +952,20 @@ class TxController:
         started = time.time()
         my_dev = dev
 
+        if self._stop_evt.is_set():
+            # Something asked us to stop between arming and the first write —
+            # an operator Stop, or Acquirer recovery calling TX.shutdown().
+            # Name it, because "0 samples" with no reason is a mystery.
+            OPERATIONS.stage(op_id, "stopping",
+                             "stop was already requested before the first "
+                             "write — nothing was transmitted", level="warn")
+            return "stopped before the first write"
+
         while not self._stop_evt.is_set():
             if duration and (time.time() - started) >= duration:
                 OPERATIONS.stage(op_id, "stopping",
                                  f"requested duration of {duration:g} s elapsed")
-                return
+                return "duration elapsed"
             # The Acquirer can close and reopen the source under us (retune
             # recovery, source-spec reconnect). Writing into a stream on a
             # freed device is undefined; notice and get out.
@@ -898,7 +975,7 @@ class TxController:
                     "the radio was reopened underneath the transmission "
                     "(retune recovery or source reconnect) — TX aborted",
                     level="warn")
-                return
+                return "radio was reopened underneath the transmission"
 
             buf = wave.next(chunk)
             written = 0
@@ -930,6 +1007,7 @@ class TxController:
                             self._underflows += 1
                 except Exception:
                     pass
+        return "stopped by request"
 
 
 #: Process-wide controller. Frontends call TX.bind() once at startup.
