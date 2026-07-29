@@ -658,6 +658,8 @@ body.light-theme ::-webkit-scrollbar-thumb:hover { background: #aab6c7; }
     #applied-settings { order: 5; width: 100%; border-left: none; padding-left: 0; margin-left: 0; }
     #dashboard { overflow: visible; }
     #waterfall-row { grid-template-columns: 1fr; }
+    /* The AHAWI bar's narrow-screen rules live with the rest of AHAWI below —
+       that section comes later in the file and would override them here. */
 }
 
 /* ── OPS panel: verified operations + service health ─────────────────────── */
@@ -740,18 +742,44 @@ body.recording #reset-radio-btn { opacity: .45; pointer-events: none; }
    when AHAWI frames actually arrive — clients follow the server's output). */
 body:not(.mode-ahawi) .ahawi-only { display: none !important; }
 
-#ahawi-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+/* The bar's geometry must NOT depend on its text: the badge relabels every
+   dwell tick (segment index, compute ms, transient warnings), and when that
+   reflowed the flex line the whole bar changed height and shoved the
+   waterfalls down several times a second. So: one non-wrapping row, fixed
+   height, fixed-width controls, and the badge is the only elastic item —
+   it truncates instead of resizing its neighbours. Only the scrubber's fill
+   moves. */
+#ahawi-bar { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap;
              margin: 0 0 10px; padding: 8px 12px;
+             height: 42px; box-sizing: border-box; overflow: hidden;
              background: var(--bg1); border: 1px solid var(--border);
              border-radius: var(--radius); }
-#ahawi-bar button { min-width: 34px; }
-#ahawi-scrub { flex: 1 1 120px; min-width: 90px; accent-color: var(--accent); }
-.ahawi-dwell-label { display: flex; align-items: center; gap: 5px;
+#ahawi-bar button { flex: 0 0 auto; min-width: 34px; }
+/* 0 1 → holds 240 px until the line genuinely overflows, never grows with
+   the badge's text length. */
+#ahawi-scrub { flex: 0 1 240px; width: 240px; min-width: 90px;
+               accent-color: var(--accent); }
+.ahawi-dwell-label { flex: 0 0 auto; display: flex; align-items: center; gap: 5px;
                      color: var(--dim); font-size: 11px; }
-#ahawi-dwell { width: auto; }
-#ahawi-badge { color: var(--dim); font: 11px/1.4 monospace; white-space: nowrap; }
+#ahawi-dwell { width: 76px; }
+#ahawi-badge { flex: 1 1 0; min-width: 0; display: flex; align-items: center;
+               color: var(--dim); font: 11px/1.4 monospace; white-space: nowrap;
+               overflow: hidden; }
+/* Detail truncates under pressure; flags never do — a gap/stale warning is
+   the one thing that must not be the first casualty of a narrow window.
+   The full string stays reachable as the badge's tooltip. */
+.ahawi-badge-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ahawi-badge-flags { flex: 0 0 auto; }
 #ahawi-badge .warn { color: #ffb74d; }
-#ahawi-golive { border-color: var(--accent); color: var(--accent); }
+#ahawi-golive { flex: 0 0 auto; border-color: var(--accent); color: var(--accent); }
+/* Too narrow for one row — wrap rather than clip "go live" past the edge.
+   Still jitter-free: the badge's flex basis is 0/100%, so where the row breaks
+   depends only on the fixed-size controls, never on the badge's text. */
+@media (max-width: 720px) {
+    #ahawi-bar { flex-wrap: wrap; height: auto; row-gap: 8px; }
+    #ahawi-golive { order: 1; }
+    #ahawi-badge { order: 2; flex-basis: 100%; }
+}
 
 .wf-strip { display: block; width: 100%; height: 46px; flex: 0 0 46px;
             background: var(--wf-bg); border-top: 1px solid var(--border);
