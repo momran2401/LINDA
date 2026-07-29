@@ -17,6 +17,7 @@ def run_sweep(spec_path, output, duration=None, should_stop=lambda: False,
 
     # core must import before striqt: core.striqt_compat re-execs once to fix
     # LD_LIBRARY_PATH on the AIR-T pixi env before scipy/striqt load.
+    from core.gps import gps_peripherals_class
     from core.shims import enable_stream, finite_capture_mode, open_stream
 
     import striqt.sensor as sensor
@@ -64,7 +65,12 @@ def run_sweep(spec_path, output, duration=None, should_stop=lambda: False,
             else:
                 sink_cls = bindings.get_controller(spec).sensor.sink_cls
             sink = stack.enter_context(_open_sink(spec, sink_cls, None))
-            peripheral = stack.enter_context(peripherals.NoPeripherals(spec))
+            # GPS stamps every capture with the current fix through striqt's
+            # peripheral slot (extra_data → per-capture xarray variables). It
+            # reads a cached snapshot, so an absent or wedged receiver costs
+            # the sweep nothing and simply records gps_valid=0.
+            peripheral_cls = gps_peripherals_class() or peripherals.NoPeripherals
+            peripheral = stack.enter_context(peripheral_cls(spec))
             connection = ConnectionManager(spec)
             connection._resources.update(
                 source=source, sink=sink, peripherals=peripheral,
