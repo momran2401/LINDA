@@ -4,7 +4,7 @@
 
 <h1 align="center">Live IQ Navigation and Display Application</h1>
 
-A live RF visualization suite for software-defined radios, built by Mustafa Omran, Aric Sanders, and Dan Kuester.
+A live RF visualization suite for software-defined radios, built by *Mustafa Omran, Aric Sanders, and Dan Kuester*.
 
 Streams real-time spectrogram waterfalls and power
 spectral density (PSD) — one pane per RX channel — to any web browser, a
