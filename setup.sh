@@ -203,23 +203,29 @@ apt_has() {
 # Chicken-and-egg: SoapySDR cannot enumerate a radio whose driver is not
 # installed, and we do not want to install every driver. USB IDs are readable
 # with no driver at all, so the hardware tells us which stack to fetch.
+# The trailing colon on a vendor-only entry is REQUIRED: lsusb -d takes
+# "vendor:product" and refuses to parse a bare "2500", so a vendor-wide match
+# must be written "2500:". Dropping it silently detects nothing.
 declare -a USB_RADIO_TABLE=(
-    # vid[:pid]   kind      apt package(s)                       label
-    "2500|uhd|soapysdr-module-uhd uhd-host|Ettus USRP (B2xx family)"
+    # vid:[pid]   kind      apt package(s)                       label
+    "2500:|uhd|soapysdr-module-uhd uhd-host|Ettus USRP (B2xx family)"
     "0456:b673|pluto|-|ADALM-Pluto"
     "0bda:2832|rtlsdr|soapysdr-module-rtlsdr|RTL-SDR"
     "0bda:2838|rtlsdr|soapysdr-module-rtlsdr|RTL-SDR"
     "1d50:6089|hackrf|soapysdr-module-hackrf|HackRF One"
     "1d50:60a1|airspy|soapysdr-module-airspy|Airspy"
     "1d50:6108|limesdr|soapysdr-module-lms7|LimeSDR"
-    "2cf0|bladerf|soapysdr-module-bladerf|Nuand bladeRF"
+    "2cf0:|bladerf|soapysdr-module-bladerf|Nuand bladeRF"
 )
 RADIO_PKGS=""
 
 usb_present() {
-    # `lsusb -d VID:` exits non-zero when nothing matches, which is the whole
-    # point; keep it inside a condition so errexit stays out of it.
-    lsusb -d "$1" >/dev/null 2>&1
+    # Belt and braces against the bug above: normalise a bare vendor id to the
+    # "vendor:" form lsusb actually accepts. Returns non-zero when nothing
+    # matches, so callers must keep it inside a condition (errexit-exempt).
+    local id="$1"
+    [[ "$id" == *:* ]] || id="${id}:"
+    lsusb -d "$id" >/dev/null 2>&1
 }
 
 detect_radio() {
@@ -250,6 +256,11 @@ detect_radio() {
     done
     RADIO_KIND="none"; RADIO_LABEL="no supported radio on USB"
     warn "$RADIO_LABEL"
+    # Show what IS attached. When detection is wrong — and it has been — the
+    # difference between "nothing is plugged in" and "we failed to recognise
+    # the thing that is plugged in" has to be visible without a second run.
+    warn "USB devices seen (excluding root hubs):"
+    lsusb 2>/dev/null | grep -v '1d6b:000' | sed 's/^/      /' || true
     return 0
 }
 
@@ -519,7 +530,11 @@ install_gps() {
     [[ $IS_ROOT -eq 1 && $HAVE_APT -eq 1 ]] || return 0
     [[ "$RADIO_KIND" != "demo" ]] || return 0
     say "Installing GPS support (optional)"
-    if ! apt_install gpsd gpsd-clients; then
+    # gpsd only, plus the ~330 kB CLI tools (cgps/gpsmon) for diagnosing a
+    # receiver. NOT gpsd-clients: it hard-depends on python3-matplotlib and
+    # python3-scipy and drags 229 MB of graphing stack onto the Pi for
+    # utilities we never call — core/gps.py talks to gpsd over a plain socket.
+    if ! apt_install gpsd gpsd-tools; then
         warn "gpsd unavailable — recordings will record gps_valid=0"
         return 0
     fi
@@ -588,9 +603,13 @@ link_soapysdr() {
 install_python() {
     say "Building the Python environment"
     local marker="$VENV/.linda-env-id" wanted current backup
+    # Only the inputs that decide what pip installs belong here. The radio
+    # kind deliberately does NOT: it changes the moment a radio is plugged in,
+    # and including it threw away a perfectly good venv and re-downloaded the
+    # entire scientific stack on the very re-run that fixed the detection.
     wanted="$(
         sha256sum "$REPO_ROOT/live/requirements.txt" "$REPO_ROOT/live/constraints.txt"
-        printf '%s\n' "$STRIQT_COMMIT" "$RADIO_KIND"
+        printf '%s\n' "$STRIQT_COMMIT"
         python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))'
     )"
     wanted="$(printf '%s' "$wanted" | sha256sum | awk '{print $1}')"

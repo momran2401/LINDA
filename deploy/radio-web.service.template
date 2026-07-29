@@ -19,6 +19,16 @@ Environment=XDG_RUNTIME_DIR=/run/user/@SERVICE_UID@
 # and journal read it back after the restart).
 Environment=RADIO_RESET_LOG=/var/log/radio-web/reset.log
 LogsDirectory=radio-web
+# ProtectHome=read-only below makes $HOME unwritable, so every library that
+# caches under ~/.cache dies at runtime — striqt raised
+# "[Errno 30] Read-only file system: '~/.cache/striqt'" on every compute tick
+# and the viewer sat forever on "waiting for first frame". CacheDirectory=
+# gives us a writable /var/cache/radio-web owned by the service user; the
+# variables point each library at it instead of at $HOME. Keep all four.
+CacheDirectory=radio-web
+Environment=XDG_CACHE_HOME=/var/cache/radio-web
+Environment=MPLCONFIGDIR=/var/cache/radio-web/matplotlib
+Environment=NUMBA_CACHE_DIR=/var/cache/radio-web/numba
 ExecStart=@REPO_ROOT@/deploy/run_service.sh
 Restart=always
 RestartSec=3
