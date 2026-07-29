@@ -31,14 +31,27 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
-def wait_for_health(url, timeout=30.0):
+def wait_for_health(url, timeout=120.0):
+    """Wait for the server to serve /health.
+
+    120 s, not 30 s: a first start imports striqt (numba, llvmlite, scipy,
+    matplotlib) and then opens the radio, and a USRP alone spends ~8 s loading
+    its FPGA image over USB. On a Raspberry Pi the old 30 s budget expired
+    while the server was still coming up healthy, so kiosk mode killed a
+    working install and systemd recorded it as a failure.
+    """
     t0 = time.time()
+    last_note = 0.0
     while time.time() - t0 < timeout:
         try:
             with urllib.request.urlopen(url, timeout=2) as resp:
                 if resp.status == 200:
                     return True
         except Exception:
+            elapsed = time.time() - t0
+            if elapsed - last_note >= 15.0:
+                last_note = elapsed
+                print(f"[kiosk] waiting for the server… {elapsed:.0f}s", flush=True)
             time.sleep(0.5)
     return False
 

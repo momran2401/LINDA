@@ -43,7 +43,12 @@ frontend script — fix it once in `live/core/`.**
   adapters expose `create_source(source_config)`, `read_back()`,
   `hardware_expectations()` (accounts for striqt's intentional lo_shift LO
   offset + backend_sample_rate before judging readback), `verify()`,
-  `describe_capabilities()`; `probe_channels()` discovers the real RX count
+  `describe_capabilities()`; `probe_channels()` discovers the real RX count.
+  `_probe_device_facts()` briefly opens each enumerated radio to read its RX
+  channel count **and its master clock rate** — striqt applies
+  `master_clock_rate` verbatim (`setMasterClockRate`), so a value the radio
+  cannot run stops it opening at all. Never hand a radio a clock from another
+  radio's profile: a USRP B2xx rejects the AIR-T's 125 MHz outright.
 - `core/acquisition.py` — `Acquirer` (ring buffer + rearm + readback),
   `Computer`, `DemoAcquirer` (demo tones are fixed *stations*: they move across
   the band on retune, so tuning is testable without hardware)
@@ -280,7 +285,8 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 | `RATES_HZ` | 3.84/7.68/15.36/30.72 MS/s | LTE/5G-NR grid; incoming rates snap to this |
 | `NFFT_CHOICES` | 256…4096 | Valid FFT sizes; always snap |
 | `ALIGNED_NFFTS` | 252/504/1008/2016/4032 | 28-multiples the calibrated STFT actually runs |
-| `MASTER_CLOCK_RATE` | 125e6 | AIR8201B reference clock (reused best-effort for other Soapy radios) |
+| `MASTER_CLOCK_RATE` | 125e6 | AIR-T reference clock. **Not** a universal default — each profile declares its own `master_clock_rate` |
+| `SOAPY_FALLBACK_MASTER_CLOCK` | 61.44e6 | generic-SoapySDR clock used only when `_probe_device_facts` could not ask the driver |
 
 ## striqt.analysis spectrogram contract
 

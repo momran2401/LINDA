@@ -80,8 +80,14 @@ class GenericSoapyAdapter(DeviceAdapter):
         if not driver:
             raise RuntimeError("generic soapy adapter needs a driver string "
                                "(select the device via --device auto)")
+        # Hand the spec the clock this radio told us about at enumeration.
+        # An explicit source-config override still wins.
+        overrides = dict(source_config or {})
+        probed = self.info.get("_master_clock_rate")
+        if probed and not overrides.get("master_clock_rate"):
+            overrides["master_clock_rate"] = float(probed)
         return generic_soapy_class(driver).from_spec(
-            make_source_spec("soapy", source_config))
+            make_source_spec("soapy", overrides))
 
 
 class DemoAdapter(DeviceAdapter):
@@ -188,21 +194,60 @@ def discover():
             device = identify_deepwave(info)
         else:
             device = DRIVER_TO_DEVICE.get(driver, "soapy")
+        facts = _probe_device_facts(SoapySDR, info)
         found.append({
             "device":       device,
             "driver":       driver,
             "label":        info.get("label") or driver,
             "serial":       info.get("serial"),
             "info":         info,
-            "num_channels": _probe_num_channels(SoapySDR, info),
+            "num_channels": facts["num_channels"],
+            "master_clock_rate": facts["master_clock_rate"],
         })
     return found
 
 
-def _probe_num_channels(SoapySDR, info):
-    """Briefly open the device to ask its RX channel count. Best-effort: any
-    failure (device busy, driver quirk) returns None and the profile channel
-    tuple stays in force."""
+def _probe_master_clock(dev):
+    """Largest master clock rate the driver admits to, or None.
+
+    getMasterClockRates() may yield floats or SoapySDR Range objects depending
+    on the driver, so both shapes are accepted. Falls back to whatever rate the
+    device has already selected for itself, which is always legal.
+    """
+    best = None
+    try:
+        rates = list(dev.getMasterClockRates())
+    except Exception:
+        rates = []
+    for entry in rates:
+        try:
+            value = float(entry.maximum()) if hasattr(entry, "maximum") else float(entry)
+        except Exception:
+            continue
+        if value > 0 and (best is None or value > best):
+            best = value
+    if best is None:
+        try:
+            current = float(dev.getMasterClockRate())
+            best = current if current > 0 else None
+        except Exception:
+            best = None
+    return best
+
+
+def _probe_device_facts(SoapySDR, info):
+    """Briefly open the device to ask what it actually is.
+
+    Returns {"num_channels": int|None, "master_clock_rate": float|None}. Every
+    field is best-effort: a busy device or a driver quirk yields None and the
+    profile defaults stay in force.
+
+    The master clock matters because striqt applies it verbatim
+    (sources/soapy.py: setMasterClockRate) and LINDA used to hand every radio
+    the AIR-T's 125 MHz, which a USRP B2xx rejects outright. Asking the driver
+    is the only answer that generalises past the radios we have profiles for.
+    """
+    facts = {"num_channels": None, "master_clock_rate": None}
     try:
         from SoapySDR import SOAPY_SDR_RX as rx_dir
     except Exception:
@@ -210,15 +255,20 @@ def _probe_num_channels(SoapySDR, info):
     dev = None
     try:
         dev = SoapySDR.Device(info)
-        return int(dev.getNumChannels(rx_dir))
+        try:
+            facts["num_channels"] = int(dev.getNumChannels(rx_dir))
+        except Exception:
+            pass
+        facts["master_clock_rate"] = _probe_master_clock(dev)
     except Exception:
-        return None
+        pass
     finally:
         try:
             if dev is not None:
                 SoapySDR.Device.unmake(dev)
         except Exception:
             pass
+    return facts
 
 
 def _parse_selector(selector: str):
@@ -268,6 +318,8 @@ def resolve_device(selector: str):
         adapter = ADAPTER_CLASSES[m["device"]](m["info"])
         if m["num_channels"]:
             adapter.info["_num_channels"] = int(m["num_channels"])
+        if m.get("master_clock_rate"):
+            adapter.info["_master_clock_rate"] = float(m["master_clock_rate"])
         print(f"[device] selected {m['device']} ({m['label']}"
               + (f", serial {m['serial']}" if m["serial"] else "") + ")")
         return m["device"], adapter
