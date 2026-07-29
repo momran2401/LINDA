@@ -189,11 +189,23 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   the server, not on first request. `RADIO_GPS=0` disables the integration;
   `RADIO_GPS_HOST`/`RADIO_GPS_PORT` relocate gpsd.
 - `setup.sh install_gps()` provisions gpsd on a FRESH host: installs it, probes
-  `ttyACM*`/`ttyUSB*` for a device actually emitting NMEA (never claims an
-  Arduino or FTDI cable found on the same port class), binds it in
-  `/etc/default/gpsd` so it survives reboot, and warns without failing setup
-  when there is no receiver. `RADIO_GPS_DEVICE=/dev/ttyTHS1 bash setup.sh`
-  names a UART-wired module explicitly.
+  for a port actually emitting satellite data, binds it in `/etc/default/gpsd`
+  so it survives reboot, and warns without failing setup when there is no
+  receiver. `RADIO_GPS_DEVICE=/dev/ttyTHS1 bash setup.sh` names a port
+  explicitly and skips the probe. `gps_probe_ttys()` walks
+  `ttyACM*`/`ttyUSB*`/`ttyTHS*`/`ttyAMA*` — the AIR-T wires its onboard GNSS
+  module to a Tegra UART, so a USB-only probe reports "no receiver" on a radio
+  whose receiver is fine — setting each line speed first (9600/115200/38400: a
+  UART at the wrong baud returns *silence*, indistinguishable from no
+  receiver), stopping gpsd for the duration (it holds its configured port open,
+  so probing around a live daemon reads nothing), and skipping the
+  `console=` tty from `/proc/cmdline`. `gps_tty_speaks()` accepts NMEA **or**
+  the UBX sync bytes `b5 62` — gpsd drives a u-blox shipped in binary mode
+  fine, but it must never claim an Arduino or FTDI cable on the same port
+  class. `gps_write_devices()` DELETES every `DEVICES=` line before appending
+  one: `/etc/default/gpsd` is sourced as shell, so a second assignment silently
+  wins, and a hand-edited file listing the working port and then a stale one
+  points gpsd at the stale one (this is exactly how radio05 lost its fix).
 - Recordings therefore embed the precise site location — relevant to any
   data-release decision (see the recordings note below).
 

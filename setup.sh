@@ -651,29 +651,72 @@ install_gps() {
         warn "gpsd unavailable — recordings will record gps_valid=0"
         return 0
     fi
-    local device="${RADIO_GPS_DEVICE:-}" candidate
+    local device="${RADIO_GPS_DEVICE:-}"
     if [[ -z "$device" ]]; then
-        for candidate in /dev/ttyACM* /dev/ttyUSB*; do
-            [[ -e "$candidate" ]] || continue
-            # Only claim a port that actually speaks NMEA — Arduinos and FTDI
-            # cables live on these same device names.
-            if timeout 4 grep -qam1 '^\$G[PNLAB]' "$candidate" 2>/dev/null; then
-                device="$candidate"; break
-            fi
-        done
+        # gpsd holds its configured port open, so a probe run while the daemon
+        # is up reads nothing and we would wrongly conclude "no receiver".
+        systemctl stop gpsd gpsd.socket >/dev/null 2>&1 || true
+        device="$(gps_probe_ttys)"
+        systemctl start gpsd.socket >/dev/null 2>&1 || true
     fi
     if [[ -n "$device" && -e "$device" ]]; then
-        if [[ -f /etc/default/gpsd ]]; then
-            sed -i "s|^DEVICES=.*|DEVICES=\"$device\"|" /etc/default/gpsd || true
-            grep -q '^DEVICES=' /etc/default/gpsd || echo "DEVICES=\"$device\"" >> /etc/default/gpsd
-        fi
+        gps_write_devices "$device"
         systemctl enable gpsd  >/dev/null 2>&1 || true
         systemctl restart gpsd >/dev/null 2>&1 || true
         ok "GPS receiver on $device"
+        info "confirm the fix with:  python3 live/radioctl.py gps"
     else
-        info "no GPS receiver attached — recordings will set gps_valid=0"
+        info "no GPS receiver found — recordings will set gps_valid=0"
+        info "on an AIR-T the GNSS antenna (MCX, bias-fed) must be attached;"
+        info "name a known port explicitly with RADIO_GPS_DEVICE=/dev/ttyTHS1"
     fi
     return 0
+}
+
+# Find a serial port that is actually emitting satellite data.
+#
+# USB dongles enumerate as ttyACM*/ttyUSB*, but the AIR-T wires its onboard
+# GNSS module to a Tegra UART and a Pi GPS HAT lands on ttyAMA0 — a probe that
+# only walks the USB names reports "no receiver" on a radio whose receiver is
+# fine. UARTs also need the line speed set first: a tty left at the wrong baud
+# returns silence, not garbage, which is indistinguishable from no receiver.
+gps_probe_ttys() {
+    local candidate baud console
+    # Never claim the kernel console: it is a UART, it is chatty enough to look
+    # alive, and handing it to gpsd breaks the only way into a headless box.
+    console="$(sed -n 's/.*console=\([^, ]*\).*/\1/p' /proc/cmdline 2>/dev/null)"
+    for candidate in /dev/ttyACM* /dev/ttyUSB* /dev/ttyTHS* /dev/ttyAMA*; do
+        [[ -c "$candidate" ]] || continue
+        [[ -n "$console" && "$candidate" == "/dev/$console" ]] && continue
+        for baud in 9600 115200 38400; do
+            stty -F "$candidate" "$baud" raw -echo >/dev/null 2>&1 || continue
+            if gps_tty_speaks "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# True when a port emits something gpsd can actually drive. Accepting only
+# NMEA would reject a u-blox shipped in UBX binary mode — gpsd parses UBX
+# natively, so a receiver that never sends a '$G' sentence still works.
+# The check stays narrow on purpose: Arduinos and FTDI cables share these
+# device names, and claiming one for gpsd is worse than finding nothing.
+gps_tty_speaks() {
+    timeout 4 head -c 4096 "$1" 2>/dev/null \
+        | grep -qa -e '\$G[PNLAB]' -e "$(printf '\xb5\x62')"
+}
+
+# Write a SINGLE DEVICES line. /etc/default/gpsd is sourced as shell, so a
+# second DEVICES= assignment silently wins over the first — a hand-edited file
+# that lists the working port and then a stale one points gpsd at the stale
+# one. Deleting every existing line before appending makes that unrepresentable.
+gps_write_devices() {
+    [[ -f /etc/default/gpsd ]] || return 0
+    sed -i '/^[[:space:]]*DEVICES=/d' /etc/default/gpsd || return 0
+    printf 'DEVICES="%s"\n' "$1" >> /etc/default/gpsd
 }
 
 # ── 10. Python environment ──────────────────────────────────────────────────
