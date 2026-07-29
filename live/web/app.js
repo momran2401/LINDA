@@ -1571,6 +1571,7 @@ function updateAhawiBadge() {
     if (!els.badge) return;
     if (!ahawiCap) {
         els.badge.textContent = "waiting for the first capture…";
+        els.badge.title = "";
         return;
     }
     const a = ahawiCap.a;
@@ -1594,25 +1595,28 @@ function updateAhawiBadge() {
     const gpu  = a.compute_backend === "cupy" ? " · GPU" : "";
     let text = `seg ${ahawiSeg + 1}/${a.segments} · +${t0}–${t1} ms · ` +
                `${alignTxt} · ${meas}${gpu} · compute ${a.compute_ms} ms`;
+    // Two boxes so the bar's width never follows the text: `detail` is the
+    // elastic one and ellipsises, `flags` never shrinks. The tooltip carries
+    // whatever the ellipsis ate.
     els.badge.innerHTML = "";
-    els.badge.appendChild(document.createTextNode(text));
-    if (ahawiStaleAt) {
-        const stale = document.createElement("span");
-        stale.className = "warn";
-        stale.textContent = " · settings changed — recapturing…";
-        els.badge.appendChild(stale);
-    }
-    if (a.coherent === false) {
-        const warn = document.createElement("span");
-        warn.className = "warn";
-        warn.textContent = " · ⚠ possible gap in this capture";
-        els.badge.appendChild(warn);
-    }
-    if (ahawiPending) {
-        const dot = document.createElement("span");
-        dot.textContent = ahawiPlaying ? " · new capture queued" : " · newer capture waiting";
-        els.badge.appendChild(dot);
-    }
+    const detail = document.createElement("span");
+    detail.className = "ahawi-badge-text";
+    detail.textContent = text;
+    const flags = document.createElement("span");
+    flags.className = "ahawi-badge-flags";
+    els.badge.append(detail, flags);
+    const addFlag = (txt, warn) => {
+        const el = document.createElement("span");
+        if (warn) el.className = "warn";
+        el.textContent = txt;
+        flags.appendChild(el);
+        text += txt;
+    };
+    if (ahawiStaleAt)         addFlag(" · settings changed — recapturing…", true);
+    if (a.coherent === false) addFlag(" · ⚠ possible gap in this capture", true);
+    if (ahawiPending)         addFlag(ahawiPlaying ? " · new capture queued"
+                                                   : " · newer capture waiting", false);
+    els.badge.title = text;
     if (els.golive) els.golive.hidden = !(ahawiPending && !ahawiPlaying);
 }
 
