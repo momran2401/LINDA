@@ -125,6 +125,50 @@ def test_every_profile_declares_its_own_clock_or_is_generic():
         assert profile.get("master_clock_rate"), f"{name} declares no master clock"
 
 
+def test_discover_reports_channels_and_clock(monkeypatch):
+    """Enumeration still works after folding the clock probe into it.
+
+    _probe_num_channels grew into _probe_device_facts so one device open yields
+    both facts; this pins the wiring so a refactor cannot quietly return rows
+    without a clock (or no rows at all).
+    """
+    import sys
+    import types
+
+    class _Dev:
+        def __init__(self, info=None):
+            pass
+
+        def getNumChannels(self, direction):
+            return 1
+
+        def getMasterClockRates(self):
+            return [_Range(5e6, 61.44e6)]
+
+        def getMasterClockRate(self):
+            return 16e6
+
+        @staticmethod
+        def unmake(dev):
+            pass
+
+        @staticmethod
+        def enumerate():
+            return [{"driver": "uhd", "label": "B205mini 34C56EC",
+                     "serial": "34C56EC"}]
+
+    fake = types.ModuleType("SoapySDR")
+    fake.Device = _Dev
+    fake.SOAPY_SDR_RX = 1
+    monkeypatch.setitem(sys.modules, "SoapySDR", fake)
+
+    rows = devices.discover()
+    assert len(rows) == 1
+    assert rows[0]["device"] == "soapy"        # unknown driver → generic profile
+    assert rows[0]["num_channels"] == 1
+    assert rows[0]["master_clock_rate"] == 61.44e6
+
+
 def test_generic_adapter_injects_the_probed_clock(monkeypatch, spec_stub):
     """The rate the radio reported at enumeration reaches the source spec."""
     captured = {}

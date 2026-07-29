@@ -710,8 +710,17 @@ verify_radio() {
         return 0
     fi
     say "Talking to the radio"
-    local found
-    found="$( cd "$REPO_ROOT" && UHD_IMAGES_DIR="${UHD_IMAGES_PATH:-}" "$VENV_PY" -c '
+    # Build the environment as an array: UHD_IMAGES_DIR is set only when images
+    # were actually located. Exporting it EMPTY points UHD at nowhere and is
+    # worse than leaving it to its own search.
+    local -a runner=("$VENV_PY")
+    if [[ -n "$UHD_IMAGES_PATH" ]]; then
+        runner=(env "UHD_IMAGES_DIR=$UHD_IMAGES_PATH" "$VENV_PY")
+    fi
+    # stderr is CAPTURED, not discarded. Hiding it once already turned a
+    # diagnosable enumeration failure into a guess.
+    local out found
+    out="$( cd "$REPO_ROOT" && "${runner[@]}" -c '
 import sys; sys.path.insert(0, "live")
 from core import devices
 try:
@@ -720,11 +729,23 @@ except RuntimeError as e:
     print("ERR", e); raise SystemExit
 for r in rows:
     print("HIT", r["device"], r["label"])
-' 2>/dev/null | grep '^HIT' || true )"
+' 2>&1 || true )"
+    found="$(printf '%s\n' "$out" | grep '^HIT' || true)"
     if [[ -z "$found" ]]; then
         RADIO_CHECK_STATUS="FAILED — no radio enumerated"
-        warn "SoapySDR enumerated no radios."
-        warn "Check power/cabling, then:  SoapySDRUtil --find"
+        warn "SoapySDR enumerated no radios. It said:"
+        printf '%s\n' "$out" | sed 's/^/        /'
+        # Cross-check with the driver's own tool. If SoapySDRUtil sees the
+        # radio and we do not, the fault is in LINDA; if neither sees it, the
+        # radio is absent, unpowered, or still held by another process.
+        if command -v SoapySDRUtil >/dev/null 2>&1; then
+            warn "SoapySDRUtil --find says:"
+            SoapySDRUtil --find 2>&1 | sed 's/^/        /' || true
+        fi
+        if command -v lsusb >/dev/null 2>&1 && lsusb -d 2500: >/dev/null 2>&1; then
+            warn "the USRP IS present on USB, so it is most likely still open in"
+            warn "another process. Check with:  sudo fuser -v /dev/bus/usb/*/*"
+        fi
         return 0
     fi
     info "enumerated:"
@@ -929,6 +950,37 @@ stop_existing_service() {
         systemctl stop "$SERVICE_NAME"
         info "stopped the running $SERVICE_NAME for the duration of setup"
     fi
+    release_radio
+    return 0
+}
+
+# A USRP that another process still has open does not show up in SoapySDR's
+# enumeration AT ALL, so one stale viewer makes a perfectly good radio look
+# absent. Kiosk mode is the way to get one: it runs the web server as a CHILD
+# process and relaunches it whenever its health probe times out, so a failed
+# run can leave a server behind that is still holding the USB device.
+LINDA_PROCS='striqt_web_server\.py|striqt_kiosk\.py|striqt_standalone_terminal\.py'
+release_radio() {
+    [[ $IS_ROOT -eq 1 ]] || return 0
+    command -v pgrep >/dev/null 2>&1 || return 0
+    local pids
+    pids="$(pgrep -f "$LINDA_PROCS" 2>/dev/null | tr '\n' ' ' || true)"
+    [[ -n "${pids// /}" ]] || return 0
+    warn "other LINDA viewer processes still hold the radio (pids:${pids%% })"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    local i
+    for i in $(seq 1 10); do
+        pgrep -f "$LINDA_PROCS" >/dev/null 2>&1 || break
+        sleep 1
+    done
+    pids="$(pgrep -f "$LINDA_PROCS" 2>/dev/null | tr '\n' ' ' || true)"
+    if [[ -n "${pids// /}" ]]; then
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
+        sleep 1
+    fi
+    ok "radio released by the previous viewer"
     return 0
 }
 
