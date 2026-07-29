@@ -430,18 +430,39 @@ install_pluto_driver() {
         return 0
     fi
     info "not packaged in this release — building SoapyPlutoSDR from source"
-    apt_install build-essential cmake git libiio-dev libad9361-dev \
+    # libsoapysdr-dev is REQUIRED here even though nothing else in this repo
+    # compiles: SoapyPlutoSDR's CMakeLists looks for the SoapySDR headers and
+    # its CMake config, and stops with "Soapy SDR development files not
+    # found..." without them.
+    apt_install build-essential cmake git libsoapysdr-dev libiio-dev libad9361-dev \
         || die "cannot install the toolchain needed to build SoapyPlutoSDR"
+
+    # Install into the prefix SoapySDR itself searches. A module built with
+    # CMake's default /usr/local lands in /usr/local/lib/SoapySDR/modules0.8,
+    # which the DISTRO SoapySDR (rooted at /usr) never looks in — the build
+    # would succeed and the driver would still be invisible.
+    local prefix
+    prefix="$(SoapySDRUtil --info 2>/dev/null \
+              | sed -n 's/^Install root:[[:space:]]*//p' | head -1 || true)"
+    [[ -n "$prefix" ]] || prefix="/usr"
+    info "installing the module under $prefix (SoapySDR's own search root)"
+
     local src="/usr/local/src/SoapyPlutoSDR"
     rm -rf "$src"
     git clone --depth 1 https://github.com/pothosware/SoapyPlutoSDR.git "$src" \
         || die "could not fetch SoapyPlutoSDR"
-    cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release >/dev/null \
+    cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="$prefix" >/dev/null \
         && cmake --build "$src/build" -j"$(nproc)" >/dev/null \
         && cmake --install "$src/build" >/dev/null \
         || die "SoapyPlutoSDR build failed (see $LOG_FILE)"
     ldconfig
-    ok "SoapyPlutoSDR built and installed"
+    if SoapySDRUtil --info 2>&1 | grep -qiE 'plutosdr|pluto'; then
+        ok "SoapyPlutoSDR built and loaded by SoapySDR"
+    else
+        warn "SoapyPlutoSDR built, but SoapySDR does not list it. Module search"
+        warn "path (SoapySDRUtil --info) may differ from $prefix."
+    fi
     return 0
 }
 
