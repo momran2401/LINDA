@@ -28,7 +28,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import devices, health, state                       # noqa: E402
-from core.constants import DEFAULT_CENTER                      # noqa: E402
+from core.constants import (DEFAULT_CENTER, DEFAULT_SAMPLE_RATE,  # noqa: E402
+                            DEVICE_PROFILES, RATES_HZ)
 from core.acquisition import Acquirer, Computer, DemoAcquirer  # noqa: E402
 from core.config import SharedConfig                           # noqa: E402
 from core.operations import OPERATIONS                         # noqa: E402
@@ -117,15 +118,26 @@ def main():
     if args.quick:
         centers = centers[:2]
     centers = [c for c in centers if env["freq_min"] <= c <= env["freq_max"]]
-    rates = [3.84e6, 15.36e6] if not args.quick else [15.36e6]
-    rates = [r for r in rates if env["rate_min"] <= r <= env["rate_max"]]
+    # Qualify at the rate THIS radio actually defaults to, plus one neighbour
+    # to prove a rate change applies. The old hard-coded 15.36 MS/s is fine for
+    # an AIR-T but wrong for a PlutoSDR, whose own profile calls that rate
+    # optimistic over its USB link and defaults to 3.84 MS/s — the qualifier
+    # would have failed a perfectly healthy radio at a rate nobody runs it at.
+    home_rate = DEVICE_PROFILES.get(name, {}).get("defaults", {}).get(
+        "sample_rate", DEFAULT_SAMPLE_RATE)
+    legal_rates = [r for r in RATES_HZ
+                   if env["rate_min"] <= r <= env["rate_max"]]
+    if home_rate not in legal_rates:
+        home_rate = legal_rates[0] if legal_rates else home_rate
+    neighbours = [r for r in legal_rates if r != home_rate]
+    rates = [home_rate] + (neighbours[:1] if args.quick else neighbours)
     gains = [env["gain_min"], min(env["gain_max"], env["gain_min"] + 10)]
 
     points = ([("center", c, "center") for c in centers]
               + [("sample_rate", r, "fs") for r in rates]
               + [("gain", g, "gain") for g in gains]
               + [("center", DEFAULT_CENTER, "center"),  # return to defaults
-                 ("sample_rate", 15.36e6 if 15.36e6 <= env["rate_max"] else rates[0], "fs")])
+                 ("sample_rate", home_rate, "fs")])
 
     results = []
     for field, value, hkey in points:
