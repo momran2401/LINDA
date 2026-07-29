@@ -42,7 +42,7 @@ import numpy as np
 
 from . import state
 from .operations import OPERATIONS
-from .shims import get_device
+from .shims import enable_stream, get_device
 
 # ---------------------------------------------------------------------------
 # Waveforms
@@ -63,6 +63,39 @@ DEFAULT_AMPLITUDE = 0.5
 
 #: Samples per writeStream call when the driver reports no MTU.
 DEFAULT_CHUNK = 16384
+
+# How the TX stream had to be obtained, best case first. Observed on a real
+# AIR8201B: `setupStream(SOAPY_SDR_TX)` fails with
+#
+#     Trigger in use, can't set up new stream!
+#
+# while the live RX stream exists. AirStack's SoapyAIRT arms every stream from
+# ONE FPGA trigger block, and the running viewer already holds it — so on this
+# radio "RX and TX are independent streams on one device" is true of the AD9371
+# but NOT of the driver above it. The ladder below tries the cheapest thing
+# first and discloses which rung it actually needed, because the last one costs
+# the operator their live view.
+TX_COEXIST      = "coexist"       # true full duplex; viewer never notices
+TX_RX_QUIESCED  = "rx_quiesced"   # RX briefly deactivated; viewer blips
+TX_RX_RELEASED  = "rx_released"   # RX stream closed for the whole transmission
+
+#: Human wording for each rung — used in the op log and shown in the UI.
+TX_RX_MODE_NOTES = {
+    TX_COEXIST: "live view keeps running (radio does full duplex)",
+    TX_RX_QUIESCED: "live view blipped while the TX stream was created",
+    TX_RX_RELEASED: "LIVE VIEW IS DOWN — this radio cannot receive while "
+                    "transmitting; it resumes when you press Stop",
+}
+
+#: Driver messages that mean "another stream holds the resource", not "your
+#: request was wrong". Only these escalate the ladder; a genuinely bad request
+#: must fail fast instead of costing the operator their live view.
+_STREAM_CONFLICT_MARKERS = ("trigger", "in use", "busy", "already", "resource")
+
+
+def _is_stream_conflict(exc):
+    text = str(exc).lower()
+    return any(marker in text for marker in _STREAM_CONFLICT_MARKERS)
 
 
 class Waveform:
@@ -679,8 +712,12 @@ class TxController:
             self._plan["actual"] = dict(actual)
 
         stream = None
+        rx_mode = TX_COEXIST
         try:
-            stream = dev.setupStream(d, _cf32(), [ch])
+            stream, rx_mode = self._acquire_tx_stream(dev, d, ch, op_id)
+            with self._lock:
+                self._plan["rx_mode"] = rx_mode
+                self._plan["rx_note"] = TX_RX_MODE_NOTES[rx_mode]
             try:
                 mtu = int(dev.getStreamMTU(stream))
             except Exception:
@@ -712,7 +749,9 @@ class TxController:
                    if mismatched else ""))
         finally:
             # Deactivate/close even on the failure path: a TX stream left
-            # active keeps the PA keyed.
+            # active keeps the PA keyed. This MUST happen before the RX stream
+            # is restored — the TX stream holds the same trigger the RX stream
+            # needs back, so resuming first would just move the conflict.
             for action in (lambda: dev.deactivateStream(stream),
                            lambda: dev.closeStream(stream)):
                 if stream is None:
@@ -721,6 +760,114 @@ class TxController:
                     action()
                 except Exception:
                     pass
+            self._restore_rx(rx_mode, op_id)
+
+    def _acquire_tx_stream(self, dev, d, ch, op_id):
+        """Get a TX stream, giving up as little of the live view as necessary.
+
+        Returns (stream, rx_mode). See TX_COEXIST/TX_RX_QUIESCED/
+        TX_RX_RELEASED — the caller discloses whichever rung was needed.
+        """
+        # Deepwave's own TX example passes this; drivers that don't know the
+        # key ignore it, and the no-args form is retried for bindings whose
+        # setupStream takes no kwargs at all.
+        args = {"tx_buffer_size": str(DEFAULT_CHUNK)}
+
+        def attempt():
+            try:
+                return dev.setupStream(d, _cf32(), [ch], args)
+            except TypeError:
+                return dev.setupStream(d, _cf32(), [ch])
+
+        # Rung 0 — just ask. Works on any genuinely full-duplex driver.
+        try:
+            return attempt(), TX_COEXIST
+        except Exception as exc:
+            if not _is_stream_conflict(exc):
+                raise
+            OPERATIONS.stage(
+                op_id, "applying",
+                f"TX stream refused while the live RX stream is up ({exc}) — "
+                f"deactivating RX and retrying", level="warn")
+
+        source = getattr(self._acquirer, "source", None)
+
+        # Rung 1 — deactivate RX, create the TX stream, put RX back. Costs the
+        # viewer a blip. Some drivers release the trigger on deactivate.
+        quiesced = False
+        try:
+            enable_stream(source, False)
+            quiesced = True
+            stream = attempt()
+        except Exception as exc:
+            if quiesced:
+                # Put the viewer back before deciding anything else.
+                try:
+                    enable_stream(source, True)
+                except Exception:
+                    pass
+            if not _is_stream_conflict(exc):
+                raise
+            stream = None
+        if stream is not None:
+            try:
+                enable_stream(source, True)
+                OPERATIONS.stage(op_id, "applying",
+                                 "TX stream created with RX briefly "
+                                 "deactivated; live view is back")
+                return stream, TX_RX_QUIESCED
+            except Exception as exc:
+                # TX stream exists but RX will not restart alongside it. Drop
+                # the TX stream and fall through to the honest option rather
+                # than leaving the viewer silently dead.
+                OPERATIONS.stage(
+                    op_id, "applying",
+                    f"RX would not restart alongside the TX stream ({exc}) — "
+                    f"releasing the radio instead", level="warn")
+                for action in (lambda: dev.deactivateStream(stream),
+                               lambda: dev.closeStream(stream)):
+                    try:
+                        action()
+                    except Exception:
+                        pass
+
+        # Rung 2 — hand the radio over exactly the way a recording does. The
+        # Acquirer's pause path closes the RX stream while KEEPING the AIR-T
+        # device initialized (source.close() would deinitialize the AD9371
+        # management sensors for the life of the process), and resume()
+        # rearms it afterwards.
+        OPERATIONS.stage(
+            op_id, "applying",
+            "this radio cannot hold an RX and a TX stream at once — pausing "
+            "live acquisition for the duration of the transmission",
+            level="warn")
+        if self._stop_evt.is_set():
+            # Stop was requested while we were climbing the ladder. Do not take
+            # the viewer down for a transmission nobody is waiting for.
+            raise RuntimeError("transmission cancelled before it started")
+        if not self._acquirer.pause_and_release(15.0):
+            raise RuntimeError(
+                "live acquisition did not release the radio within 15 s, so "
+                "the TX stream cannot be created (the radio only has one "
+                "stream trigger)")
+        try:
+            return attempt(), TX_RX_RELEASED
+        except Exception:
+            self._acquirer.resume()
+            raise
+
+    def _restore_rx(self, rx_mode, op_id):
+        """Give the live view back. Only rung 2 actually took it away."""
+        if rx_mode != TX_RX_RELEASED:
+            return
+        try:
+            self._acquirer.resume()
+            OPERATIONS.stage(op_id, "resume-live",
+                             "live acquisition resumed after the transmission")
+        except Exception as exc:  # noqa: BLE001
+            OPERATIONS.stage(op_id, "resume-live",
+                             f"could not resume live acquisition: {exc}",
+                             level="error")
 
     def _pump(self, dev, stream, wave, plan, chunk, op_id):
         """Feed the TX stream until stop, duration, or the device disappears."""

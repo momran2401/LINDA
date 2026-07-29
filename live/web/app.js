@@ -851,6 +851,10 @@ function fmtTxPlan(plan) {
         lines.push(`chirp ${(p.chirp_bandwidth_hz / 1e6).toFixed(3)} MHz over ` +
                    `${(p.chirp_period_s * 1e3).toFixed(2)} ms`);
     }
+    // Some radios (the AIR-T among them) cannot hold an RX and a TX stream at
+    // once, so transmitting costs the live view. A frozen waterfall must
+    // explain itself rather than looking like a crash.
+    if (plan.rx_note) lines.push(plan.rx_note);
     // Readback: what the DRIVER says it tuned to, which is the only number
     // worth trusting. Shown whenever it disagrees with the request.
     const a = plan.actual;
@@ -884,7 +888,11 @@ function updateTxUI(tx) {
                     (tx.simulated ? "⚡ SIMULATED TRANSMIT · " : "⚡ TRANSMITTING · ") +
                     `${(plan.frequency_hz / 1e6).toFixed(3)} MHz · ${plan.gain_db} dB · ` +
                     `${plan.waveform} · ${(tx.elapsed_s || 0).toFixed(0)} s` +
-                    (tx.remaining_s != null ? ` (${tx.remaining_s.toFixed(0)} s left)` : "");
+                    (tx.remaining_s != null ? ` (${tx.remaining_s.toFixed(0)} s left)` : "") +
+                    // The radio may have had to give up receiving to transmit;
+                    // say so in the banner, not just in the dialog the operator
+                    // may have closed.
+                    (plan.rx_mode === "rx_released" ? " · LIVE VIEW PAUSED" : "");
             } else {
                 // Read-only roles are told to stand by, not what is radiating
                 // — they cannot act on it either way, and the instrument being

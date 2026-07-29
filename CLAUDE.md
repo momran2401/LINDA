@@ -250,11 +250,27 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 - **TX borrows the live device handle; it never opens its own, and the service
   never stops.** The AIR-T retains FPGA descriptors for the process lifetime
   (same reason recording runs in-process), so a second process could not
-  acquire the radio. RX and TX are independent streams on one device, so the
-  waterfall keeps running while transmitting — you can watch your own signal.
-  `TxController._pump` re-checks device identity every chunk and aborts the
-  transmission if the Acquirer reopened the source underneath it; `_recover()`
+  acquire the radio. `TxController._pump` re-checks device identity every chunk
+  and aborts if the Acquirer reopened the source underneath it; `_recover()`
   also calls `TX.shutdown()` *before* disturbing the handle.
+- **The AIR-T has ONE stream trigger, and the live RX stream holds it.**
+  Observed on a real AIR8201B: `setupStream(SOAPY_SDR_TX)` raises
+  `Trigger in use, can't set up new stream!` while the viewer is running. The
+  AD9371 is full duplex; AirStack's SoapyAIRT above it is not, because every
+  stream arms from one FPGA trigger block. Do NOT assume RX and TX coexist on
+  this radio. `_acquire_tx_stream()` is an escalation ladder that gives up as
+  little as possible and DISCLOSES which rung it needed
+  (`plan.rx_mode`/`rx_note`, banner, op log):
+  `coexist` (true full duplex — other radios) → `rx_quiesced` (RX deactivated
+  just for the setup call) → `rx_released` (RX stream closed for the whole
+  transmission via `acquirer.pause_and_release()`, the same handoff recording
+  uses; the waterfall freezes and the UI says **LIVE VIEW PAUSED**). Only
+  driver messages matching `_STREAM_CONFLICT_MARKERS` escalate — a bad request
+  must fail fast rather than cost the operator their live view. The TX stream
+  is closed BEFORE the RX stream is restored: it holds the very trigger RX
+  needs back. Deepwave's own TX example passes `tx_buffer_size`, so
+  `setupStream` is called with it (with a no-args retry for bindings that
+  reject kwargs).
 - Waveforms (`Waveform`): `cw`, `two_tone`, `chirp`, `noise`. Phase is carried
   as fractional cycles mod 1 in float64 — an absolute float32 time axis
   scrambles a MHz tone within a minute, and a transmitter runs far longer than
