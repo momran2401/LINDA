@@ -900,16 +900,26 @@ health_check() {
     [[ "$MODE" != "terminal" ]] || return 0
     [[ $IS_ROOT -eq 1 && $HAVE_SYSTEMD -eq 1 ]] || return 0
     say "Waiting for the viewer to answer"
+    # 30 s was not enough on a Pi and produced a false failure on a install that
+    # was actually fine: the first start imports striqt (numba, llvmlite, scipy,
+    # matplotlib) and then a USRP loads its FPGA image over USB, which alone
+    # takes ~8 s. Give it two minutes, but report progress so a slow start does
+    # not look like a hang.
     local i
-    for i in $(seq 1 30); do
+    for i in $(seq 1 120); do
         if curl -fsS "http://localhost:$PORT/health" >/dev/null 2>&1; then
             ok "$(curl -fsS "http://localhost:$PORT/health" | head -c 200)"
             return 0
         fi
+        if ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            journalctl -u "$SERVICE_NAME" -n 60 --no-pager >&2 || true
+            die "the service stopped while starting up (journal above)"
+        fi
+        (( i % 15 == 0 )) && info "still starting… ${i}s"
         sleep 1
     done
     journalctl -u "$SERVICE_NAME" -n 60 --no-pager >&2 || true
-    die "the service did not answer /health within 30 seconds"
+    die "the service did not answer /health within 120 seconds"
 }
 
 stop_existing_service() {
