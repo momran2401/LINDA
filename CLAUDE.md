@@ -30,6 +30,16 @@ frontend script — fix it once in `live/core/`.**
 - `core/state.py` — runtime device/channels/backend/fps; set once at startup via
   `state.configure_device()` etc., read at call time everywhere
 - `core/striqt_compat.py` — defensive striqt imports + AIR-T pixi libstdc++ re-exec
+  + **SoapySDR compatibility patches for non-AIR-T radios**. striqt 0.7.0 was
+  only ever exercised against Deepwave hardware, so two of its assumptions
+  break every generic SoapySDR device; both are patched here, not in
+  `striqt/`. (1) `_probe_channel` subscripts `getSensorInfo(...)[0]`, which is
+  a single ArgInfo — fires on any radio with per-channel sensors (USRP yes,
+  AIR-T no). (2) `HardwareTimeSync.to_host_os` raises when
+  `hasHardwareTime()` is False, and every `time_sync_at` value reaches it, so
+  a Pluto/RTL-SDR/HackRF could never open — even though striqt's own read
+  path already handles a null sync time. Both patches no-op on a striqt that
+  fixes them upstream
   (must be imported first; `import core` guarantees it)
 - `core/parsing.py` — freedom-model parsers, `ANALYSIS_TARGETS`, striqt scratch validators
 - `core/config.py` — `RadioConfig` + `SharedConfig` (tier-1 clamp/snap, tier-2

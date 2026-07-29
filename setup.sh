@@ -520,11 +520,17 @@ install_pluto_driver() {
         && cmake --install "$src/build" >/dev/null \
         || die "SoapyPlutoSDR build failed (see $LOG_FILE)"
     ldconfig
-    if SoapySDRUtil --info 2>&1 | grep -qiE 'plutosdr|pluto'; then
-        ok "SoapyPlutoSDR built and loaded by SoapySDR"
+    # Report where the module landed rather than guessing whether it works:
+    # an earlier version grepped SoapySDRUtil --info for "plutosdr" and cried
+    # wolf on a build that was in fact fine — the Pluto enumerated correctly
+    # moments later. The authoritative check is verify_radio, which actually
+    # enumerates and captures.
+    local module
+    module="$(grep -m1 'SoapySDR/modules' "$src/build/install_manifest.txt" 2>/dev/null || true)"
+    if [[ -n "$module" ]]; then
+        ok "SoapyPlutoSDR installed: $module"
     else
-        warn "SoapyPlutoSDR built, but SoapySDR does not list it. Module search"
-        warn "path (SoapySDRUtil --info) may differ from $prefix."
+        ok "SoapyPlutoSDR built and installed under $prefix"
     fi
     return 0
 }
