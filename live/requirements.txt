@@ -3,13 +3,7 @@
 #   pip install 'striqt @ git+https://github.com/usnistgov/striqt@2e7696d3cd7c9f710f406b4b83148476ead8c20f'
 fastapi>=0.110
 uvicorn[standard]>=0.27
-# Keep the scientific/plotting stack in one resolver transaction.  In
-# particular, do not install pandas-stubs here: it is editor-only metadata,
-# not pandas, and inherited system copies have caused misleading conflicts.
+# NumPy is used directly by the live acquisition and quicklook DSP paths.
+# striqt brings its own scientific/analysis dependencies when real-radio
+# support is installed by setup.sh.
 numpy>=1.24,<3
-pandas>=1.5,<2.3
-seaborn>=0.13,<0.14
-
-# Optional (tools & tests)
-websockets>=11
-pytest>=7

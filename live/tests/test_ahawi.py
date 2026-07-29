@@ -185,6 +185,31 @@ def test_capture_trims_to_exact_segment_rows_and_discloses_geometry():
     assert meta["backend"] == "quicklook"
     assert a["align_offset_rows"] <= plan["extra_rows"]
     assert a["compute_ms"] >= 0
+    # Bundle honesty: the header lists exactly what ran. On a striqt-less
+    # host that is the quicklook spectrogram alone — no phantom psd/power.
+    from core.striqt_compat import _ANALYSIS_OK
+    if _ANALYSIS_OK:
+        assert "psd" in a["measurements"]
+        assert "channel_power" in a["measurements"]
+        assert a["power"]["series"], "channel power ran but shipped no data"
+    else:
+        assert a["measurements"] == ["quicklook"]
+        assert "psd" not in a and "power" not in a
+    assert a["compute_backend"] in ("numpy", "cupy")
+
+
+def test_power_plan_geometry_is_exact_and_bounded():
+    from fractions import Fraction
+    from core.dsp import ahawi_power_plan
+    for segments, seg_samples, fs in [(5, 300 * 1024, 15.36e6),
+                                      (64, 57 * 1024, 15.36e6),
+                                      (1, 1500 * 1024, 30.72e6)]:
+        period, window = ahawi_power_plan(segments, seg_samples, fs)
+        assert isinstance(period, Fraction)      # striqt's spec demands exact
+        assert period == Fraction(window, int(round(fs)))
+        points_per_seg = seg_samples // window
+        assert 15 <= points_per_seg <= 65
+        assert segments * points_per_seg <= 2200   # header JSON stays small
 
 
 # ── Config validation ───────────────────────────────────────────────────────

@@ -61,7 +61,9 @@ developed and tested on a laptop without hardware
 - Python packages: `fastapi`, `uvicorn`, `numpy` (see
   [`live/requirements.txt`](live/requirements.txt))
 - For real radios: **SoapySDR** with your radio's driver module
-  (`SoapyAIRT` for Deepwave, `soapysdr-module-plutosdr` for Pluto, …) and the
+  (`SoapyAIRT` for Deepwave, `soapysdr-module-uhd` + `uhd-host` + `uhd-images`
+  for an Ettus USRP B205mini/B2xx, `soapysdr-module-plutosdr` for Pluto, …) and
+  the
   **striqt** acquisition/analysis library:
 
   ```sh
@@ -80,19 +82,22 @@ Demo mode needs only Python + the pip packages — no SDR stack at all.
 ```sh
 git clone <this-repo> && cd LINDA
 sudo bash setup.sh              # interactive TUI: mode, port, hostname, radio…
-sudo bash setup.sh --defaults   # or: no questions, web mode on port 8000
+sudo bash setup.sh --defaults   # no questions: web mode + one attached radio
+# Ettus USRP B205mini/B2xx (recommended explicit one-liner):
+sudo bash setup.sh --defaults --device=uhd
 # Provision before the selected radio is physically available:
 sudo bash setup.sh --skip-hardware-check
 ```
 
 The installer is **idempotent** (safe to re-run) and takes care of:
 
-- apt packages: build tooling, SoapySDR + every common radio driver module
-  available from the configured distro repositories, avahi (mDNS), whiptail,
-  USB/udev permissions, firmware utilities, NetworkManager (for
+- apt packages: build tooling, SoapySDR + the driver stack for the selected
+  radio (UHD/SoapyUHD for `--device=uhd`), avahi (mDNS), whiptail,
+  USB/udev permissions, only the selected driver's firmware utilities,
+  NetworkManager (for
   hotspot/ethernet modes), and Chromium/X/LightDM (for kiosk mode)
 - a Python virtualenv at `.venv/` with one consistently resolved
-  FastAPI/uvicorn/numpy/pandas/Seaborn/striqt dependency set; the installer
+  FastAPI/uvicorn/numpy/striqt dependency set; the installer
   preserves and rebuilds stale environments, then runs `pip check` and import
   checks before configuring the service
 - username-only role logins and a generated session-signing secret written to
@@ -132,11 +137,11 @@ provisioning.
 # No hardware — synthetic signals, open http://localhost:8000
 ./.venv/bin/python live/striqt_web_server.py --demo
 
-# Real radio (AIR8201B default)
-./.venv/bin/python live/striqt_web_server.py
-
-# Auto-detect whatever SoapySDR radio is plugged in
+# Real radio: enumerate one attached SDR automatically
 ./.venv/bin/python live/striqt_web_server.py --device auto
+
+# Ettus USRP B205mini/B2xx (select the SoapyUHD driver explicitly)
+./.venv/bin/python live/striqt_web_server.py --device driver=uhd
 
 # Terminal waterfall over SSH (no browser, no GUI)
 ./.venv/bin/python live/striqt_standalone_terminal.py --demo --backend quicklook
@@ -221,7 +226,7 @@ by side; a single-channel Pluto gets one full-width pane.
 
 | Flag | Meaning |
 |---|---|
-| `--device X` | `air8201b` (default) · `air7201b` · `air7101b` · `pluto` · `soapy` · `demo` · `auto` (enumerate; must find exactly one) · `driver=X[,serial=Y]` (pick one of several) |
+| `--device X` | `air8201b` (default) · `air7201b` · `air7101b` · `pluto` · `demo` · `auto` (enumerate; must find exactly one) · `driver=X[,serial=Y]` (pick one of several; a USRP B205mini uses `driver=uhd`) |
 | `--demo` | alias for `--device demo` |
 | `--ports 0,1` | explicit RX port list (default `auto`: probe the driver, fall back to the profile) |
 | `--channels N` | use the first N channels (demo: create N) |

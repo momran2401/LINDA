@@ -88,6 +88,35 @@ def test_honours_an_explicit_retry_count(source):
         assert record.receive_retries == 5
 
 
+def test_honours_the_yaml_array_backend_request(source):
+    """Regression: the recording YAML asks for cupy on hardware, but the live
+    source spec hardcodes numpy and used to clobber the request — 4.6 s of
+    CPU analysis per 20 ms capture on the AIR-T."""
+    live = source.setup_spec
+    assert live.array_backend == "cupy"   # FakeSpec default mimics the request path
+    src = FakeSource(FakeSpec(array_backend="numpy"))
+    with shims.finite_capture_mode(src, array_backend="cupy") as record:
+        assert record.array_backend == "cupy"
+        assert record.gapless is False
+    assert src.setup_spec.array_backend == "numpy"   # restored for the viewer
+
+
+def test_array_backend_none_leaves_the_live_backend_alone(source):
+    with shims.finite_capture_mode(source, array_backend=None) as record:
+        assert record.array_backend == source.__setup__.array_backend \
+            or record.array_backend == "cupy"
+
+
+def test_array_backend_swap_applies_even_when_already_finite():
+    finite = FakeSpec(gapless=False, receive_retries=3, array_backend="numpy")
+    src = FakeSource(finite)
+    with shims.finite_capture_mode(src, array_backend="cupy") as record:
+        assert record.array_backend == "cupy"
+        assert record.gapless is False
+        assert record.receive_retries == 3   # untouched — only backend changed
+    assert src.setup_spec is finite
+
+
 def test_registers_and_unregisters_the_swapped_spec(monkeypatch, source):
     """Sink path formatting resolves a radio ID by looking the sweep's source
     spec up in striqt's registry; an unregistered spec blocks, then raises."""

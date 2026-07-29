@@ -120,12 +120,15 @@ def time_aperture_bins(cfg: "RadioConfig", hop: int) -> int:
     return max(1, round(float(cfg.time_aperture) * float(cfg.sample_rate) / max(1, hop)))
 
 
-def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
+def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig",
+                           prefer_gpu: bool = False) -> tuple:
     """
     striqt-calibrated PSD spectrogram driven by cfg's analysis params (P2a-1) —
     window, overlap, fill, integration bandwidth, LO bandstop, stopband trim.
     Returns (blocks, meta) — blocks (channels, rows, bins) float32, meta
-    {fft_nfft, bin_avg, hop_size, freqs_hz_f0, freqs_hz_step}.
+    {fft_nfft, bin_avg, hop_size, freqs_hz_f0, freqs_hz_step, compute_backend}.
+    prefer_gpu offloads the STFT to cupy when present (AHAWI/capture-sized
+    work); the rolling live path keeps its numpy default unchanged.
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"calibrated backend unavailable: {_ANALYSIS_ERR!r}")
@@ -160,9 +163,10 @@ def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
         else max(1, round(integration / (sample_rate / nfft)))
     )
     striqt_shared.spectrogram_cache.clear()
-    spg, _ = striqt_shared.evaluate_spectrogram(
-        samples, capture, spec, dtype="float32", dB=True
-    )
+    spg, gpu_backend = _run_array_fn(
+        lambda iq: striqt_shared.evaluate_spectrogram(
+            iq, capture, spec, dtype="float32", dB=True)[0],
+        samples, prefer_gpu)
     # time_aperture averages time_bins STFT rows into one output row (P2b-2):
     # fewer rows come back, and each spans time_bins hops of signal. Fit to the
     # honest averaged count and disclose the widened hop so the client's time
@@ -175,7 +179,7 @@ def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
         lo_null=cfg.lo_null, lo_bandstop=cfg.lo_bandstop,
     )
     meta = {"fft_nfft": int(nfft), "bin_avg": int(average_bins),
-            "hop_size": int(hop * time_bins)}
+            "hop_size": int(hop * time_bins), "compute_backend": gpu_backend}
     # Ship striqt's own frequency coordinates so the header axis is exact for ANY
     # analysis params (trim/averaging change the bin grid in ways the header's
     # symmetric-about-DC fallback can only approximate). Additive: build_header
@@ -211,7 +215,8 @@ def make_psd_kwargs(cfg: "RadioConfig", nfft: int, sample_rate: float) -> dict:
     )
 
 
-def psd_traces(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
+def psd_traces(samples: np.ndarray, cfg: "RadioConfig",
+               prefer_gpu: bool = False) -> tuple:
     """
     striqt power_spectral_density backend (P2b-3): Welch-method statistic
     traces over the frame's time span, one row per configured time_statistic
@@ -245,9 +250,10 @@ def psd_traces(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
         1 if integration is None
         else max(1, round(integration / (sample_rate / nfft)))
     )
-    psd, _ = striqt_measurements.power_spectral_density(
-        samples, capture, as_xarray=False, **kwargs
-    )
+    psd, _gpu = _run_array_fn(
+        lambda iq: striqt_measurements.power_spectral_density(
+            iq, capture, as_xarray=False, **kwargs)[0],
+        samples, prefer_gpu)
     psd = np.asarray(psd, dtype=np.float32)   # (channels, n_stats, bins), dB
     blocks = fit_display_rows(
         psd, psd.shape[1],
@@ -669,6 +675,42 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
 # own burst geometry — both are already coherent views, so AHAWI stays out.
 AHAWI_BACKENDS = frozenset({"calibrated", "quicklook"})
 
+# ── GPU offload for capture-sized striqt analysis ───────────────────────────
+# The AIR-T analyzes captures orders of magnitude faster on cupy; a laptop has
+# no cupy and must silently use numpy. Availability is probed once; ANY GPU
+# failure at compute time falls back to numpy for that call and disables cupy
+# for the rest of the process (never trade the viewer for an optimization).
+_GPU = {"probed": False, "cp": None}
+
+
+def _gpu_module():
+    if not _GPU["probed"]:
+        _GPU["probed"] = True
+        try:
+            import cupy
+            cupy.zeros(1)   # touch the device so failures surface here
+            _GPU["cp"] = cupy
+        except Exception:
+            _GPU["cp"] = None
+    return _GPU["cp"]
+
+
+def _run_array_fn(fn, samples, prefer_gpu):
+    """Run `fn(iq_array) -> array` on the GPU when asked and available.
+
+    Returns (numpy_result, backend_str). fn must accept either array
+    namespace — true for striqt measurements, which follow their input.
+    """
+    if prefer_gpu:
+        cp = _gpu_module()
+        if cp is not None:
+            try:
+                return cp.asnumpy(fn(cp.asarray(samples))), "cupy"
+            except Exception as e:
+                _GPU["cp"] = None
+                print(f"[dsp] cupy analysis failed ({e!r}); numpy from now on")
+    return np.asarray(fn(samples)), "numpy"
+
 
 def ahawi_executed_backend(cfg: RadioConfig) -> str:
     """The backend an AHAWI capture will actually run (honest fallback)."""
@@ -743,6 +785,45 @@ def ahawi_plan(cfg: RadioConfig) -> dict:
     }
 
 
+def ahawi_power_plan(segments: int, seg_samples: int, sample_rate: float):
+    """Detector geometry for the capture's channel-power time series.
+
+    Aims for ~64 points per segment (0.3 ms resolution at 20 ms segments —
+    NR slots are 0.5 ms) but caps the whole series near 2048 points so the
+    header JSON stays small at high segment counts. Returns
+    (detector_period as an exact Fraction, window_samples).
+    """
+    per_seg = int(min(64, max(16, 2048 // max(1, segments))))
+    window = max(1, seg_samples // per_seg)
+    return Fraction(window, int(round(sample_rate))), window
+
+
+def channel_power_series(samples: np.ndarray, cfg: "RadioConfig",
+                         detector_period: Fraction,
+                         prefer_gpu: bool = False) -> tuple:
+    """
+    striqt channel_power_time_series over the given IQ span: per-channel
+    rms/peak power in dB at detector_period resolution. Returns
+    (series (channels, detectors, points) float32, detectors tuple).
+    """
+    if not _ANALYSIS_OK:
+        raise RuntimeError(f"channel power unavailable: {_ANALYSIS_ERR!r}")
+    samples = np.asarray(samples, dtype=np.complex64)
+    fs = float(cfg.sample_rate)
+    capture = analysis_specs.Capture(
+        sample_rate=fs,
+        duration=samples.shape[1] / fs,
+        analysis_bandwidth=float(cfg.analysis_bandwidth),
+    )
+    detectors = ("rms", "peak")
+    series, _gpu = _run_array_fn(
+        lambda iq: striqt_measurements.channel_power_time_series(
+            iq, capture, as_xarray=False,
+            detector_period=detector_period, power_detectors=detectors)[0],
+        samples, prefer_gpu)
+    return np.asarray(series, dtype=np.float32), detectors
+
+
 def ahawi_align_offset(blocks: np.ndarray, rows_per_seg: int, segments: int):
     """
     Burst-phase alignment: fold per-row power modulo the segment length and
@@ -797,10 +878,19 @@ def ahawi_align_offset(blocks: np.ndarray, rows_per_seg: int, segments: int):
 
 def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
     """
-    Analyze one coherent AHAWI capture: full-span spectrogram via the executed
-    backend, optional burst alignment, trim to exactly segments·rows_per_seg
-    rows. Returns (blocks, meta) in the normal compute_blocks contract, with
-    meta["ahawi"] carrying the replay geometry for the client.
+    Analyze one coherent AHAWI capture the way striqt is meant to be used:
+
+      1. full-span spectrogram (striqt calibrated when available),
+      2. burst alignment + trim to exactly segments·rows_per_seg rows,
+      3. the striqt measurement BUNDLE over the trimmed (displayed) span —
+         power_spectral_density statistics and channel_power_time_series —
+         mirroring what the recorder computes per capture.
+
+    Returns (blocks, meta) in the normal compute_blocks contract, with
+    meta["ahawi"] carrying replay geometry, the bundle results, the list of
+    measurements that actually ran, and the compute backend (cupy/numpy).
+    Bundle failures never kill the capture — the measurement just drops off
+    the disclosed list (and logs why).
     """
     started = time.perf_counter()
     total_rows = plan["total_rows"]
@@ -809,9 +899,13 @@ def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
         # exists to show; duration=0 so nothing re-derives rows underneath us.
         cfg_capture = replace(cfg, rows=total_rows, backend="calibrated",
                               time_aperture=None, duration=0.0)
-        blocks, meta = calibrated_spectrogram(samples, cfg_capture)
+        blocks, meta = calibrated_spectrogram(samples, cfg_capture,
+                                              prefer_gpu=True)
+        measurements = ["spectrogram"]
     else:
         blocks, meta = db_spectrogram(samples, plan["nfft"], total_rows)
+        meta["compute_backend"] = "numpy"
+        measurements = ["quicklook"]
     blocks = np.asarray(blocks, dtype=np.float32)
 
     rows_per_seg, segments = plan["rows_per_seg"], plan["segments"]
@@ -821,11 +915,12 @@ def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
     if offset > plan["extra_rows"]:
         # Never read past the capture: alignment is capped by the slack rows.
         offset, aligned = plan["extra_rows"], aligned
-    blocks = blocks[:, offset:offset + segments * rows_per_seg, :]
+    rows_disp = segments * rows_per_seg
+    blocks = blocks[:, offset:offset + rows_disp, :]
 
     meta["backend"] = plan["backend"]
     meta["backend_requested"] = cfg.backend
-    meta["ahawi"] = {
+    ahawi = {
         "segments":          segments,
         "rows_per_segment":  rows_per_seg,
         "segment_ms":        round(plan["segment_ms"], 3),
@@ -836,8 +931,55 @@ def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
         "align_requested":   bool(cfg.ahawi_align),
         "align_offset_rows": int(offset),
         "align_contrast_db": float(contrast_db),
-        "compute_ms":        round(1e3 * (time.perf_counter() - started), 1),
+        "compute_backend":   str(meta.get("compute_backend", "numpy")),
     }
+
+    # ── striqt measurement bundle over the DISPLAYED span ──────────────────
+    # Row r covers samples [r·hop, r·hop+nfft), so the trimmed rows map to an
+    # exact sample slice: every bundled measurement describes precisely the
+    # signal on screen, not the pre-alignment slack.
+    if _ANALYSIS_OK:
+        hop = plan["hop"]
+        start = offset * hop
+        span = (calibrated_sample_count(plan["nfft"], rows_disp, hop)
+                if plan["backend"] == "calibrated" else rows_disp * plan["nfft"])
+        span_samples = samples[:, start:start + span]
+        seg_samples = rows_per_seg * hop
+
+        try:
+            psd_blocks, psd_meta = psd_traces(
+                span_samples,
+                replace(cfg, rows=rows_disp, duration=0.0), prefer_gpu=True)
+            psd_blocks = np.asarray(psd_blocks, dtype=np.float32)
+            if psd_blocks.shape[2] <= 2048:   # keep the JSON header sane
+                ahawi["psd"] = {
+                    "stats":  list(psd_meta.get("psd_stats") or []),
+                    "bins":   int(psd_blocks.shape[2]),
+                    "f0":     psd_meta.get("freqs_hz_f0"),
+                    "step":   psd_meta.get("freqs_hz_step"),
+                    "traces": np.round(psd_blocks, 2).tolist(),
+                }
+            measurements.append("psd")
+        except Exception as e:
+            print(f"[ahawi] psd measurement skipped: {e}")
+
+        try:
+            detector_period, _win = ahawi_power_plan(
+                segments, seg_samples, cfg.sample_rate)
+            series, detectors = channel_power_series(
+                span_samples, cfg, detector_period, prefer_gpu=True)
+            ahawi["power"] = {
+                "period_ms": round(1e3 * float(detector_period), 4),
+                "detectors": list(detectors),
+                "series":    np.round(series, 1).tolist(),
+            }
+            measurements.append("channel_power")
+        except Exception as e:
+            print(f"[ahawi] channel power skipped: {e}")
+
+    ahawi["measurements"] = measurements
+    ahawi["compute_ms"] = round(1e3 * (time.perf_counter() - started), 1)
+    meta["ahawi"] = ahawi
     return blocks, meta
 
 

@@ -235,7 +235,7 @@ def _unregister_source_spec(spec):
 
 
 @contextlib.contextmanager
-def finite_capture_mode(source, *, receive_retries=2):
+def finite_capture_mode(source, *, receive_retries=2, array_backend=None):
     """Run a finite (recording) sweep on a source opened for the gapless live view.
 
     The live viewer opens the radio with ``gapless=True``. In that mode striqt
@@ -247,20 +247,38 @@ def finite_capture_mode(source, *, receive_retries=2):
 
     Inside this context the source reports an ordinary finite-capture spec:
     striqt swallows the expected between-capture overflow and retries a
-    mid-capture one. The live spec is restored on exit, before the viewer
-    resumes, including when the sweep raises.
+    mid-capture one. ``array_backend`` optionally overrides the analysis array
+    module for the sweep — the recording YAML asks for cupy on hardware, but
+    the live source spec hardcodes numpy and used to clobber that request the
+    same way it clobbered gapless (observed: 4.6 s of CPU analysis per 20 ms
+    capture). The live spec is restored on exit, before the viewer resumes,
+    including when the sweep raises.
 
-    Yields the spec now in force (the live one when it was already finite).
+    Yields the spec now in force (the live one when nothing needed changing).
     """
     live = get_setup_spec(source)
     if live is None:
         raise RuntimeError(
             "striqt source exposes no setup spec — cannot make it safe for "
             "finite captures (see INSTALLED_STRIQT_API.txt)")
-    if not getattr(live, "gapless", False):
+    changes = {}
+    if getattr(live, "gapless", False):
+        changes.update(gapless=False, receive_retries=receive_retries)
+    if array_backend and getattr(live, "array_backend", None) != array_backend:
+        changes["array_backend"] = str(array_backend)
+    if not changes:
         yield live
         return
-    record = live.replace(gapless=False, receive_retries=receive_retries)
+    if changes.get("array_backend") == "cupy":
+        # The source was constructed under numpy, so striqt's one-time cupy
+        # setup (pinned-memory pools) never ran. Best-effort — cupy works
+        # with default pools too, and a failure here must not stop the sweep.
+        try:
+            from striqt import waveform as _sw
+            _sw.arrays.configure_cupy()
+        except Exception:
+            pass
+    record = live.replace(**changes)
     _register_source_spec(source, record)
     _set_setup_spec(source, record)
     try:
