@@ -141,3 +141,63 @@ def _patch_soapy_arginfo_subscript():
 
 
 _patch_soapy_arginfo_subscript()
+
+
+def _patch_soapy_hardware_time_optional():
+    """Let radios with no hardware clock finish opening.
+
+    striqt's SoapySource disciplines the device clock during setup:
+
+        HardwareTimeSync.to_host_os() ->
+            if not device.hasHardwareTime():
+                raise IOError('device does not expose hardware time')
+
+    BOTH ``time_sync_at`` settings reach it — 'open' from ``_apply_setup`` and
+    'acquire' from ``_prepare_capture`` — and ``gapless=True`` forces 'open',
+    so no configuration avoids it. A USRP implements hardware time; a
+    PlutoSDR, RTL-SDR, HackRF and most low-cost SDRs do not, so the source
+    could never be constructed for them at all.
+
+    That the raise is an oversight rather than a requirement is settled by
+    striqt's own READ path, which already guards the identical case:
+
+        if not self.checked_timestamp and device.hasHardwareTime():
+            sync_time_ns = last_sync_time
+        else:
+            sync_time_ns = None
+
+    So a missing clock simply means "no sync time" — exactly what everything
+    downstream already expects, since ``last_sync_time`` is typed
+    ``int | None``. We return None instead of raising.
+
+    Only the 'host'/'internal' path is relaxed. 'external'/'gps' still raise:
+    quietly skipping a PPS discipline the operator asked for would be a lie
+    about the timing of the data, which is worse than refusing to run.
+    """
+    try:
+        from striqt.sensor.lib.sources.soapy import HardwareTimeSync
+    except Exception:
+        return  # no striqt.sensor on this host; nothing to patch
+    if getattr(HardwareTimeSync, '_linda_optional_hw_time', False):
+        return
+    original = getattr(HardwareTimeSync, 'to_host_os', None)
+    if original is None:
+        return
+
+    def to_host_os(self, device):
+        try:
+            has_time = device.hasHardwareTime()
+        except Exception:
+            has_time = False
+        if not has_time:
+            return None
+        return original(self, device)
+
+    try:
+        HardwareTimeSync.to_host_os = to_host_os
+        HardwareTimeSync._linda_optional_hw_time = True
+    except Exception:
+        pass  # a compatibility patch must never break the import
+
+
+_patch_soapy_hardware_time_optional()
