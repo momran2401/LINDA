@@ -860,6 +860,28 @@ for r in rows:
         RADIO_CHECK_STATUS="FAILED — enumerated but did not capture"
         warn "the radio enumerated but the capture test failed (see above)"
     fi
+    # The qualification just had the radio open, and a USB SDR does not always
+    # release its interface the instant the process exits. Starting the
+    # service one second later made a PlutoSDR report
+    #   "Unable to claim interface 3:3:5: Device or resource busy (16)"
+    # after passing 9/9 points moments earlier — the radio was fine, it was
+    # simply not free yet. Give the kernel a moment to tear the handle down.
+    wait_for_radio_release
+    return 0
+}
+
+# Poll until no process holds the radio any more, so install_service does not
+# hand a still-busy device to the viewer. Bounded: this is a settle wait, not
+# a guarantee, and the service retries on its own besides.
+wait_for_radio_release() {
+    local i
+    for i in $(seq 1 10); do
+        if ! pgrep -f 'hardware_qual\.py' >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    sleep 3   # kernel-side USB interface teardown after the process is gone
     return 0
 }
 

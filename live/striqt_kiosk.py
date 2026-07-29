@@ -140,15 +140,35 @@ def main():
     print(f"[kiosk] launching browser: {' '.join(cmd)}")
     browser = subprocess.Popen(cmd)
 
-    # Exit when EITHER side goes away: browser closed → stop server;
-    # server died → close nothing, report.
+    def stop_browser():
+        if browser.poll() is None:
+            browser.terminate()
+            try:
+                browser.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                browser.kill()
+
+    # Registered so a systemd stop (SIGTERM → sys.exit) takes the browser down
+    # as well; cleanup() above only ever handled the server.
+    atexit.register(stop_browser)
+
+    # Exit when EITHER side goes away, and always leave the machine with no
+    # stray processes.
     while True:
         if browser.poll() is not None:
             print("[kiosk] browser closed — stopping server")
             cleanup()
             return
         if server.poll() is not None:
-            print("[kiosk] server exited — leaving browser open", file=sys.stderr)
+            # This used to "leave the browser open", which stranded one
+            # Chromium per cycle: the unit is Restart=always, so systemd
+            # relaunches this script, it starts a fresh server and a SECOND
+            # browser, and they pile up until the Pi runs out of memory.
+            # Take the browser down with the server so each restart begins
+            # from a clean slate.
+            print("[kiosk] server exited — stopping the browser too",
+                  file=sys.stderr)
+            stop_browser()
             return
         time.sleep(0.5)
 
