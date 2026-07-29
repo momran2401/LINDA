@@ -103,7 +103,12 @@ The installer is **idempotent** (safe to re-run) and takes care of:
 - **radio identification over USB before any driver exists** — SoapySDR cannot
   enumerate a radio whose driver is missing, so the USB vendor ID decides
   which stack to fetch (Ettus USRP, Pluto, RTL-SDR, HackRF, Airspy, bladeRF,
-  LimeSDR; a Deepwave AIR-T is recognised by its pre-installed SoapyAIRT)
+  LimeSDR; a Deepwave AIR-T is recognised by its pre-installed SoapyAIRT and
+  its vendor SoapySDR is left untouched rather than layered over)
+- **anything else still works**: if the USB table does not recognise what is
+  attached, the installer asks SoapySDR directly, and failing that installs
+  the remaining driver modules and asks again — which also covers radios that
+  are not on USB at all, such as SoapyRemote
 - apt packages, always with `--no-install-recommends`: SoapySDR plus **only**
   the selected radio's driver, avahi (mDNS), USB/udev permissions,
   NetworkManager (hotspot/ethernet modes), Chromium/X/LightDM (kiosk mode).
@@ -204,8 +209,24 @@ username. There is no password.
 ## Deployment modes
 
 All modes serve the **same web UI**; they differ only in how you reach it.
-The installer configures whichever you pick (and you can change it later by
-editing `RADIO_MODE` in `/etc/radio-web/radio.env` and restarting).
+
+**To change mode later, re-run the installer and pick the new one** — it
+switches cleanly in both directions:
+
+```sh
+sudo bash setup.sh          # answer "hotspot" (or whatever you now want)
+```
+
+Re-running removes the previous mode's system state before installing the new
+one: the `radio-hotspot` / `radio-ethernet` NetworkManager profiles and the
+kiosk autologin. That matters because both network profiles are created with
+`autoconnect=yes`, so a hotspot profile left behind after switching to `web`
+would keep the machine broadcasting an access point instead of joining your
+network. Your session secret and role logins survive the switch.
+
+Editing `RADIO_MODE` in `/etc/radio-web/radio.env` by hand changes only which
+frontend the service launches — it will **not** create or remove the network
+profiles, so prefer re-running the installer.
 
 | Mode       | What you get |
 |------------|--------------|

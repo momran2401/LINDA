@@ -251,7 +251,58 @@ usb_present() {
     lsusb -d "$id" >/dev/null 2>&1
 }
 
+# Every SoapySDR driver module the distribution ships, EXCEPT the audio one:
+# that probes ALSA/Jack/PulseAudio on every single enumeration and buries the
+# log on a headless Pi. Installed only as a fallback for a radio the USB table
+# does not recognise.
+SOAPY_EXTRA_MODULES="soapysdr-module-rtlsdr soapysdr-module-hackrf
+soapysdr-module-airspy soapysdr-module-bladerf soapysdr-module-lms7
+soapysdr-module-mirisdr soapysdr-module-osmosdr soapysdr-module-redpitaya
+soapysdr-module-remote soapysdr-module-rfspace soapysdr-module-uhd"
+
+soapy_sees_a_radio() {
+    command -v SoapySDRUtil >/dev/null 2>&1 || return 1
+    SoapySDRUtil --find 2>/dev/null | grep -qi 'Found device'
+}
+
+# The USB table below can only ever list radios we thought of. This is the
+# catch-all that makes "any SoapySDR device" true: ask SoapySDR itself, and if
+# it still sees nothing, install the rest of the driver modules and ask again.
+# It also covers radios that are not on USB at all (SoapyRemote, networked
+# receivers), which no USB table could ever match.
+broaden_driver_search() {
+    case "$RADIO_KIND" in
+        none|unknown) ;;
+        *) return 0 ;;
+    esac
+    [[ $HAVE_APT -eq 1 && $IS_ROOT -eq 1 ]] || return 0
+    if soapy_sees_a_radio; then
+        RADIO_KIND="soapy"
+        RADIO_LABEL="SoapySDR device (its driver was already installed)"
+        ok "$RADIO_LABEL"
+        return 0
+    fi
+    say "Radio not in the known list — installing the remaining SoapySDR drivers"
+    # shellcheck disable=SC2086
+    apt_install $SOAPY_EXTRA_MODULES || warn "some driver modules were unavailable"
+    if soapy_sees_a_radio; then
+        RADIO_KIND="soapy"
+        RADIO_LABEL="SoapySDR device (found once every driver was present)"
+        ok "$RADIO_LABEL"
+    else
+        warn "no radio is visible to SoapySDR even with every driver installed"
+    fi
+    return 0
+}
+
 detect_radio() {
+    # An explicit --demo settles it; probing hardware we are told to ignore
+    # would only install drivers for a radio nobody asked to use.
+    if [[ "${DEVICE:-}" == "demo" ]]; then
+        RADIO_KIND="demo"
+        RADIO_LABEL="demo (synthetic IQ, no hardware)"
+        return 0
+    fi
     say "Looking for a radio"
     # An AIR-T carries its SDR on-board with the proprietary SoapyAIRT driver
     # already in the vendor image — nothing to install, just recognise it.
@@ -313,6 +364,9 @@ resolve_selector() {
         limesdr)  DEVICE="driver=lime" ;;
         pluto)    DEVICE="pluto" ;;
         airt)     DEVICE="auto" ;;
+        # Recognised by SoapySDR but not by our USB table: let the enumeration
+        # pick it, exactly as --device auto would.
+        soapy)    DEVICE="auto" ;;
         *)        DEVICE="demo" ;;
     esac
     return 0
@@ -384,6 +438,15 @@ install_base() {
 install_soapy_core() {
     [[ "$RADIO_KIND" != "demo" ]] || return 0
     [[ $HAVE_APT -eq 1 && $IS_ROOT -eq 1 ]] || return 0
+    # A Deepwave AIR-T ships SoapySDR and the proprietary SoapyAIRT module in
+    # its vendor image, generally outside apt. Installing the distribution's
+    # packages on top would leave the machine with two SoapySDR stacks whose
+    # bindings can shadow each other — so a working vendor install is left
+    # exactly as it is.
+    if [[ "$RADIO_KIND" == "airt" ]] && python3 -c 'import SoapySDR' 2>/dev/null; then
+        ok "using the AIR-T's own SoapySDR (leaving the vendor stack untouched)"
+        return 0
+    fi
     say "Installing SoapySDR"
     # soapysdr-tools is SoapySDRUtil (enumeration + diagnostics). Its
     # Recommends pull the whole module-all bundle; --no-install-recommends
@@ -830,6 +893,42 @@ EOF
     return 0
 }
 
+# Re-running with a DIFFERENT mode has to change how the machine behaves, not
+# just what the env file says. Both network profiles are created with
+# autoconnect=yes, so a radio-hotspot profile left behind after switching to
+# web keeps the Pi broadcasting an access point and off your network entirely;
+# radio-ethernet keeps the wired port serving DHCP instead of acting as a
+# client; and the kiosk autologin survives a switch away from kiosk. Remove
+# whatever does not belong to the mode now being installed.
+clear_other_mode_state() {
+    [[ $IS_ROOT -eq 1 ]] || return 0
+    local changed=0 keep="" profile
+    case "$MODE" in
+        hotspot)  keep="radio-hotspot" ;;
+        ethernet) keep="radio-ethernet" ;;
+    esac
+    if command -v nmcli >/dev/null 2>&1; then
+        for profile in radio-hotspot radio-ethernet; do
+            [[ "$profile" == "$keep" ]] && continue
+            if nmcli -t -f NAME connection show 2>/dev/null | grep -qx "$profile"; then
+                nmcli connection delete "$profile" >/dev/null 2>&1 || true
+                info "removed the $profile profile left by the previous mode"
+                changed=1
+            fi
+        done
+    fi
+    local kiosk_conf=/etc/lightdm/lightdm.conf.d/50-radio-kiosk.conf
+    if [[ "$MODE" != "kiosk" && -f "$kiosk_conf" ]]; then
+        rm -f "$kiosk_conf"
+        info "removed the kiosk autologin left by the previous mode"
+        changed=1
+    fi
+    if [[ $changed -eq 1 ]]; then
+        REBOOT_REQUIRED=1
+    fi
+    return 0
+}
+
 setup_network() {
     [[ $IS_ROOT -eq 1 ]] || return 0
     case "$MODE" in
@@ -1019,13 +1118,15 @@ fi
 
 preflight
 install_base                 # lsusb must exist before we can detect anything
-detect_radio
-ask_questions
+detect_radio                 # USB vendor IDs: works with no driver installed
+install_soapy_core           # SoapySDRUtil must exist for the catch-all below
+broaden_driver_search        # anything the USB table did not recognise
+ask_questions                # asked last, so the radio it names is the real one
 resolve_selector
-install_soapy_core
 install_radio_driver
 install_udev_rules
 install_gps
+clear_other_mode_state       # undo the PREVIOUS mode before installing this one
 install_kiosk
 install_python
 install_web_assets
