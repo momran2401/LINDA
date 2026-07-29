@@ -137,6 +137,34 @@ Debian or Python package repositories. A clean AIR-T must first use Deepwave's
 supported system image/driver installer. `setup.sh` detects this case and stops
 with a specific error instead of reporting a working AIR-T installation.
 
+### Uninstalling
+
+```sh
+sudo bash uninstall_linda.sh            # prints a plan, asks to confirm
+sudo bash uninstall_linda.sh --dry-run  # print the plan and change nothing
+```
+
+Removes the service, `/etc/radio-web/`, the sudoers rule, udev rules, the
+`.venv`, the systemd log/cache directories, the NetworkManager profiles, the
+kiosk config, the UFW rule, and the `usbcore.usbfs_memory_mb` kernel argument.
+
+Packages come from `/etc/radio-web/installed-packages`, which `setup.sh` writes
+as it goes and which lists **only packages that were not already on the machine
+before it ran** — so an uninstall cannot remove something the OS shipped with.
+Older installs without that manifest fall back to a conservative SDR-only list,
+and the script says so.
+
+Three things it deliberately does not do by default, each with a flag:
+
+| Kept | Why | Flag |
+|---|---|---|
+| `recordings/` | irreplaceable captured data | `--purge-recordings` (asks a second time) |
+| Chromium / X / LightDM | on a Pi these are the desktop you are sitting in front of | `--purge-desktop` |
+| NetworkManager / avahi | removing these can drop the machine off the network | `--purge-network` |
+
+`python3`, `sudo`, `apt` and friends are never removable at all. The git clone
+is left in place; the closing message tells you the `rm -rf` for it.
+
 ### Option B — just the Python deps (no root, e.g. a dev laptop)
 
 ```sh

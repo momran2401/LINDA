@@ -186,8 +186,31 @@ PY
 # audio module in that bundle spews ALSA/Jack/PulseAudio errors over every
 # device enumeration afterwards. We install what we actually use.
 APT_UPDATED=0
+PKG_MANIFEST="/etc/radio-web/installed-packages"
+
+pkg_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed'
+}
+
+# Record packages that were NOT already on this machine before we asked for
+# them. uninstall_linda.sh removes exactly this set, so it can never rip out
+# something the operating system shipped with — the difference between a clean
+# uninstall and a broken Pi.
+record_new_packages() {
+    [[ $IS_ROOT -eq 1 ]] || return 0
+    mkdir -p "$(dirname "$PKG_MANIFEST")" 2>/dev/null || return 0
+    local p
+    for p in "$@"; do
+        if ! pkg_installed "$p"; then
+            grep -qxF "$p" "$PKG_MANIFEST" 2>/dev/null || echo "$p" >> "$PKG_MANIFEST"
+        fi
+    done
+    return 0
+}
+
 apt_install() {
     [[ $HAVE_APT -eq 1 && $IS_ROOT -eq 1 ]] || return 0
+    record_new_packages "$@"
     if [[ $APT_UPDATED -eq 0 ]]; then
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
         APT_UPDATED=1
