@@ -118,6 +118,15 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 - Segment length = the existing `duration` control. `dsp.ahawi_plan()` owns the
   geometry (hop-exact rows per segment, ring-fit clamps, +1 segment of slack
   for alignment); the frame header discloses the EXECUTED spans.
+- Each capture runs the full striqt measurement BUNDLE over the trimmed
+  (displayed) span — spectrogram + power_spectral_density statistics +
+  channel_power_time_series, mirroring the recorder — on cupy when present
+  (`dsp._run_array_fn`: any GPU failure falls back to numpy and disables cupy
+  for the process). `header.ahawi.measurements` lists exactly what ran;
+  `compute_backend` says where. The client renders the striqt PSD stats in
+  the PSD pane (float precision, bypasses wire quantization) and drives the
+  power strip from the channel-power series; both fall back to client-side
+  derivations when the bundle is absent (striqt-less hosts).
 - Burst alignment (`ahawi_align_offset`): subtract each bin's stationary power
   (median over time) so constant carriers can't bury the burst, fold the
   RESIDUAL per-row power at the segment period, shift so the burst (e.g. 20 ms

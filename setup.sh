@@ -3,14 +3,15 @@
 # NIST-Omran radio viewer — one-shot installer / setup TUI.
 #
 #   sudo bash setup.sh              # interactive (whiptail TUI when available)
-#   sudo bash setup.sh --defaults   # no questions: web mode, port 8000
+#   sudo bash setup.sh --defaults   # no questions: web mode, auto-detect radio
+#   sudo bash setup.sh --defaults --device=uhd  # Ettus USRP (B205mini, B2xx…)
 #   bash setup.sh --deps-only       # just python deps into ./.venv (no root)
 #   sudo bash setup.sh --skip-hardware-check  # provision before radio arrives
 #   sudo bash setup.sh --defaults --device=pluto --mode=kiosk
 #
 # What it does (idempotent — safe to re-run):
 #   1. Detects distro/arch; installs system deps via apt when available
-#      (SoapySDR + common SDR driver modules, avahi mDNS, NetworkManager).
+#      (SoapySDR plus the selected radio driver, avahi mDNS, NetworkManager).
 #   2. Creates ./.venv and installs live/requirements.txt (+ striqt, optional).
 #   3. Asks (TUI) for: default mode (web / hotspot / ethernet / kiosk /
 #      terminal), port, mDNS hostname, radio, hotspot SSID/password,
@@ -36,7 +37,7 @@ SERVICE_NAME="radio-web"
 MODE="web"           # web | hotspot | ethernet | kiosk | terminal
 PORT="8000"
 MDNS_HOST="radio"
-DEVICE=""            # empty = server default (air8201b); or pluto/auto/...
+DEVICE="auto"        # auto-detect one attached radio; uhd is a USRP shorthand
 AUTOSTART="yes"
 HOTSPOT_SSID="radio-viewer"
 HOTSPOT_PASS=""
@@ -57,7 +58,6 @@ for arg in "$@"; do
         --mode=*) MODE="${arg#*=}" ;;
         --device=*)
             DEVICE="${arg#*=}"
-            if [[ "$DEVICE" == "air8201b" ]]; then DEVICE=""; fi
             ;;
         --port=*) PORT="${arg#*=}" ;;
         --hostname=*) MDNS_HOST="${arg#*=}" ;;
@@ -66,6 +66,14 @@ for arg in "$@"; do
         *) echo "unknown option: $arg (see --help)" >&2; exit 1 ;;
     esac
 done
+
+# Keep the friendly installer spelling out of the service configuration: the
+# runtime selector is deliberately explicit so a generic Soapy adapter knows
+# which driver to open.  B205mini/B2xx radios enumerate as driver=uhd.
+normalize_device_selector() {
+    [[ "$DEVICE" == "uhd" || "$DEVICE" == "usrp" ]] && DEVICE="driver=uhd"
+}
+normalize_device_selector
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33mWARNING: %s\033[0m\n' "$*"; }
@@ -114,8 +122,8 @@ validate_configuration() {
     [[ "$MODE" =~ ^(web|hotspot|ethernet|kiosk|terminal)$ ]] \
         || die "invalid mode: $MODE"
     [[ "$AUTOSTART" =~ ^(yes|no)$ ]] || die "autostart must be yes or no"
-    [[ "$DEVICE" =~ ^(|air8201b|air7201b|air7101b|pluto|auto|demo)$ ]] \
-        || die "invalid device: $DEVICE"
+    [[ "$DEVICE" =~ ^(air8201b|air7201b|air7101b|pluto|auto|demo|driver=[A-Za-z0-9_.+-]+(,serial=[A-Za-z0-9_.:-]+)?)$ ]] \
+        || die "invalid device: $DEVICE (use auto, uhd, pluto, demo, or driver=X[,serial=Y])"
     [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1024 && PORT <= 65535 )) \
         || die "port must be an integer from 1024 through 65535"
     [[ "$MDNS_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
@@ -180,34 +188,37 @@ install_system_deps() {
         python3 python3-venv python3-pip python3-dev \
         build-essential pkg-config cmake \
         whiptail avahi-daemon libgl1 iproute2 usbutils pciutils
-    apt-get install -y python3-soapysdr soapysdr-tools libsoapysdr-dev \
-        python3-pyqt5 python3-pyqt6 python3-pyqtgraph \
-        || die "required SoapySDR/Qt runtime packages are unavailable from this distro's repositories"
-
-    # Radio modules differ between Debian/Ubuntu/Raspberry Pi releases. Install
-    # every module that exists in the configured repositories; absence is
-    # reported later if it matters for the selected radio.
-    local mod
-    for mod in soapysdr-module-plutosdr soapysdr-module-rtlsdr \
-               soapysdr-module-uhd soapysdr-module-hackrf \
-               soapysdr-module-airspy soapysdr-module-bladerf \
-               soapysdr-module-lms7 soapysdr-module-mirisdr \
-               soapysdr-module-osmosdr soapysdr-module-remote \
-               libiio-utils libiio-dev libad9361-dev; do
-        if apt-cache show "$mod" >/dev/null 2>&1; then
-            apt-get install -y "$mod"
-        else
-            echo "  optional radio package unavailable: $mod"
-        fi
-    done
-    for mod in uhd-host hackrf rtl-sdr bladerf; do
-        if apt-cache show "$mod" >/dev/null 2>&1; then
-            apt-get install -y "$mod"
-        fi
-    done
-    if command -v uhd_images_downloader >/dev/null 2>&1; then
-        timeout 300s uhd_images_downloader || die "UHD firmware/image download failed"
+    if [[ "$DEVICE" != "demo" ]]; then
+        apt-get install -y python3-soapysdr soapysdr-tools libsoapysdr-dev \
+            || die "required SoapySDR packages are unavailable from this distro's repositories"
     fi
+
+    # Install only the driver stack that the selected radio uses.  Installing
+    # every Soapy module pulls in unrelated firmware and conflicts on small Pi
+    # images.  With --device=auto, recognise a connected Ettus USRP so the
+    # one-line/default installation works for a B205mini without a flag.
+    local selected_driver="$DEVICE"
+    if [[ "$selected_driver" == "auto" ]] && lsusb -d 2500: >/dev/null 2>&1; then
+        selected_driver="driver=uhd"
+        echo "  detected Ettus Research USB device; installing the UHD/SoapyUHD stack"
+    fi
+    case "$selected_driver" in
+        driver=uhd|driver=uhd,serial=*)
+            apt-get install -y soapysdr-module-uhd uhd-host uhd-images \
+                || die "USRP selected, but soapysdr-module-uhd/uhd-host are unavailable"
+            ;;
+        pluto)
+            apt-get install -y soapysdr-module-plutosdr libiio-utils libiio-dev libad9361-dev \
+                || die "Pluto selected, but its SoapySDR/libiio packages are unavailable"
+            ;;
+        auto)
+            warn "auto selected with no detectable USB radio; only the SoapySDR core was installed"
+            warn "rerun with --device=uhd for a USRP, or install the matching driver module"
+            ;;
+        air8201b|air7201b|air7101b)
+            echo "  Deepwave AIR-T selected; its proprietary SoapyAIRT driver must already be installed"
+            ;;
+    esac
     # Network modes need NetworkManager.
     if [[ "$MODE" == "hotspot" || "$MODE" == "ethernet" ]]; then
         if [[ -f /etc/network/interfaces ]] \
@@ -265,6 +276,9 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6089", MODE="0660", 
 SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6108", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="60a1", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="2cf0", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# Ettus Research USRP B2xx family (UHD also installs rules; keep this
+# explicit so a minimal Raspberry Pi image works before a logout/reboot).
+SUBSYSTEM=="usb", ATTR{idVendor}=="2500", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 EOF
     udevadm control --reload-rules
     udevadm trigger --subsystem-match=usb
@@ -353,10 +367,8 @@ verify_install() {
     say "Verifying installed software…"
     local py="$REPO_ROOT/.venv/bin/python"
     "$py" - <<'PYCHECK' || die "required Python imports failed"
-import fastapi, numpy, pandas, seaborn, uvicorn, websockets
-import PyQt5, PyQt6, pyqtgraph
-print("  web/scientific Python imports OK")
-print("  legacy PyQt5/PyQt6 frontend imports OK")
+import fastapi, numpy, uvicorn
+print("  web runtime Python imports OK")
 PYCHECK
 
     if [[ "$INSTALL_STRIQT" != "no" ]]; then
@@ -379,7 +391,10 @@ PYCHECK
     if [[ "$DEVICE" == "pluto" ]]; then
         SoapySDRUtil --info 2>&1 | grep -qiE 'pluto|libiio' \
             || die "Pluto selected, but the SoapyPlutoSDR/libiio driver is not installed by this distro"
-    elif [[ -z "$DEVICE" || "$DEVICE" == air* ]]; then
+    elif [[ "$DEVICE" == "driver=uhd" || "$DEVICE" == driver=uhd,serial=* ]]; then
+        SoapySDRUtil --info 2>&1 | grep -qiE 'uhd|usrp' \
+            || die "USRP selected, but the SoapyUHD driver is not installed"
+    elif [[ "$DEVICE" == air* ]]; then
         SoapySDRUtil --info 2>&1 | grep -qi 'SoapyAIRT' \
             || die "Deepwave selected, but proprietary SoapyAIRT is absent. Use the Deepwave AIR-T software image/installer, then rerun setup.sh"
     fi
@@ -396,7 +411,7 @@ qualify_hardware() {
         warn "hardware qualification skipped by request"
         return 0
     }
-    local selector="${DEVICE:-air8201b}"
+    local selector="$DEVICE"
     local py="$REPO_ROOT/.venv/bin/python"
     say "Running short end-to-end ${selector} qualification…"
     if [[ "$selector" == "demo" ]]; then
@@ -438,11 +453,12 @@ ask_tui() {
             "$MDNS_HOST" 3>&1 1>&2 2>&3) || true
         DEVICE=$(whiptail --title "Radio" --nocancel --menu \
             "Which radio will this host drive?" 17 64 6 \
-            ""       "AIR8201B (default)" \
+            auto     "Auto-detect one attached SoapySDR radio (default)" \
+            uhd      "Ettus USRP B205mini/B2xx (UHD)" \
+            air8201b "AIR8201B (Deepwave AIR-T)" \
             air7201b "AIR7201B" \
             air7101b "AIR7101B" \
             pluto    "PlutoSDR" \
-            auto     "Auto-detect at startup (SoapySDR enumeration)" \
             demo     "Demo (synthetic IQ, no hardware)" \
             3>&1 1>&2 2>&3) || true
         if [[ "$MODE" == "hotspot" ]]; then
@@ -461,8 +477,8 @@ ask_tui() {
         MODE="${a:-$MODE}"
         read -rp "Port ($PORT): " a || true;             PORT="${a:-$PORT}"
         read -rp "mDNS hostname ($MDNS_HOST): " a || true; MDNS_HOST="${a:-$MDNS_HOST}"
-        read -rp "Device [air8201b default/air7201b/air7101b/pluto/auto/demo] (): " a || true
-        DEVICE="${a:-}"; [[ "$DEVICE" == "air8201b" ]] && DEVICE=""
+        read -rp "Device [auto default/uhd/air8201b/air7201b/air7101b/pluto/demo] ($DEVICE): " a || true
+        DEVICE="${a:-$DEVICE}"
         read -rp "Autostart on boot? [yes/no] ($AUTOSTART): " a || true
         AUTOSTART="${a:-$AUTOSTART}"
     fi
@@ -635,6 +651,7 @@ fi
 
 bootstrap_prompter
 ask_tui
+normalize_device_selector
 validate_configuration
 stop_existing_service
 install_system_deps
@@ -649,7 +666,7 @@ health_check
 
 say "Setup complete."
 echo "  mode:      $MODE"
-echo "  device:    ${DEVICE:-air8201b (default)}"
+echo "  device:    $DEVICE"
 [[ "$MODE" != "terminal" ]] && echo "  URL:       http://${MDNS_HOST}.local:$PORT  (or the host's IP)"
 [[ -n "${CREDS_NOTE:-}" ]]    && echo "  logins:    $CREDS_NOTE"
 [[ -n "${HOTSPOT_NOTE:-}" ]]  && echo "  hotspot:   $HOTSPOT_NOTE"

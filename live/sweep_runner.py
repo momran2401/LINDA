@@ -47,8 +47,12 @@ def run_sweep(spec_path, output, duration=None, should_stop=lambda: False,
             # analysis and archive work between captures, so overflow in those
             # gaps is expected rather than exceptional — run the sweep as an
             # ordinary finite-capture sweep and restore the live spec on exit.
+            # The YAML's array_backend request (cupy on hardware) is honored
+            # instead of being clobbered by the live spec's numpy.
             # Entered first so it unwinds last, after the sink has closed.
-            source_spec = stack.enter_context(finite_capture_mode(source))
+            source_spec = stack.enter_context(finite_capture_mode(
+                source,
+                array_backend=getattr(spec.source, "array_backend", None)))
 
             # The source registry keys by the exact immutable source spec. Use
             # the spec now in force so sink path formatting and capture

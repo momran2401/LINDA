@@ -1355,18 +1355,49 @@ function ahawiIngest(header, blocks, channels) {
         center:   header.center,
         fs:       header.fs,
         levels:   ahawiCaptureLevels(blocks, chans),
-        power:    {},
-        powerRange: {},
+        strip:    {},
+        psd:      null,
     };
-    for (const ch of chans) {
-        const p = ahawiRowPowerDb(blocks[ch], cap.rows, cap.bins);
-        cap.power[ch] = p;
-        let lo = Infinity, hi = -Infinity;
-        for (let i = 0; i < p.length; i++) {
-            if (p[i] < lo) lo = p[i];
-            if (p[i] > hi) hi = p[i];
+    // Power strip data: striqt's channel_power_time_series when the server
+    // bundled it (a real measurement over the displayed span), else the
+    // client-side per-row derivation as fallback.
+    const pw = cap.a.power;
+    chans.forEach((ch, i) => {
+        let data = null;
+        if (pw && pw.series && pw.series[i]) {
+            const di = Math.max(0, (pw.detectors || []).indexOf("rms"));
+            const src = pw.series[i][di] || pw.series[i][0];
+            if (src && src.length) data = Float32Array.from(src);
         }
-        cap.powerRange[ch] = [lo, hi - lo < 3 ? lo + 3 : hi];
+        const striqtPower = !!data;
+        if (!data) data = ahawiRowPowerDb(blocks[ch], cap.rows, cap.bins);
+        let lo = Infinity, hi = -Infinity;
+        for (let k = 0; k < data.length; k++) {
+            if (data[k] < lo) lo = data[k];
+            if (data[k] > hi) hi = data[k];
+        }
+        cap.strip[ch] = { data, lo, hi: hi - lo < 3 ? lo + 3 : hi,
+                          striqt: striqtPower };
+    });
+    // Capture-wide striqt PSD statistics — rendered in the PSD pane when the
+    // bundle ran on the same frequency grid as the spectrogram (float
+    // precision, unaffected by the uint8 wire quantization).
+    const ps = cap.a.psd;
+    if (ps && ps.traces && ps.stats && ps.stats.length
+            && ps.bins === cap.bins
+            && (ps.f0 == null || header.freqs_hz_f0 == null
+                || Math.abs(ps.f0 - header.freqs_hz_f0)
+                   < Math.abs(header.freqs_hz_step || 1) * 0.5)) {
+        const stats = ps.stats.map(String);
+        const psdBlocks = {};
+        chans.forEach((ch, i) => {
+            const flat = new Float32Array(stats.length * ps.bins).fill(NaN);
+            (ps.traces[i] || []).forEach((tr, s) => {
+                if (tr && tr.length) flat.set(tr.slice(0, ps.bins), s * ps.bins);
+            });
+            psdBlocks[ch] = flat;
+        });
+        cap.psd = { stats, blocks: psdBlocks };
     }
     // A capture computed after a settings change clears the stale flag and
     // loads IMMEDIATELY — the user just changed something and wants to see it,
@@ -1406,9 +1437,6 @@ function renderAhawiSegment() {
     const { blocks, bins, a, channels, center, fs } = ahawiCap;
     const rps = a.rows_per_segment;
     if (autoColor) levels = ahawiCap.levels;   // pinned per capture
-    psdData.server = null;
-    const stdKind = "std:" + channelsKey(channelList);
-    if (uplotKind !== stdKind) initUplot(freqsMHz);
     const segBlocks = {};
     for (const ch of channels) {
         segBlocks[ch] = blocks[ch].subarray(ahawiSeg * rps * bins,
@@ -1417,7 +1445,20 @@ function renderAhawiSegment() {
     for (const ch of channels) {
         updateWaterfall(ch, segBlocks[ch], rps, bins, center, fs);
     }
-    updatePSD(channels, segBlocks, rps, bins);
+    if (ahawiCap.psd) {
+        // striqt capture-wide PSD statistics from the bundle — same renderer
+        // as the PSD backend. serverStats is frame-derived global state;
+        // set-and-restore keeps updateMeta's waterfall labels untouched.
+        serverStats = ahawiCap.psd.stats;
+        renderServerPsd(channels, ahawiCap.psd.blocks,
+                        ahawiCap.psd.stats.length, bins);
+        serverStats = null;
+    } else {
+        psdData.server = null;
+        const stdKind = "std:" + channelsKey(channelList);
+        if (uplotKind !== stdKind) initUplot(freqsMHz);
+        updatePSD(channels, segBlocks, rps, bins);
+    }
     updateBandMonitor(channels, segBlocks, rps, bins);
     const els = ahawiEls();
     if (els.scrub) els.scrub.value = String(ahawiSeg);
@@ -1440,11 +1481,14 @@ function drawAhawiStrip(ch, colorIdx) {
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, W, H);
 
-    const { a, rows } = ahawiCap;
-    const power = ahawiCap.power[ch];
-    const [lo, hi] = ahawiCap.powerRange[ch];
-    const rps  = a.rows_per_segment;
+    const { a } = ahawiCap;
+    const strip = ahawiCap.strip[ch];
+    if (!strip) return;
+    const power = strip.data;
+    const { lo, hi } = strip;
+    const rows = power.length;   // rows OR striqt detector points — same map
     const segs = a.segments;
+    const rps  = rows / segs;
 
     // Current-segment highlight + boundary ticks.
     const segW = W * rps / rows;
@@ -1497,8 +1541,10 @@ function updateAhawiBadge() {
     } else {
         alignTxt = `no periodic burst found (${a.align_contrast_db ?? "?"} dB)`;
     }
+    const meas = (a.measurements || []).join("+") || "spectrogram";
+    const gpu  = a.compute_backend === "cupy" ? " · GPU" : "";
     let text = `seg ${ahawiSeg + 1}/${a.segments} · +${t0}–${t1} ms · ` +
-               `${alignTxt} · compute ${a.compute_ms} ms`;
+               `${alignTxt} · ${meas}${gpu} · compute ${a.compute_ms} ms`;
     els.badge.innerHTML = "";
     els.badge.appendChild(document.createTextNode(text));
     if (ahawiStaleAt) {
