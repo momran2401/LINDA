@@ -883,7 +883,7 @@ def _login_page(error: str = "") -> str:
       <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
       <span class="wordmark">LINDA</span>
     </div>
-    <h1>SDR LIVE Viewer - Div. 675</h1>
+    <h1>Live IQ Navigation & Display Application</h1>
     <p class="sub">National Institute of Standards and Technology</p>
     {err_html}
     <label for="u">Username</label>
