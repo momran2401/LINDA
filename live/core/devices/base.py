@@ -59,6 +59,16 @@ class DeviceAdapter:
         serial = self.info.get("serial")
         return f"{base} ({serial})" if serial else base
 
+    def tx_channels(self):
+        """TX channel count learned at enumeration, or None if never probed.
+
+        Only an early hint so the UI can hide transmit on a receive-only radio
+        before the source is even open; core.tx re-probes the live device for
+        the authoritative answer and the ranges that go with it.
+        """
+        n = self.info.get("_num_tx_channels")
+        return int(n) if n is not None else None
+
     def describe_capabilities(self):
         prof = self.profile
         return {
@@ -67,6 +77,7 @@ class DeviceAdapter:
             "serial":            self.info.get("serial"),
             "driver":            self.info.get("driver"),
             "channels":          list(state.CHANNELS),
+            "tx_channels":       self.tx_channels(),
             "envelope":          dict(prof["envelope"]),
             "query_envelope":    bool(prof.get("query_envelope")),
             "supports_readback": bool(self.supports_readback),

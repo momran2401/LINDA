@@ -9,6 +9,12 @@ Run ON the radio host, against real hardware:
     python3 live/tools/hardware_qual.py --device auto
     python3 live/tools/hardware_qual.py --quick             # fewer points
 
+Transmit qualification is opt-in and RADIATES. It refuses to pick a frequency
+for you — terminate the TX port into a 50 ohm load, or use one you are
+licensed for:
+
+    python3 live/tools/hardware_qual.py --tx --tx-freq-mhz 2450
+
 For each test point it applies the setting through the SAME validated path the
 UI uses (SharedConfig.update), then requires:
   1. the operation to reach a terminal state (hardware apply + readback ran),
@@ -73,6 +79,108 @@ def run_point(shared, acquirer, field, value, header_key, timeout):
     return op["state"], f"applied {want}, frame echoed, op {op['state']}"
 
 
+def qualify_tx(acquirer, args, is_demo):
+    """Closed-loop TX qualification: transmit, then look for it on RX.
+
+    This is the only test in this file that RADIATES, which is why it is opt-in
+    and why it refuses to pick a frequency for you. What it proves, in order:
+    the driver accepts the tuning and reads it back; the writer thread actually
+    streams; and — the part no readback can tell you — the carrier shows up in
+    the receiver at the offset it was commanded to, through an antenna or a
+    loopback cable. A radio that reports a perfect readback while emitting
+    nothing passes every other check in this file and fails this one.
+    """
+    from core import tx as txmod          # local: TX is optional at import time
+
+    out = []
+    txmod.TX.bind(acquirer, demo=is_demo)
+    caps = txmod.TX.capabilities(refresh=True)
+    if not caps["available"]:
+        return [("transmit path", "failed", caps["reason"] or "unavailable")]
+
+    freq = args.tx_freq_mhz * 1e6
+    # Offset the carrier from band centre so it cannot be confused with LO
+    # leakage, which sits exactly at DC and is present whether or not the PA
+    # is keyed. A qualification that mistakes LO feedthrough for its own
+    # transmission is worse than no qualification.
+    offset = 1e6
+    print(f"→ transmit {args.tx_freq_mhz:.6g} MHz "
+          f"(+{offset/1e6:g} MHz offset) for {args.tx_seconds:g} s")
+    print("   *** THIS RADIATES — confirm the load/antenna and your authority ***")
+
+    # The acknowledgment subject must be the SAME one start() is called with —
+    # the gate is per-subject, so acknowledging as someone else is not
+    # acknowledging at all.
+    subject = "hardware_qual"
+    txmod.TX.acknowledge(subject)
+    try:
+        txmod.TX.start({"waveform": "cw", "frequency_hz": freq,
+                        "offset_hz": offset, "duration_s": args.tx_seconds},
+                       subject)
+    except Exception as exc:                       # noqa: BLE001
+        return [("transmit start", "failed", str(exc))]
+
+    if not wait_for(lambda: txmod.TX.status()["state"] == "transmitting", 10.0):
+        txmod.TX.stop("qualification timed out waiting for the carrier")
+        return [("transmit start", "failed", "never reached the transmitting state")]
+
+    status = txmod.TX.status()
+    actual = (status["plan"] or {}).get("actual") or {}
+    if actual.get("frequency_hz") is None:
+        out.append(("transmit readback", "unverified",
+                    "driver returned no TX frequency"))
+    elif abs(actual["frequency_hz"] - freq) <= max(10.0, 1e-6 * freq):
+        out.append(("transmit readback", "verified",
+                    f"driver tuned TX to {actual['frequency_hz']/1e6:.6g} MHz"))
+    else:
+        out.append(("transmit readback", "mismatch",
+                    f"asked {freq/1e6:.6g} MHz, driver reports "
+                    f"{actual['frequency_hz']/1e6:.6g} MHz"))
+
+    time.sleep(min(args.tx_seconds, 2.0))
+    status = txmod.TX.status()
+    out.append(("transmit streaming",
+                "success" if status["samples_written"] > 0 else "failed",
+                f"{status['samples_written']} samples written"
+                + (f", {status['underflows']} underflow(s)"
+                   if status["underflows"] else "")))
+
+    # Closed loop: is the carrier actually in the receiver's band?
+    header, blocks = acquirer.latest()
+    seen = None
+    if header is not None and blocks:
+        import numpy as np
+        row = np.asarray(blocks[0])
+        row = row[0] if row.ndim > 1 else row
+        f0 = header.get("freqs_hz_f0")
+        step = header.get("freqs_hz_step")
+        if f0 is not None and step:
+            want = freq + offset - float(header.get("center", 0.0))
+            bins = f0 + step * np.arange(row.size)
+            near = np.abs(bins - want) <= max(3 * abs(step), 100e3)
+            if near.any():
+                seen = float(row[near].max() - np.median(row))
+    if seen is None:
+        out.append(("transmit seen on RX", "unverified",
+                    "could not locate the commanded bin in the frame header — "
+                    "check the RX centre covers the TX frequency"))
+    elif seen >= 6.0:
+        out.append(("transmit seen on RX", "verified",
+                    f"carrier is {seen:.1f} dB over the in-band median at the "
+                    f"commanded offset"))
+    else:
+        out.append(("transmit seen on RX", "mismatch",
+                    f"only {seen:.1f} dB over median at the commanded offset — "
+                    f"driver accepted the tuning but nothing is coming out "
+                    f"(no antenna/loopback, or the PA is not keyed)"))
+
+    txmod.TX.stop("qualification complete")
+    out.append(("transmit stops on request",
+                "success" if txmod.TX.status()["state"] == "idle" else "failed",
+                f"state is {txmod.TX.status()['state']}"))
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="on-radio settings qualification")
     parser.add_argument("--device", default="air8201b")
@@ -81,7 +189,20 @@ def main():
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--timeout", type=float, default=20.0,
                         help="per-point timeout (s)")
+    parser.add_argument("--tx", action="store_true",
+                        help="ALSO qualify the transmit path — this RADIATES. "
+                             "Requires --tx-freq-mhz and a dummy load or a "
+                             "frequency you are licensed to use.")
+    parser.add_argument("--tx-freq-mhz", type=float,
+                        help="frequency for the TX qualification point")
+    parser.add_argument("--tx-seconds", type=float, default=3.0,
+                        help="how long the TX qualification point transmits")
     args = parser.parse_args()
+
+    if args.tx and args.tx_freq_mhz is None:
+        parser.error("--tx requires --tx-freq-mhz. There is no safe default "
+                     "transmit frequency: pick one you are licensed for, or "
+                     "terminate the TX port into a 50 ohm load first.")
 
     selector = "demo" if args.demo else args.device
     name, adapter = devices.resolve_device(selector)
@@ -147,6 +268,12 @@ def main():
                                     args.timeout)
         print(f"   {verdict.upper()}: {detail}\n")
         results.append((label, verdict, detail))
+
+    if args.tx:
+        for row in qualify_tx(acquirer, args, is_demo):
+            print(f"   {row[1].upper()}: {row[2]}")
+            results.append(row)
+        print()
 
     # Sustained streaming check after all changes.
     hdr0 = acquirer.latest()[0]

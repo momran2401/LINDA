@@ -787,3 +787,97 @@ body:not(.mode-ahawi) .ahawi-only { display: none !important; }
 #ahawi-apply.staged { border-color: var(--accent); color: var(--accent);
                       box-shadow: 0 0 0 1px var(--accent) inset; }
 #gps-status.gps-bad { color: #ffb74d; }
+
+/* ══ TRANSMIT MODE ════════════════════════════════════════════════════════ */
+/* The one feature here that radiates. Everything is red on purpose: the
+   button, the banner, the dialog border, the live readout. A control that can
+   put a person in front of the FCC should not look like the FFT-size picker. */
+
+/* Banner is fixed and above the recording banner's row so both can coexist
+   (a recording and a transmission are mutually exclusive server-side, but the
+   banner outlives the stop by one broadcast tick). */
+#tx-banner {
+    position: fixed; z-index: 60; top: 54px; left: 50%;
+    transform: translateX(-50%); padding: 9px 18px;
+    border: 1px solid var(--red); border-radius: 7px;
+    background: #2a0f10; color: #ffb3ad;
+    font: 700 12px/1.3 var(--ui); letter-spacing: 0.04em;
+    box-shadow: 0 4px 20px rgba(0,0,0,.45);
+    animation: tx-banner-pulse 1.6s ease-in-out infinite;
+}
+body.recording #tx-banner { top: 96px; }
+@keyframes tx-banner-pulse {
+    0%, 100% { box-shadow: 0 4px 20px rgba(0,0,0,.45), 0 0 0 0 rgba(229,118,110,0.35); }
+    50%      { box-shadow: 0 4px 20px rgba(0,0,0,.45), 0 0 0 7px rgba(229,118,110,0); }
+}
+/* Read-only roles get the standby wording, so the palette shifts to "wait"
+   rather than "danger" — nothing they can do about it either way. */
+#tx-banner.tx-standby { border-color: var(--yellow); background: #2b2209;
+                        color: #ffd98a; animation: none; }
+
+/* ── Modal ─────────────────────────────────────────────────────────────── */
+.tx-modal {
+    position: fixed; inset: 0; z-index: 1500;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.72); padding: 20px;
+}
+.tx-modal[hidden] { display: none; }
+.tx-dialog {
+    width: min(96vw, 620px); max-height: 92vh; overflow-y: auto;
+    background: var(--bg1); border: 1px solid var(--red);
+    border-radius: var(--radius); box-shadow: 0 18px 60px rgba(0,0,0,0.7);
+    padding: 20px 22px;
+}
+.tx-view[hidden] { display: none; }
+
+.tx-legal-title { color: var(--red); font: 700 18px/1.3 var(--ui); margin-bottom: 12px; }
+.tx-legal-body p { color: var(--text); font-size: 12.5px; line-height: 1.55; margin-bottom: 10px; }
+/* The FCC sentence carries the whole warning; give it the weight. */
+.tx-legal-body p:nth-child(2) { color: #ffb3ad; font-weight: 600; }
+.tx-actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+.tx-actions button { flex: 1 1 auto; padding: 10px 14px; font-size: 12px; }
+
+.tx-head { display: flex; align-items: center; margin-bottom: 10px; }
+.tx-head h2 { font: 700 16px/1.2 var(--ui); color: var(--text); }
+.tx-close { margin-left: auto; padding: 3px 9px; }
+.tx-envelope { color: var(--text-dim); font: 11px/1.5 monospace; margin-bottom: 12px;
+               padding: 7px 9px; background: var(--bg0);
+               border: 1px solid var(--border); border-radius: var(--radius); }
+
+.tx-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+@media (max-width: 460px) { .tx-grid { grid-template-columns: 1fr; } }
+.tx-field { display: block; color: var(--text-dim); font-size: 11px; }
+.tx-field[hidden] { display: none; }
+.tx-field input, .tx-field select {
+    display: block; width: 100%; margin-top: 3px; padding: 6px 8px;
+    background: var(--inset); border: 1px solid var(--border2);
+    border-radius: var(--radius); color: var(--text); font-size: 12px;
+}
+.tx-danger { background: #170d0e; border: 1px solid #4a2528; color: var(--red); font-weight: 700; }
+.tx-danger:hover:not(:disabled) { background: #241013; border-color: var(--red); }
+.tx-dialog .btn-row { margin-top: 14px; }
+.tx-status { margin-top: 12px; color: var(--text-dim); font: 11px/1.5 monospace;
+             white-space: pre-wrap; }
+
+/* ── Live readout: word, settings, animated wave ───────────────────────── */
+.tx-live { margin-top: 14px; padding: 12px; background: var(--bg0);
+           border: 1px solid var(--red); border-radius: var(--radius); }
+.tx-live[hidden] { display: none; }
+.tx-live-title { display: flex; align-items: center; gap: 9px;
+                 color: var(--red); font: 700 15px/1.2 var(--ui);
+                 letter-spacing: 0.06em; text-transform: uppercase; }
+.tx-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red);
+          animation: tx-dot-blink 1s steps(1, end) infinite; }
+@keyframes tx-dot-blink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0.25; } }
+.tx-live-settings { margin: 8px 0 10px; color: var(--text-dim);
+                    font: 11px/1.6 monospace; white-space: pre-wrap; }
+.tx-wave { display: block; width: 100%; height: 96px; background: var(--plot-bg);
+           border: 1px solid var(--border); border-radius: var(--radius); }
+.tx-wave-note { margin-top: 6px; color: var(--text-faint); font-size: 10px; }
+
+/* Transmitting locks the same controls recording does — one owner of the
+   radio at a time, and the server enforces it too. */
+body.transmitting #settings-apply, body.transmitting #analysis-apply,
+body.transmitting #reset-radio-btn, body.transmitting #record-start {
+    opacity: .45; pointer-events: none;
+}

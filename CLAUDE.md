@@ -240,6 +240,53 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   being written. Do NOT commit archives or add an upload path without a
   data-release decision.
 
+## Transmit mode (`core/tx.py` → `/tx/*` → the "bad boy" button)
+
+- **striqt does not transmit.** Its only `SOAPY_SDR_TX` use is `_probe_channel`,
+  which *counts* TX channels for metadata. The whole TX path is ours, written
+  against the raw SoapySDR device API (`setupStream`/`activateStream`/
+  `writeStream`) — that is what makes ONE implementation cover the AIR-T, the
+  Pluto, a USRP, and anything else Soapy enumerates.
+- **TX borrows the live device handle; it never opens its own, and the service
+  never stops.** The AIR-T retains FPGA descriptors for the process lifetime
+  (same reason recording runs in-process), so a second process could not
+  acquire the radio. RX and TX are independent streams on one device, so the
+  waterfall keeps running while transmitting — you can watch your own signal.
+  `TxController._pump` re-checks device identity every chunk and aborts the
+  transmission if the Acquirer reopened the source underneath it; `_recover()`
+  also calls `TX.shutdown()` *before* disturbing the handle.
+- Waveforms (`Waveform`): `cw`, `two_tone`, `chirp`, `noise`. Phase is carried
+  as fractional cycles mod 1 in float64 — an absolute float32 time axis
+  scrambles a MHz tone within a minute, and a transmitter runs far longer than
+  a demo frame. The waveform is regenerated against the rate the driver
+  ACTUALLY applied, so a driver that snaps the rate cannot silently shift every
+  offset.
+- **Frequency out of range is REJECTED, never clamped** — transmitting
+  somewhere other than where the operator asked is the one failure this feature
+  cannot have. Gain defaults to the radio's minimum, never to the last value.
+- The legal notice is served by `GET /tx` and acknowledged via
+  `POST /tx/acknowledge`; `/tx/start` returns **428** until the caller has
+  acknowledged in this process. A modal the browser can delete from the DOM is
+  not a gate. Every transmission is an `OPERATIONS` entry with driver readback
+  — the audit trail is the point, not decoration.
+- Blank duration = transmit until Stop, deliberately (no automatic cutoff). TX
+  still stops on process shutdown, `reset-radio`, and source recovery.
+  Recording and transmitting are mutually exclusive both ways (409).
+- TX state rides the SAME broadcast every client receives: admins see what is
+  radiating, read-only roles get `VIEWER BUSY — STANDBY`. The button is hidden
+  unless the device reports TX channels, the role is admin, and `RADIO_TX` is on.
+- Demo mode is `simulated: true` and injects the carrier into the synthetic IQ
+  (`DemoAcquirer._synth_chunk`), so the whole flow — menu, notice, animation,
+  ops log, "did I tune where I meant to" — is verifiable with no radio and
+  nothing radiated.
+- `setup.sh detect_tx_support()` writes `RADIO_TX=1` by default, `0` only when
+  the driver reports zero TX channels or the family is known receive-only
+  (rtlsdr/airspy). `radioctl.py tx status|start|stop` is the SSH path (`start`
+  requires `--i-have-a-license`). `hardware_qual.py --tx --tx-freq-mhz N`
+  RADIATES and closes the loop: it requires the carrier to appear in the
+  RECEIVER at the commanded offset, because a radio can report a perfect
+  readback while emitting nothing.
+
 ## Verified operations / Reset Radio
 
 - Config changes are only trusted after driver readback + a fresh frame; the

@@ -202,6 +202,7 @@ def discover():
             "serial":       info.get("serial"),
             "info":         info,
             "num_channels": facts["num_channels"],
+            "num_tx_channels": facts["num_tx_channels"],
             "master_clock_rate": facts["master_clock_rate"],
         })
     return found
@@ -247,16 +248,29 @@ def _probe_device_facts(SoapySDR, info):
     the AIR-T's 125 MHz, which a USRP B2xx rejects outright. Asking the driver
     is the only answer that generalises past the radios we have profiles for.
     """
-    facts = {"num_channels": None, "master_clock_rate": None}
+    facts = {"num_channels": None, "num_tx_channels": None,
+             "master_clock_rate": None}
     try:
         from SoapySDR import SOAPY_SDR_RX as rx_dir
     except Exception:
         rx_dir = 1
+    try:
+        from SoapySDR import SOAPY_SDR_TX as tx_dir
+    except Exception:
+        tx_dir = 0
     dev = None
     try:
         dev = SoapySDR.Device(info)
         try:
             facts["num_channels"] = int(dev.getNumChannels(rx_dir))
+        except Exception:
+            pass
+        # TX channel count decides whether transmit mode exists at all for this
+        # radio. Asked here, at enumeration, so the answer is known before the
+        # source is open — an RTL-SDR must never be offered a TX button that
+        # only fails once it is clicked.
+        try:
+            facts["num_tx_channels"] = int(dev.getNumChannels(tx_dir))
         except Exception:
             pass
         facts["master_clock_rate"] = _probe_master_clock(dev)
@@ -318,6 +332,8 @@ def resolve_device(selector: str):
         adapter = ADAPTER_CLASSES[m["device"]](m["info"])
         if m["num_channels"]:
             adapter.info["_num_channels"] = int(m["num_channels"])
+        if m.get("num_tx_channels") is not None:
+            adapter.info["_num_tx_channels"] = int(m["num_tx_channels"])
         if m.get("master_clock_rate"):
             adapter.info["_master_clock_rate"] = float(m["master_clock_rate"])
         print(f"[device] selected {m['device']} ({m['label']}"
