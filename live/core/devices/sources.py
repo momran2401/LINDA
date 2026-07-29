@@ -2,13 +2,16 @@
 
 PlutoSource is ported from live/legacy/pluto_standalone.py (P3-1); GenericSoapySource
 extends the same trick to any SoapySDR driver string, best-effort. Both reuse
-the Air8201BSourceSpec values — the Soapy drivers ignore the AirStack
-master-clock/time-source fields they don't implement. striqt/ itself is never
-modified.
+the Air8201BSourceSpec CLASS, but not its values: the assumption that "the
+Soapy drivers ignore the AirStack master-clock/time-source fields they don't
+implement" is false. SoapyUHD implements setMasterClockRate and a USRP B2xx
+rejects the AIR-T's 125 MHz outright, so the source never opened. Anything the
+driver genuinely acts on has to be right for the radio in hand — see
+master_clock_rate below. striqt/ itself is never modified.
 """
 from __future__ import annotations
 
-from ..constants import DEVICE_PROFILES, MASTER_CLOCK_RATE
+from ..constants import DEVICE_PROFILES, SOAPY_FALLBACK_MASTER_CLOCK
 from ..striqt_compat import (
     Air7101BSourceSpec, Air7201BSourceSpec, Air8201BSourceSpec,
     Airstack1Source, _SENSOR_OK, _SoapySource,
@@ -31,9 +34,15 @@ def make_source_spec(device=None, overrides=None):
     stale/foreign key can never crash source construction.
     """
     spec_cls = SPEC_CLASSES.get(device, Air8201BSourceSpec)
+    # Every profile now declares its own master clock; only a radio with no
+    # profile entry (the generic "soapy" catch-all) falls back. It must still be
+    # set explicitly rather than left out: the fallback spec class here is the
+    # AIR-T's, whose own default is 125 MHz, so omitting the option would
+    # silently reintroduce the value that a USRP B2xx refuses to accept. The
+    # adapter overrides this with the rate the device reported at enumeration.
     profile_clock = DEVICE_PROFILES.get(device, {}).get("master_clock_rate")
     options = {
-        "master_clock_rate": profile_clock or MASTER_CLOCK_RATE,
+        "master_clock_rate": profile_clock or SOAPY_FALLBACK_MASTER_CLOCK,
         "array_backend": "numpy",
         "time_source": "host",
         "time_sync_at": "open",

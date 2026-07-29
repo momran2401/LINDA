@@ -29,6 +29,9 @@ DEVICE_PROFILES = {
     "air8201b": {
         "label": "AIR8201B",
         "channels": (0, 1),
+        # This model's own converter clock. Declared per profile so it can
+        # never be inherited by a radio that cannot run it.
+        "master_clock_rate": 125e6,
         "defaults": {"center": 3750e6, "sample_rate": 15.36e6, "gain": 0.0},
         "envelope": {
             "freq_min": 300e6, "freq_max": 6e9,
@@ -44,6 +47,9 @@ DEVICE_PROFILES = {
     "air7101b": {
         "label": "AIR7101B",
         "channels": (0, 1),
+        # This model's own converter clock. Declared per profile so it can
+        # never be inherited by a radio that cannot run it.
+        "master_clock_rate": 125e6,
         "defaults": {"center": 3750e6, "sample_rate": 15.36e6, "gain": 0.0},
         "envelope": {
             "freq_min": 300e6, "freq_max": 6e9,
@@ -55,6 +61,9 @@ DEVICE_PROFILES = {
     "air7201b": {
         "label": "AIR7201B",
         "channels": (0, 1),
+        # This model's own converter clock. Declared per profile so it can
+        # never be inherited by a radio that cannot run it.
+        "master_clock_rate": 125e6,
         "defaults": {"center": 3750e6, "sample_rate": 15.36e6, "gain": 0.0},
         "envelope": {
             "freq_min": 300e6, "freq_max": 6e9,
@@ -116,7 +125,18 @@ DEFAULT_GAIN        = 0.0
 DEFAULT_NFFT        = 1024
 DEFAULT_ROWS        = 12      # rows per frame (window_ms drives this from browser)
 
-MASTER_CLOCK_RATE   = 125e6
+MASTER_CLOCK_RATE   = 125e6   # AIR-T reference clock. NOT a universal default:
+                              # see SOAPY_FALLBACK_MASTER_CLOCK below.
+# Master clock for a generic SoapySDR radio when the device could not be probed
+# (core.devices._probe_device_facts asks the driver first and almost always
+# answers). 125 MHz is the AIR-T's converter clock and used to be applied to
+# every radio: a USRP B205mini rejects it outright —
+#   "current master clock rate (125.000000 MHz) exceeds maximum possible
+#    master clock rate (61.440000 MHz)"
+# — and the source never opened. 61.44 MHz is the AD936x-family clock shared by
+# the Pluto, the USRP B2xx and most SoapySDR radios, and it is an exact integer
+# multiple of every rate in RATES_HZ.
+SOAPY_FALLBACK_MASTER_CLOCK = 61.44e6
 READ_SIZE           = 1 << 18   # max IQ samples per _read_stream call (262144)
 MAX_TAIL            = 1 << 22   # per-channel ring buffer capacity (4M samples)
 DATA_STALE_SEC      = 1.0       # get_latest() returns None if the ring is older
