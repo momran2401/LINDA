@@ -135,7 +135,7 @@ exec 9>&2
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 printf '\n\033[1;36m╔══════════════════════════════════════════════════════════════════╗\033[0m\n'
-printf '\033[1;36m║  LINDA installer — live IQ Navigation and Display Application                ║\033[0m\n'
+printf '\033[1;36m║  LINDA installer — live IQ Navigation and Display Application          ║\033[0m\n'
 printf '\033[1;36m╚══════════════════════════════════════════════════════════════════╝\033[0m\n'
 info "host $(uname -n)   arch $ARCH   user $SERVICE_USER"
 info "log  $LOG_FILE"
