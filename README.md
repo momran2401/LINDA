@@ -80,42 +80,57 @@ Demo mode needs only Python + the pip packages — no SDR stack at all.
 
 ### Option A — one-shot installer (recommended on the radio host)
 
+Plug the radio in first, then:
+
 ```sh
 git clone <this-repo> && cd LINDA
-sudo bash setup.sh              # interactive TUI: mode, port, hostname, radio…
-sudo bash setup.sh --defaults   # no questions: web mode + one attached radio
-# Ettus USRP B205mini/B2xx (recommended explicit one-liner):
-sudo bash setup.sh --defaults --device=uhd
-# Provision before the selected radio is physically available:
-sudo bash setup.sh --skip-hardware-check
+sudo bash setup.sh              # detects the radio, asks 2 questions, done
+```
+
+That is the whole installation. It identifies the attached SDR over USB,
+installs only that radio's driver stack, builds the Python environment, proves
+the radio actually captures, starts the service, and prints the URL to open.
+
+```sh
+sudo bash setup.sh --yes               # ask nothing; all defaults
+sudo bash setup.sh --demo              # synthetic IQ, no radio needed
+sudo bash setup.sh --device=uhd        # force a selector instead of detecting
+sudo bash setup.sh --skip-radio-check  # provision before the radio arrives
 ```
 
 The installer is **idempotent** (safe to re-run) and takes care of:
 
-- apt packages: build tooling, SoapySDR + **only** the driver stack the
-  selected radio uses (UHD/SoapyUHD for `--device=uhd`), avahi (mDNS),
-  whiptail, USB/udev permissions, NetworkManager (for hotspot/ethernet modes),
-  and Chromium/X/LightDM (for kiosk mode)
+- **radio identification over USB before any driver exists** — SoapySDR cannot
+  enumerate a radio whose driver is missing, so the USB vendor ID decides
+  which stack to fetch (Ettus USRP, Pluto, RTL-SDR, HackRF, Airspy, bladeRF,
+  LimeSDR; a Deepwave AIR-T is recognised by its pre-installed SoapyAIRT)
+- apt packages, always with `--no-install-recommends`: SoapySDR plus **only**
+  the selected radio's driver, avahi (mDNS), USB/udev permissions,
+  NetworkManager (hotspot/ethernet modes), Chromium/X/LightDM (kiosk mode).
+  The recommends matter — a plain `apt-get install uhd-host` pulls GNU Radio,
+  Qt5+Qt6, GDAL and 974 MB of unrelated packages onto a Pi
 - for a USRP: the UHD firmware/FPGA images (a B2xx uploads its image over USB
-  at every open, so it cannot stream without them) and
-  `usbcore.usbfs_memory_mb=1000`, without which USB 3 capture overflows
-  continuously on a Pi
-- a Python virtualenv at `.venv/` with one consistently resolved
-  FastAPI/uvicorn/numpy/striqt dependency set; the installer
-  preserves and rebuilds stale environments, then runs targeted import checks
-  before configuring the service
+  at every open and cannot stream without them) with `UHD_IMAGES_DIR` pinned
+  to wherever they actually landed, plus `usbcore.usbfs_memory_mb=1000`,
+  without which USB 3 capture overflows continuously
+- for a Pluto on a release that does not package SoapyPlutoSDR: builds the
+  driver from upstream source
+- an **isolated** virtualenv at `.venv/` (the system SoapySDR binding is
+  linked in, because it has no wheel — nothing else leaks in from apt, which
+  is what previously mixed apt's NumPy with pip's and broke the SciPy ABI)
 - username-only role logins and a generated session-signing secret written to
   `/etc/radio-web/radio.env` (mode 0600)
 - the `radio-web` systemd service (auto-start on boot, hardened, journald
   logging) and the scoped sudoers rule that powers the Reset Radio button
-- mDNS hostname (reach the radio at `http://<name>.local:8000`), a firewall
-  rule when UFW is active, and the selected network mode (see below)
-- selected-radio enumeration plus a short streaming/settings qualification
-  (unless `--skip-hardware-check` was given)
-- a strict post-install health check; failures include recent systemd logs and
-  do not print “Setup complete”
-- a reboot-required notice when group, udev, network, display, or package
-  changes need a fresh boot
+- mDNS (reach the box at `http://<hostname>.local:8000` — the installer does
+  **not** rename your machine unless you pass `--hostname=`), a UFW rule when
+  the firewall is active, and the selected network mode (see below)
+- proof rather than assumption: runtime imports, driver enumeration, and a
+  real capture that tunes the radio and reads the setting back out of a frame
+  header (unless `--skip-radio-check` was given)
+- a post-install health check against `/health`
+- a full transcript at `/var/log/radio-web-setup.log` — attach it to any bug
+  report
 
 Deepwave's SoapyAIRT/CUDA software is proprietary and is not published in the
 Debian or Python package repositories. A clean AIR-T must first use Deepwave's

@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 # ============================================================================
-# NIST-Omran radio viewer — one-shot installer / setup TUI.
+# LINDA — one-command installer for the live two-channel RF viewer.
 #
-#   sudo bash setup.sh              # interactive (whiptail TUI when available)
-#   sudo bash setup.sh --defaults   # no questions: web mode, auto-detect radio
-#   sudo bash setup.sh --defaults --device=uhd  # Ettus USRP (B205mini, B2xx…)
-#   bash setup.sh --deps-only       # just python deps into ./.venv (no root)
-#   sudo bash setup.sh --skip-hardware-check  # provision before radio arrives
-#   sudo bash setup.sh --defaults --device=pluto --mode=kiosk
+#     sudo bash setup.sh            # detect the radio, ask 2 questions, done
+#     sudo bash setup.sh --yes      # same, but ask nothing (all defaults)
+#     sudo bash setup.sh --demo     # synthetic IQ; no radio required
+#     bash setup.sh --deps-only     # just the Python env, no root, no service
 #
-# What it does (idempotent — safe to re-run):
-#   1. Detects distro/arch; installs system deps via apt when available
-#      (SoapySDR plus the selected radio driver, avahi mDNS, NetworkManager).
-#      For a USRP it also downloads the UHD firmware/FPGA images (a B2xx has
-#      no on-board flash and will not open without them) and raises the usbfs
-#      buffer so USB 3 streaming does not overflow.
-#   2. Creates ./.venv and installs live/requirements.txt (+ striqt, optional).
-#   3. Asks (TUI) for: default mode (web / hotspot / ethernet / kiosk /
-#      terminal), port, mDNS hostname, radio, hotspot SSID/password,
-#      autostart. --defaults answers everything with safe defaults.
-#   4. Writes /etc/radio-web/radio.env (0600) with role usernames and a
-#      generated session-signing secret. Login is username-only.
-#   5. Installs + enables the radio-web systemd unit, the Reset-Radio sudoers
-#      rule, and (mode-dependent) a NetworkManager hotspot or shared-ethernet
-#      profile so a connected laptop gets an address automatically.
-#   6. Runs a post-install health check against /health.
+# Overrides (rarely needed — everything below is auto-detected):
+#     --device=auto|uhd|pluto|rtlsdr|hackrf|airspy|bladerf|limesdr
+#     --device=air8201b|air7201b|air7101b|demo|driver=X[,serial=Y]
+#     --mode=web|kiosk|hotspot|ethernet|terminal
+#     --port=8000  --hostname=<name>  --hotspot-ssid=X  --hotspot-pass=X
+#     --skip-radio-check            provision before the radio arrives
 #
-# Never touches striqt/ (read-only upstream library).
+# What it does, in order (idempotent — re-running is always safe):
+#     1.  preflight: root, distro, arch, Python, disk, port
+#     2.  identify the attached radio over USB *before* choosing any driver
+#     3.  apt: base tools + ONLY the driver stack that radio needs
+#     4.  radio enablement: UHD images + UHD_IMAGES_DIR, usbfs buffer, udev
+#     5.  an ISOLATED .venv (+ the system SoapySDR binding linked in) and the
+#         pinned striqt build
+#     6.  prove it: imports, driver enumeration, a real capture
+#     7.  role logins, systemd unit, sudoers, mDNS, optional network profile
+#     8.  health check, then print the URL to open
+#
+# A full transcript is written to the log named at startup — attach that file
+# to any bug report. striqt/ is upstream and is never touched.
 # ============================================================================
 set -euo pipefail
 
@@ -36,669 +36,698 @@ ENV_DIR="/etc/radio-web"
 ENV_FILE="$ENV_DIR/radio.env"
 UNIT_FILE="/etc/systemd/system/radio-web.service"
 SERVICE_NAME="radio-web"
+VENV="$REPO_ROOT/.venv"
+VENV_PY="$VENV/bin/python"
 
-MODE="web"           # web | hotspot | ethernet | kiosk | terminal
+# striqt 0.7.0, the exact commit verified against the radio. Do not float this.
+STRIQT_COMMIT="2e7696d3cd7c9f710f406b4b83148476ead8c20f"
+
+MODE="web"
 PORT="8000"
-MDNS_HOST="radio"
-DEVICE="auto"        # auto-detect one attached radio; uhd is a USRP shorthand
-AUTOSTART="yes"
+MDNS_HOST=""                 # empty → keep this host's current name
+DEVICE=""                    # empty → decide from USB detection
+RADIO_KIND=""                # uhd|pluto|rtlsdr|hackrf|airspy|bladerf|limesdr|airt|demo|unknown
+RADIO_LABEL=""
 HOTSPOT_SSID="radio-viewer"
 HOTSPOT_PASS=""
-INSTALL_STRIQT="yes"
-STRIQT_COMMIT="2e7696d3cd7c9f710f406b4b83148476ead8c20f"  # v0.7.0; verified on the radio
-ASSUME_DEFAULTS=0
+ASK=1
+SKIP_RADIO_CHECK=0
 DEPS_ONLY=0
-SKIP_HARDWARE_CHECK=0
 REBOOT_REQUIRED=0
 SETUP_COMPLETE=0
 WAS_SERVICE_ACTIVE=0
+RADIO_CHECK_STATUS="not run"
+UHD_IMAGES_PATH=""
 
-for arg in "$@"; do
-    case "$arg" in
-        --defaults)  ASSUME_DEFAULTS=1 ;;
-        --deps-only) DEPS_ONLY=1 ;;
-        --skip-hardware-check) SKIP_HARDWARE_CHECK=1 ;;
-        --mode=*) MODE="${arg#*=}" ;;
-        --device=*)
-            DEVICE="${arg#*=}"
-            ;;
-        --port=*) PORT="${arg#*=}" ;;
-        --hostname=*) MDNS_HOST="${arg#*=}" ;;
-        --hotspot-ssid=*) HOTSPOT_SSID="${arg#*=}" ;;
-        --help|-h)   grep '^#' "$0" | head -25; exit 0 ;;
-        *) echo "unknown option: $arg (see --help)" >&2; exit 1 ;;
-    esac
-done
-
+# ── 0. Output helpers and the failure trap ──────────────────────────────────
+# The trap is installed before ANY other logic runs. A `set -e` abort with no
+# trap in place exits silently, which on a console is indistinguishable from
+# "the installer did nothing" — that exact failure mode cost a debugging
+# session once already. Nothing below this block may run before it.
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
-warn() { printf '\033[1;33mWARNING: %s\033[0m\n' "$*"; }
-die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+info() { printf '    %s\n' "$*"; }
+ok()   { printf '\033[1;32m    ✓ %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33m    ! %s\033[0m\n' "$*"; }
+die()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 failure_report() {
     local rc=$?
-    [[ $rc -eq 0 || $SETUP_COMPLETE -eq 1 ]] && return
-    printf '\n\033[1;31mSETUP FAILED (exit %s).\033[0m\n' "$rc" >&2
-    echo "  Re-run after correcting the error above; setup is idempotent." >&2
+    if [[ $rc -eq 0 || $SETUP_COMPLETE -eq 1 ]]; then
+        return 0
+    fi
+    printf '\n\033[1;31m─── SETUP FAILED (exit %s) ───\033[0m\n' "$rc" >&2
+    echo "  Fix the error above and re-run; setup is idempotent." >&2
+    [[ -n "${LOG_FILE:-}" ]] && echo "  Full transcript: $LOG_FILE" >&2
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl --no-pager --full status "$SERVICE_NAME" 2>/dev/null | tail -20 >&2 || true
-        journalctl -u "$SERVICE_NAME" -n 40 --no-pager 2>/dev/null >&2 || true
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager 2>/dev/null >&2 || true
     fi
     if [[ $WAS_SERVICE_ACTIVE -eq 1 ]]; then
         systemctl restart "$SERVICE_NAME" 2>/dev/null || true
-        echo "  Previous service restart was attempted after setup failure." >&2
-    fi
-}
-# Installed before any other logic runs. An `set -e` abort with no trap in
-# place exits SILENTLY, which on the console is indistinguishable from "the
-# installer did nothing" — that is exactly how the bug below went unnoticed.
-trap failure_report EXIT
-
-# Keep the friendly installer spelling out of the service configuration: the
-# runtime selector is deliberately explicit so a generic Soapy adapter knows
-# which driver to open.  B205mini/B2xx radios enumerate as driver=uhd.
-#
-# The `if` and the explicit `return 0` are load-bearing: written as a bare
-# `[[ test ]] && assignment`, the function returns the status of the FAILED
-# test whenever the device is not a USRP, and `set -e` then killed the whole
-# installer at this line — before the trap above existed, so with no output.
-normalize_device_selector() {
-    if [[ "$DEVICE" == "uhd" || "$DEVICE" == "usrp" ]]; then
-        DEVICE="driver=uhd"
+        echo "  The previously running service was restarted." >&2
     fi
     return 0
 }
-normalize_device_selector
+trap failure_report EXIT
 
-# ── 0. Environment detection ────────────────────────────────────────────────
-HAVE_APT=0;     command -v apt-get   >/dev/null && HAVE_APT=1
-HAVE_SYSTEMD=0; command -v systemctl >/dev/null && HAVE_SYSTEMD=1
-HAVE_NMCLI=0;   command -v nmcli     >/dev/null && HAVE_NMCLI=1
-IS_ROOT=0;      [[ ${EUID} -eq 0 ]] && IS_ROOT=1
+# ── 1. Arguments ────────────────────────────────────────────────────────────
+for arg in "$@"; do
+    case "$arg" in
+        --yes|-y)            ASK=0 ;;
+        --demo)              DEVICE="demo"; ASK=0 ;;
+        --deps-only)         DEPS_ONLY=1 ;;
+        --skip-radio-check)  SKIP_RADIO_CHECK=1 ;;
+        --mode=*)            MODE="${arg#*=}" ;;
+        --device=*)          DEVICE="${arg#*=}" ;;
+        --port=*)            PORT="${arg#*=}" ;;
+        --hostname=*)        MDNS_HOST="${arg#*=}" ;;
+        --hotspot-ssid=*)    HOTSPOT_SSID="${arg#*=}" ;;
+        --hotspot-pass=*)    HOTSPOT_PASS="${arg#*=}" ;;
+        --help|-h)
+            # awk (ERE) rather than sed: `\?` in a BRE is a GNU extension and
+            # silently fails to strip anywhere else.
+            awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if ($0 !~ /^=+$/) print; next}
+                 NR>1 {exit}' "$0"
+            SETUP_COMPLETE=1; exit 0 ;;
+        *) die "unknown option: $arg  (run: bash setup.sh --help)" ;;
+    esac
+done
+
+IS_ROOT=0; [[ ${EUID} -eq 0 ]] && IS_ROOT=1
 ARCH="$(uname -m)"
 SERVICE_USER="${SUDO_USER:-$(id -un)}"
+HAVE_APT=0;     command -v apt-get   >/dev/null 2>&1 && HAVE_APT=1
+HAVE_SYSTEMD=0; command -v systemctl >/dev/null 2>&1 && HAVE_SYSTEMD=1
 
-say "NIST-Omran radio viewer setup  (arch: $ARCH, user: $SERVICE_USER)"
-[[ $HAVE_APT -eq 1 ]]     || warn "no apt-get — system packages must be installed manually"
-[[ $HAVE_SYSTEMD -eq 1 ]] || warn "no systemd — service autostart will be skipped"
+# Transcript. Everything after this point lands in the log as well as on the
+# terminal, so "it printed something weird 10 minutes ago" is recoverable.
+if [[ $IS_ROOT -eq 1 ]]; then
+    LOG_FILE="/var/log/radio-web-setup.log"
+else
+    LOG_FILE="$REPO_ROOT/setup.log"
+fi
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || LOG_FILE="/tmp/radio-web-setup.log"
+# Keep a handle on the REAL terminal before stdout/stderr become a pipe into
+# tee. whiptail paints its dialog on stdout and returns the selection on
+# stderr; with both teed, the dialog would be scribbled into the log file and
+# the user would see nothing. fd 9 stays connected to the terminal so the
+# questions below can still draw (see ask_questions).
+exec 9>&2
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-bootstrap_prompter() {
-    [[ $ASSUME_DEFAULTS -eq 0 && $DEPS_ONLY -eq 0 && $IS_ROOT -eq 1 && $HAVE_APT -eq 1 ]] || return 0
-    if ! command -v whiptail >/dev/null; then
-        apt-get update
-        apt-get install -y whiptail || die "could not install the setup prompt UI"
-    fi
-}
+printf '\n\033[1;36m╔══════════════════════════════════════════════════╗\033[0m\n'
+printf '\033[1;36m║  LINDA installer — live RF viewer                ║\033[0m\n'
+printf '\033[1;36m╚══════════════════════════════════════════════════╝\033[0m\n'
+info "host $(uname -n)   arch $ARCH   user $SERVICE_USER"
+info "log  $LOG_FILE"
 
-validate_configuration() {
-    [[ $DEPS_ONLY -eq 1 ]] && return
-    [[ $IS_ROOT -eq 1 ]] || die "full setup must run as root: sudo bash setup.sh"
-    id "$SERVICE_USER" >/dev/null 2>&1 || die "service user does not exist: $SERVICE_USER"
-    [[ "$MODE" =~ ^(web|hotspot|ethernet|kiosk|terminal)$ ]] \
-        || die "invalid mode: $MODE"
-    [[ "$AUTOSTART" =~ ^(yes|no)$ ]] || die "autostart must be yes or no"
-    [[ "$DEVICE" =~ ^(air8201b|air7201b|air7101b|pluto|auto|demo|driver=[A-Za-z0-9_.+-]+(,serial=[A-Za-z0-9_.:-]+)?)$ ]] \
-        || die "invalid device: $DEVICE (use auto, uhd, pluto, demo, or driver=X[,serial=Y])"
+# ── 2. Preflight ────────────────────────────────────────────────────────────
+preflight() {
+    [[ $DEPS_ONLY -eq 1 ]] && return 0
+    [[ $IS_ROOT -eq 1 ]] || die "run as root:  sudo bash setup.sh"
+    id "$SERVICE_USER" >/dev/null 2>&1 || die "no such user: $SERVICE_USER"
+    [[ "$MODE" =~ ^(web|hotspot|ethernet|kiosk|terminal)$ ]] || die "invalid --mode: $MODE"
     [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1024 && PORT <= 65535 )) \
-        || die "port must be an integer from 1024 through 65535"
-    [[ "$MDNS_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
-        || die "hostname must be 1-63 letters, digits, or hyphens"
-    if [[ "$MODE" == "hotspot" ]]; then
-        [[ ! "$HOTSPOT_SSID" =~ [[:cntrl:]] ]] \
-            || die "hotspot SSID cannot contain control characters"
-        (( ${#HOTSPOT_SSID} >= 1 && ${#HOTSPOT_SSID} <= 32 )) \
-            || die "hotspot SSID must be 1-32 characters"
-        [[ -z "$HOTSPOT_PASS" || ( ${#HOTSPOT_PASS} -ge 8 && ${#HOTSPOT_PASS} -le 63 ) ]] \
-            || die "hotspot password must be empty (generate) or 8-63 characters"
-    fi
-    [[ "$DEVICE" == "demo" || "$INSTALL_STRIQT" != "no" ]] \
-        || die "striqt is mandatory for every real-radio service"
+        || die "--port must be 1024-65535"
 
-    [[ -r /etc/os-release ]] || die "cannot identify the operating system"
+    [[ -r /etc/os-release ]] || die "cannot identify this operating system"
     # shellcheck disable=SC1091
     . /etc/os-release
     case " ${ID:-} ${ID_LIKE:-} " in
         *" debian "*|*" ubuntu "*) ;;
-        *) die "automated full setup supports Debian-family Linux only (found ${ID:-unknown})" ;;
+        *) die "automated setup supports Debian-family Linux (found: ${ID:-unknown}).
+       Everything else can still run demo mode:  bash setup.sh --deps-only" ;;
     esac
-    case "${ID:-}:${VERSION_ID:-}" in
-        debian:12|debian:13|raspbian:12|raspbian:13|ubuntu:22.04|ubuntu:24.04) ;;
-        *) die "unqualified OS release: ${ID:-unknown} ${VERSION_ID:-unknown} (supported: Debian/Raspberry Pi OS 12-13, Ubuntu 22.04/24.04)" ;;
+    case "$ARCH" in
+        x86_64|aarch64|arm64) ;;
+        *) die "unsupported architecture: $ARCH (need x86_64 or 64-bit ARM)" ;;
     esac
-    case "$ARCH" in x86_64|aarch64|arm64) ;; *)
-        die "unsupported architecture: $ARCH (supported: x86_64, aarch64/arm64)"
-    esac
-    python3 - <<'PY' || die "Python 3.9 through 3.13 is required"
+    python3 - <<'PY' || die "need Python 3.9-3.13 (found: $(python3 -V 2>&1))"
 import sys
 raise SystemExit(0 if (3, 9) <= sys.version_info[:2] <= (3, 13) else 1)
 PY
-    local free_kb mem_kb
+    local free_kb
     free_kb="$(df -Pk "$REPO_ROOT" | awk 'NR==2 {print $4}')"
-    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
-    (( free_kb >= 5 * 1024 * 1024 )) \
-        || die "at least 5 GiB free disk space is required"
-    (( mem_kb >= 2 * 1024 * 1024 )) \
-        || warn "less than 2 GiB RAM detected; Chromium/scientific workloads may be unreliable"
+    (( free_kb >= 4 * 1024 * 1024 )) || die "need at least 4 GiB free on $REPO_ROOT"
 
-    if command -v ss >/dev/null && ss -H -ltn "sport = :$PORT" | grep -q .; then
-        if ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            die "TCP port $PORT is already in use"
-        fi
-        echo "  port $PORT is occupied by the existing $SERVICE_NAME service (safe rerun)"
+    if command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :$PORT" 2>/dev/null | grep -q .; then
+        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null \
+            || die "TCP port $PORT is already used by something else"
+        info "port $PORT held by the existing $SERVICE_NAME (safe re-run)"
     fi
+    ok "preflight passed"
+    return 0
 }
 
-# ── USRP (UHD) host preparation ─────────────────────────────────────────────
-# A USRP B2xx has no on-board flash: UHD uploads the firmware and the FPGA
-# image over USB every time the device is opened.  Debian cannot redistribute
-# those images, so a fresh host enumerates the radio in lsusb and then fails to
-# open it until they are downloaded.
-UHD_IMAGES_DIR=""
-uhd_images_present() {
-    local dir
-    for dir in /usr/share/uhd/images /usr/local/share/uhd/images; do
-        if [[ -d "$dir" ]] && compgen -G "$dir/*" >/dev/null 2>&1; then
-            UHD_IMAGES_DIR="$dir"
+# ── 3. apt helper ───────────────────────────────────────────────────────────
+# --no-install-recommends is not an optimisation here, it is a correctness
+# fix. Debian's uhd-host and soapysdr-tools recommend GNU Radio, Qt5+Qt6,
+# GDAL, MariaDB clients and the soapysdr module-all bundle: a plain
+# `apt-get install uhd-host` pulled 180 packages and 974 MB onto a Pi, and the
+# audio module in that bundle spews ALSA/Jack/PulseAudio errors over every
+# device enumeration afterwards. We install what we actually use.
+APT_UPDATED=0
+apt_install() {
+    [[ $HAVE_APT -eq 1 && $IS_ROOT -eq 1 ]] || return 0
+    if [[ $APT_UPDATED -eq 0 ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        APT_UPDATED=1
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "$@"
+}
+
+apt_has() {
+    apt-cache show "$1" >/dev/null 2>&1
+}
+
+# ── 4. Radio identification (before any driver exists) ──────────────────────
+# Chicken-and-egg: SoapySDR cannot enumerate a radio whose driver is not
+# installed, and we do not want to install every driver. USB IDs are readable
+# with no driver at all, so the hardware tells us which stack to fetch.
+declare -a USB_RADIO_TABLE=(
+    # vid[:pid]   kind      apt package(s)                       label
+    "2500|uhd|soapysdr-module-uhd uhd-host|Ettus USRP (B2xx family)"
+    "0456:b673|pluto|-|ADALM-Pluto"
+    "0bda:2832|rtlsdr|soapysdr-module-rtlsdr|RTL-SDR"
+    "0bda:2838|rtlsdr|soapysdr-module-rtlsdr|RTL-SDR"
+    "1d50:6089|hackrf|soapysdr-module-hackrf|HackRF One"
+    "1d50:60a1|airspy|soapysdr-module-airspy|Airspy"
+    "1d50:6108|limesdr|soapysdr-module-lms7|LimeSDR"
+    "2cf0|bladerf|soapysdr-module-bladerf|Nuand bladeRF"
+)
+RADIO_PKGS=""
+
+usb_present() {
+    # `lsusb -d VID:` exits non-zero when nothing matches, which is the whole
+    # point; keep it inside a condition so errexit stays out of it.
+    lsusb -d "$1" >/dev/null 2>&1
+}
+
+detect_radio() {
+    say "Looking for a radio"
+    # An AIR-T carries its SDR on-board with the proprietary SoapyAIRT driver
+    # already in the vendor image — nothing to install, just recognise it.
+    if command -v SoapySDRUtil >/dev/null 2>&1 \
+            && SoapySDRUtil --info 2>/dev/null | grep -qi 'SoapyAIRT'; then
+        RADIO_KIND="airt"; RADIO_LABEL="Deepwave AIR-T (SoapyAIRT present)"
+        DEVICE="${DEVICE:-auto}"
+        ok "$RADIO_LABEL"
+        return 0
+    fi
+    if ! command -v lsusb >/dev/null 2>&1; then
+        RADIO_KIND="unknown"; RADIO_LABEL="cannot probe USB (lsusb missing)"
+        warn "$RADIO_LABEL"
+        return 0
+    fi
+    local row id kind pkgs label
+    for row in "${USB_RADIO_TABLE[@]}"; do
+        IFS='|' read -r id kind pkgs label <<<"$row"
+        if usb_present "$id"; then
+            RADIO_KIND="$kind"; RADIO_LABEL="$label"
+            [[ "$pkgs" != "-" ]] && RADIO_PKGS="$pkgs"
+            ok "found: $label  (USB $id)"
             return 0
         fi
     done
-    return 1
+    RADIO_KIND="none"; RADIO_LABEL="no supported radio on USB"
+    warn "$RADIO_LABEL"
+    return 0
 }
 
-install_uhd_images() {
-    if uhd_images_present; then
-        echo "  UHD images already present in $UHD_IMAGES_DIR"
-        return 0
-    fi
-    local downloader
-    downloader="$(command -v uhd_images_downloader || true)"
-    [[ -n "$downloader" ]] || downloader=/usr/libexec/uhd/utils/uhd_images_downloader.py
-    if [[ ! -x "$downloader" ]]; then
-        warn "uhd_images_downloader is missing; a USRP cannot open without its"
-        warn "FPGA image. Reinstall uhd-host, then re-run setup.sh."
-        return 0
-    fi
-    # Restrict the download to the USB family when one is plugged in — the
-    # full image set is a much larger transfer than a B2xx needs.
-    local types="${RADIO_UHD_IMAGE_TYPES:-}"
-    if [[ -z "$types" ]] && lsusb -d 2500: >/dev/null 2>&1; then
-        types="b2xx"
-    fi
-    say "Downloading UHD firmware/FPGA images${types:+ (${types})}…"
-    if [[ -n "$types" ]]; then
-        "$downloader" -t "$types" || warn "UHD image download failed (no internet?)"
+# Map the detected kind (or an explicit --device) onto the selector the server
+# takes. Written as an if/return-0 function on purpose: a bare `[[ … ]] && …`
+# tail returns the failed test's status and `set -e` kills the installer.
+resolve_selector() {
+    case "${DEVICE:-}" in
+        "" )        ;;                              # fall through to detection
+        uhd|usrp)   DEVICE="driver=uhd"; RADIO_KIND="uhd"; return 0 ;;
+        rtlsdr)     DEVICE="driver=rtlsdr";   RADIO_KIND="rtlsdr";  return 0 ;;
+        hackrf)     DEVICE="driver=hackrf";   RADIO_KIND="hackrf";  return 0 ;;
+        airspy)     DEVICE="driver=airspy";   RADIO_KIND="airspy";  return 0 ;;
+        bladerf)    DEVICE="driver=bladerf";  RADIO_KIND="bladerf"; return 0 ;;
+        limesdr)    DEVICE="driver=lime";     RADIO_KIND="limesdr"; return 0 ;;
+        pluto)      RADIO_KIND="pluto"; return 0 ;;
+        demo)       RADIO_KIND="demo";  return 0 ;;
+        air*)       RADIO_KIND="airt";  return 0 ;;
+        *)          return 0 ;;                     # driver=…/auto: keep as-is
+    esac
+    case "$RADIO_KIND" in
+        uhd)      DEVICE="driver=uhd" ;;
+        rtlsdr)   DEVICE="driver=rtlsdr" ;;
+        hackrf)   DEVICE="driver=hackrf" ;;
+        airspy)   DEVICE="driver=airspy" ;;
+        bladerf)  DEVICE="driver=bladerf" ;;
+        limesdr)  DEVICE="driver=lime" ;;
+        pluto)    DEVICE="pluto" ;;
+        airt)     DEVICE="auto" ;;
+        *)        DEVICE="demo" ;;
+    esac
+    return 0
+}
+
+# ── 5. The two questions ────────────────────────────────────────────────────
+ask_questions() {
+    [[ $ASK -eq 1 && $DEPS_ONLY -eq 0 ]] || return 0
+    local have_tui=0
+    command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 9 ]] && have_tui=1
+
+    if [[ $have_tui -eq 1 ]]; then
+        # `2>&1 1>&9`, in that order: the selection (whiptail's stderr) goes to
+        # the capturing pipe, the dialog (its stdout) goes to fd 9 — the real
+        # terminal saved before the tee. The usual `3>&1 1>&2 2>&3` idiom
+        # assumes stderr IS the terminal, which it is not once we are logging.
+        MODE=$(whiptail --title "LINDA setup (1 of 2)" --nocancel --menu \
+            "How should this machine serve the viewer?" 17 74 5 \
+            web      "Web server on your existing network  (recommended)" \
+            kiosk    "Web server + fullscreen browser on the local display" \
+            hotspot  "Web server + its own Wi-Fi access point (no network)" \
+            ethernet "Web server + direct Ethernet to a laptop (auto DHCP)" \
+            terminal "No service; run the curses viewer by hand" \
+            2>&1 1>&9) || true
+        local choice
+        choice=$(whiptail --title "LINDA setup (2 of 2)" --nocancel --menu \
+            "Which radio should it drive?\n\nDetected: $RADIO_LABEL" 18 74 4 \
+            detected "Use the detected radio (recommended)" \
+            uhd      "Ettus USRP B2xx / B205mini" \
+            pluto    "ADALM-Pluto" \
+            demo     "Demo — synthetic IQ, no hardware" \
+            2>&1 1>&9) || true
+        [[ "$choice" != "detected" && -n "$choice" ]] && DEVICE="$choice"
+        if [[ "$MODE" == "hotspot" && -z "$HOTSPOT_PASS" ]]; then
+            HOTSPOT_PASS=$(whiptail --title "Hotspot password" --nocancel \
+                --passwordbox "8-63 characters (blank = generate one):" 9 60 \
+                2>&1 1>&9) || true
+        fi
     else
-        "$downloader" || warn "UHD image download failed (no internet?)"
+        echo
+        read -rp "  Mode [web/kiosk/hotspot/ethernet/terminal] ($MODE): " a || true
+        MODE="${a:-$MODE}"
+        read -rp "  Radio [detected/uhd/pluto/demo] (detected → $RADIO_LABEL): " a || true
+        [[ -n "${a:-}" && "$a" != "detected" ]] && DEVICE="$a"
     fi
     return 0
 }
 
-# USRP B2xx over USB 3: the kernel's default 16 MB usbfs buffer overflows
-# continuously above a few MS/s.  Ettus' documented fix is a kernel parameter.
-# usbcore is built into the Raspberry Pi kernel, so /etc/modprobe.d has no
-# effect there — the value has to go on the kernel command line.
-tune_usb_for_usrp() {
-    local want=1000
-    local sysfs=/sys/module/usbcore/parameters/usbfs_memory_mb
-    local current=""
-    [[ -r "$sysfs" ]] && current="$(cat "$sysfs" 2>/dev/null || true)"
-    if [[ "$current" =~ ^[0-9]+$ ]] && (( current >= want )); then
-        echo "  usbfs buffer already ${current} MB"
+# ── 6. Base system packages ─────────────────────────────────────────────────
+install_base() {
+    [[ $HAVE_APT -eq 1 && $IS_ROOT -eq 1 ]] || {
+        warn "no apt/root — install manually: python3-venv python3-soapysdr avahi-daemon"
+        return 0
+    }
+    say "Installing base packages"
+    #  git            pip fetches striqt from a git URL
+    #  curl           health probe + vendored asset restore
+    #  usbutils       lsusb, the radio detection above
+    #  ca-certificates/openssl  TLS + the session-signing secret
+    #  avahi-daemon   reach the box at <hostname>.local
+    #  whiptail       the two questions
+    apt_install ca-certificates curl git openssl sudo usbutils iproute2 \
+                python3 python3-venv python3-pip whiptail avahi-daemon \
+        || die "base package installation failed"
+    ok "base packages installed"
+    return 0
+}
+
+install_soapy_core() {
+    [[ "$RADIO_KIND" != "demo" ]] || return 0
+    [[ $HAVE_APT -eq 1 && $IS_ROOT -eq 1 ]] || return 0
+    say "Installing SoapySDR"
+    # soapysdr-tools is SoapySDRUtil (enumeration + diagnostics). Its
+    # Recommends pull the whole module-all bundle; --no-install-recommends
+    # (in apt_install) keeps that out.
+    apt_install python3-soapysdr soapysdr-tools \
+        || die "SoapySDR is not available from this distribution's repositories"
+    ok "SoapySDR core installed"
+    return 0
+}
+
+install_radio_driver() {
+    [[ $HAVE_APT -eq 1 && $IS_ROOT -eq 1 ]] || return 0
+    case "$RADIO_KIND" in
+        demo|none|unknown) return 0 ;;
+        airt)
+            info "AIR-T uses the vendor's SoapyAIRT driver — nothing to install"
+            return 0
+            ;;
+        pluto)
+            install_pluto_driver
+            return 0
+            ;;
+    esac
+    [[ -n "$RADIO_PKGS" ]] || return 0
+    say "Installing the $RADIO_LABEL driver"
+    # shellcheck disable=SC2086
+    apt_install $RADIO_PKGS || die "could not install: $RADIO_PKGS"
+    ok "driver installed: $RADIO_PKGS"
+    if [[ "$RADIO_KIND" == "uhd" ]]; then
+        install_uhd_images
+        tune_usbfs
+    fi
+    return 0
+}
+
+# SoapyPlutoSDR is not packaged before Debian forky. Building it is the only
+# way a Pluto works on the releases this installer supports, so build it
+# rather than telling the user to go do it themselves.
+install_pluto_driver() {
+    say "Installing the ADALM-Pluto driver"
+    apt_install libiio-utils libiio0 libad9361-0 || true
+    if apt_has soapysdr-module-plutosdr && apt_install soapysdr-module-plutosdr; then
+        ok "SoapyPlutoSDR installed from apt"
+        return 0
+    fi
+    info "not packaged in this release — building SoapyPlutoSDR from source"
+    apt_install build-essential cmake git libiio-dev libad9361-dev \
+        || die "cannot install the toolchain needed to build SoapyPlutoSDR"
+    local src="/usr/local/src/SoapyPlutoSDR"
+    rm -rf "$src"
+    git clone --depth 1 https://github.com/pothosware/SoapyPlutoSDR.git "$src" \
+        || die "could not fetch SoapyPlutoSDR"
+    cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release >/dev/null \
+        && cmake --build "$src/build" -j"$(nproc)" >/dev/null \
+        && cmake --install "$src/build" >/dev/null \
+        || die "SoapyPlutoSDR build failed (see $LOG_FILE)"
+    ldconfig
+    ok "SoapyPlutoSDR built and installed"
+    return 0
+}
+
+# ── 7. USRP enablement ──────────────────────────────────────────────────────
+# A B2xx has no on-board flash: UHD uploads firmware and an FPGA image over
+# USB at every open. Debian ships no images, and — the part that actually bit
+# us — /usr/bin/uhd_images_downloader writes to a VERSIONED directory
+# (/usr/share/uhd/4.8.0/images) that the installed libuhd does not search, so
+# the download "succeeds" and the radio still reports
+# "Using images directory: <no images directory located>". Rather than guess
+# the layout, download, then find the firmware on disk and pin UHD_IMAGES_DIR
+# to whatever directory actually holds it.
+install_uhd_images() {
+    say "Fetching UHD firmware/FPGA images"
+    if ! locate_uhd_images; then
+        local dl
+        for dl in /usr/libexec/uhd/utils/uhd_images_downloader.py \
+                  /usr/lib/uhd/utils/uhd_images_downloader.py \
+                  "$(command -v uhd_images_downloader 2>/dev/null || true)"; do
+            [[ -n "$dl" && -x "$dl" ]] || continue
+            info "running $dl"
+            "$dl" -t b2xx >/dev/null 2>&1 || "$dl" >/dev/null 2>&1 || true
+            locate_uhd_images && break
+        done
+    fi
+    if locate_uhd_images; then
+        ok "UHD images at $UHD_IMAGES_PATH"
+        export UHD_IMAGES_DIR="$UHD_IMAGES_PATH"
+    else
+        warn "UHD images could not be downloaded (offline?). The USRP will not"
+        warn "open until they exist. Retry with:  sudo uhd_images_downloader"
+    fi
+    return 0
+}
+
+locate_uhd_images() {
+    local hit
+    hit="$(find /usr/share/uhd /usr/local/share/uhd /usr/lib/uhd /lib/uhd \
+              -name 'usrp_b2*_fw*.hex' -o -name 'usrp_b200_fw.hex' 2>/dev/null \
+           | head -1)"
+    if [[ -n "$hit" ]]; then
+        UHD_IMAGES_PATH="$(dirname "$hit")"
+        return 0
+    fi
+    return 1
+}
+
+# A B2xx streaming over USB 3 overruns the kernel's default 16 MB usbfs
+# buffer within seconds. usbcore is built into the Raspberry Pi kernel, so
+# /etc/modprobe.d has no effect — this has to be a kernel command-line option.
+tune_usbfs() {
+    local want=1000 sysfs=/sys/module/usbcore/parameters/usbfs_memory_mb cur=""
+    [[ -r "$sysfs" ]] && cur="$(cat "$sysfs" 2>/dev/null || true)"
+    if [[ "$cur" =~ ^[0-9]+$ ]] && (( cur >= want )); then
+        ok "usbfs buffer already ${cur} MB"
         return 0
     fi
     if [[ -w "$sysfs" ]] && echo "$want" > "$sysfs" 2>/dev/null; then
-        echo "  usbfs buffer raised to ${want} MB for this boot"
+        info "usbfs buffer raised to ${want} MB for this boot"
     fi
-    local cmdline="" candidate
-    for candidate in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
-        [[ -f "$candidate" ]] && { cmdline="$candidate"; break; }
+    local f cmdline=""
+    for f in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+        [[ -f "$f" ]] && { cmdline="$f"; break; }
     done
     if [[ -z "$cmdline" ]]; then
-        warn "could not persist usbfs_memory_mb=$want (no Pi-style cmdline.txt)."
-        warn "Add 'usbcore.usbfs_memory_mb=$want' to this host's kernel command"
-        warn "line for sustained USRP streaming."
+        warn "add 'usbcore.usbfs_memory_mb=$want' to this host's kernel command"
+        warn "line to make the USB buffer increase survive a reboot"
         return 0
     fi
     if grep -q 'usbcore\.usbfs_memory_mb=' "$cmdline"; then
         sed -i "s/usbcore\.usbfs_memory_mb=[0-9]*/usbcore.usbfs_memory_mb=$want/" "$cmdline"
     else
-        # cmdline.txt must remain ONE line — append to it, never add a line.
-        cp -n "$cmdline" "$cmdline.nist-omran.bak" 2>/dev/null || true
+        cp -n "$cmdline" "$cmdline.linda.bak" 2>/dev/null || true
+        # cmdline.txt must stay ONE line: append to it, never add a line.
         sed -i "1s|\$| usbcore.usbfs_memory_mb=$want|" "$cmdline"
         REBOOT_REQUIRED=1
     fi
-    echo "  usbfs buffer persisted in $cmdline (usbcore.usbfs_memory_mb=$want)"
+    ok "usbfs buffer persisted in $cmdline"
     return 0
 }
 
-# ── 1. System packages (apt) ────────────────────────────────────────────────
-install_system_deps() {
-    [[ $HAVE_APT -eq 1 && $IS_ROOT -eq 1 ]] || {
-        warn "skipping apt packages (need root + apt). Required: python3-venv,"
-        warn "python3-soapysdr + your radio's soapysdr-module-*, avahi-daemon."
-        return 0
-    }
-    say "Installing system packages (apt)…"
-    apt-get update
-    # These are required on a clean Debian-family host.  Do not hide failures:
-    # a half-created venv is much harder to diagnose than a failed installer.
-    #   git      — pip installs striqt from a git URL
-    #   curl     — /health probe and the uPlot asset restore
-    #   usbutils — lsusb, used below to recognise an attached USRP
-    #   build-essential + python3-dev — source-build fallback for pip. Every
-    #     pinned dependency ships an aarch64 wheel today, but a missing
-    #     compiler is the most confusing pip failure mode on ARM; drop these
-    #     two only if you are deliberately building a minimal image.
-    apt-get install -y ca-certificates curl git openssl sudo \
-        python3 python3-venv python3-pip python3-dev build-essential \
-        whiptail avahi-daemon iproute2 usbutils
-    if [[ "$DEVICE" != "demo" ]]; then
-        # soapysdr-tools carries SoapySDRUtil (driver enumeration + the checks
-        # in verify_install).  libsoapysdr-dev is NOT installed: nothing here
-        # compiles against the SoapySDR headers.
-        apt-get install -y python3-soapysdr soapysdr-tools \
-            || die "required SoapySDR packages are unavailable from this distro's repositories"
-    fi
-
-    # Install only the driver stack that the selected radio uses.  Installing
-    # every Soapy module pulls in unrelated firmware and conflicts on small Pi
-    # images.  With --device=auto, recognise a connected Ettus USRP so the
-    # one-line/default installation works for a B205mini without a flag.
-    local selected_driver="$DEVICE"
-    if [[ "$selected_driver" == "auto" ]] && lsusb -d 2500: >/dev/null 2>&1; then
-        selected_driver="driver=uhd"
-        echo "  detected Ettus Research USB device; installing the UHD/SoapyUHD stack"
-    fi
-    case "$selected_driver" in
-        driver=uhd|driver=uhd,serial=*)
-            # There is no "uhd-images" package in Debian or Ubuntu — uhd-host
-            # ships the downloader and the images are fetched separately
-            # (install_uhd_images below).
-            apt-get install -y soapysdr-module-uhd uhd-host \
-                || die "USRP selected, but soapysdr-module-uhd/uhd-host are unavailable"
-            install_uhd_images
-            tune_usb_for_usrp
-            ;;
-        pluto)
-            # SoapyPlutoSDR is not packaged before Debian forky, so on every
-            # release this installer supports the driver must be built from
-            # source.  libiio-utils is only the iio_info diagnostic.
-            apt-get install -y libiio-utils || true
-            if ! apt-get install -y soapysdr-module-plutosdr; then
-                warn "soapysdr-module-plutosdr is not in this release's repositories"
-                warn "(it first appears in Debian forky). Build SoapyPlutoSDR from"
-                warn "source — apt-get install libiio-dev libad9361-dev cmake, then"
-                warn "cmake/make/make install github.com/pothosware/SoapyPlutoSDR —"
-                warn "and re-run setup.sh."
-            fi
-            ;;
-        auto)
-            warn "auto selected with no detectable USB radio; only the SoapySDR core was installed"
-            warn "rerun with --device=uhd for a USRP, or install the matching driver module"
-            ;;
-        air8201b|air7201b|air7101b)
-            echo "  Deepwave AIR-T selected; its proprietary SoapyAIRT driver must already be installed"
-            ;;
-    esac
-    # Network modes need NetworkManager.
-    if [[ "$MODE" == "hotspot" || "$MODE" == "ethernet" ]]; then
-        if [[ -f /etc/network/interfaces ]] \
-                && awk '$1=="iface" && $2!="lo" {found=1} END {exit !found}' /etc/network/interfaces; then
-            die "/etc/network/interfaces configures a non-loopback interface; remove that legacy configuration before using NetworkManager $MODE mode"
-        fi
-        apt-get install -y network-manager \
-            || die "NetworkManager is required for $MODE mode"
-        command -v nmcli >/dev/null && HAVE_NMCLI=1
-        if systemctl is-active --quiet dhcpcd 2>/dev/null; then
-            say "Disabling dhcpcd to avoid conflict with NetworkManager…"
-            systemctl disable --now dhcpcd
-            REBOOT_REQUIRED=1
-        fi
-        systemctl enable --now NetworkManager \
-            || die "NetworkManager could not be enabled"
-    fi
-    # Kiosk mode shows the web UI in a local Chromium-family browser.
-    if [[ "$MODE" == "kiosk" ]] && ! command -v chromium >/dev/null \
-            && ! command -v chromium-browser >/dev/null; then
-        apt-get install -y chromium \
-            || apt-get install -y chromium-browser \
-            || die "kiosk mode requires Chromium, which this distro did not provide"
-    fi
-    if [[ "$MODE" == "kiosk" ]]; then
-        apt-get install -y xserver-xorg xinit openbox lightdm dbus-x11 \
-            || die "kiosk mode requires an X server, Openbox, and LightDM"
-        install -d -m 0755 /etc/lightdm/lightdm.conf.d
-        cat > /etc/lightdm/lightdm.conf.d/50-radio-kiosk.conf <<EOF
-[Seat:*]
-autologin-user=$SERVICE_USER
-autologin-user-timeout=0
-user-session=openbox
-EOF
-        systemctl set-default graphical.target
-        systemctl enable --now lightdm
-        REBOOT_REQUIRED=1
-    fi
-}
-
-install_radio_permissions() {
-    [[ $IS_ROOT -eq 1 && "$DEVICE" != "demo" ]] || return 0
-    say "Installing SDR USB permissions…"
+# ── 8. USB permissions ──────────────────────────────────────────────────────
+install_udev_rules() {
+    [[ $IS_ROOT -eq 1 && "$RADIO_KIND" != "demo" ]] || return 0
+    say "Granting USB access to $SERVICE_USER"
     getent group plugdev >/dev/null || groupadd --system plugdev
-    local group
-    for group in plugdev dialout; do
-        getent group "$group" >/dev/null && usermod -aG "$group" "$SERVICE_USER"
+    local g
+    for g in plugdev dialout; do
+        getent group "$g" >/dev/null && usermod -aG "$g" "$SERVICE_USER" || true
     done
     install -d -m 0755 /etc/udev/rules.d
-    cat > /etc/udev/rules.d/70-nist-omran-sdr.rules <<'EOF'
-# Managed by NIST-Omran setup.sh. Common USB SDR devices.
-SUBSYSTEM=="usb", ATTR{idVendor}=="0456", ATTR{idProduct}=="b673", MODE="0660", GROUP="plugdev", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", MODE="0660", GROUP="plugdev", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6089", MODE="0660", GROUP="plugdev", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6108", MODE="0660", GROUP="plugdev", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="60a1", MODE="0660", GROUP="plugdev", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="2cf0", MODE="0660", GROUP="plugdev", TAG+="uaccess"
-# Ettus Research USRP B2xx family (UHD also installs rules; keep this
-# explicit so a minimal Raspberry Pi image works before a logout/reboot).
+    cat > /etc/udev/rules.d/70-linda-sdr.rules <<'EOF'
+# Managed by LINDA setup.sh — USB SDRs usable without root.
 SUBSYSTEM=="usb", ATTR{idVendor}=="2500", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0456", ATTR{idProduct}=="b673", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2832", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2cf0", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 EOF
-    udevadm control --reload-rules
-    udevadm trigger --subsystem-match=usb
-    REBOOT_REQUIRED=1
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb 2>/dev/null || true
+    ok "udev rules installed"
+    return 0
 }
 
-# ── GPS (optional): position stamped into every recorded capture ────────────
-# The live viewer never needs GPS; recordings embed the fix when one is
-# available and record gps_valid=0 when it is not. Installing gpsd here is what
-# makes that work on a FRESH host instead of only where someone already set it
-# up by hand. Every failure below is a warning: no GPS must never fail setup.
+# ── 9. GPS (optional; recordings embed the fix, the viewer never needs it) ──
 install_gps() {
     [[ $IS_ROOT -eq 1 && $HAVE_APT -eq 1 ]] || return 0
-    # The demo source produces synthetic IQ; stamping it with a real position
-    # would be a lie, so there is nothing for gpsd to do on a demo host.
-    [[ "$DEVICE" != "demo" ]] || return 0
-    say "Installing GPS support (gpsd, optional)…"
-    if ! apt-get install -y gpsd gpsd-clients; then
-        warn "gpsd could not be installed — recordings will record gps_valid=0"
+    [[ "$RADIO_KIND" != "demo" ]] || return 0
+    say "Installing GPS support (optional)"
+    if ! apt_install gpsd gpsd-clients; then
+        warn "gpsd unavailable — recordings will record gps_valid=0"
         return 0
     fi
-    # Bind whatever gpsd already knows about, then look for an unbound
-    # receiver. USB GPS units enumerate as ttyACM*/ttyUSB*; a module wired to
-    # the board's UART pins has to be named explicitly with RADIO_GPS_DEVICE.
-    local device="${RADIO_GPS_DEVICE:-}"
+    local device="${RADIO_GPS_DEVICE:-}" candidate
     if [[ -z "$device" ]]; then
-        local candidate
         for candidate in /dev/ttyACM* /dev/ttyUSB*; do
             [[ -e "$candidate" ]] || continue
-            # Only claim a device that actually speaks NMEA: these ports are
-            # also where Arduinos, modems and FTDI cables show up, and adding
-            # a non-GPS device to gpsd is a confusing dead end.
+            # Only claim a port that actually speaks NMEA — Arduinos and FTDI
+            # cables live on these same device names.
             if timeout 4 grep -qam1 '^\$G[PNLAB]' "$candidate" 2>/dev/null; then
-                device="$candidate"
-                break
+                device="$candidate"; break
             fi
         done
     fi
     if [[ -n "$device" && -e "$device" ]]; then
-        say "  GPS receiver detected on $device"
-        if [[ -f /etc/default/gpsd ]] && ! grep -q "$device" /etc/default/gpsd; then
-            sed -i "s|^DEVICES=.*|DEVICES=\"$device\"|" /etc/default/gpsd \
-                || true
-            grep -q '^DEVICES=' /etc/default/gpsd \
-                || echo "DEVICES=\"$device\"" >> /etc/default/gpsd
+        if [[ -f /etc/default/gpsd ]]; then
+            sed -i "s|^DEVICES=.*|DEVICES=\"$device\"|" /etc/default/gpsd || true
+            grep -q '^DEVICES=' /etc/default/gpsd || echo "DEVICES=\"$device\"" >> /etc/default/gpsd
         fi
-        systemctl enable gpsd 2>/dev/null || true
-        systemctl restart gpsd 2>/dev/null || true
-        gpsdctl add "$device" 2>/dev/null || true
+        systemctl enable gpsd  >/dev/null 2>&1 || true
+        systemctl restart gpsd >/dev/null 2>&1 || true
+        ok "GPS receiver on $device"
     else
-        warn "no NMEA receiver found on ttyACM*/ttyUSB* — recordings will"
-        warn "record gps_valid=0 until one is attached. Plug in a USB GPS and"
-        warn "re-run setup, or for a UART-wired module:"
-        warn "  sudo RADIO_GPS_DEVICE=/dev/ttyTHS1 bash setup.sh"
-        warn "Set RADIO_GPS=0 in /etc/radio-web/radio.env to disable entirely."
-    fi
-    getent group dialout >/dev/null \
-        && usermod -aG dialout "$SERVICE_USER" 2>/dev/null || true
-}
-
-# ── 2. Python virtualenv ────────────────────────────────────────────────────
-install_python_deps() {
-    say "Creating venv + installing Python deps…"
-    local marker="$REPO_ROOT/.venv/.nist-omran-dependency-id"
-    local wanted current backup
-    wanted="$(
-        sha256sum "$REPO_ROOT/live/requirements.txt" "$REPO_ROOT/live/constraints.txt"
-        printf '%s\n' "$STRIQT_COMMIT"
-        python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))'
-    )"
-    wanted="$(printf '%s' "$wanted" | sha256sum | awk '{print $1}')"
-    current="$(cat "$marker" 2>/dev/null || true)"
-    if [[ -d "$REPO_ROOT/.venv" && "$current" != "$wanted" ]]; then
-        backup="$REPO_ROOT/.venv.backup.$(date +%Y%m%d%H%M%S)"
-        say "Existing venv is unqualified; preserving it at $backup"
-        mv "$REPO_ROOT/.venv" "$backup"
-    fi
-    if [[ ! -d "$REPO_ROOT/.venv" ]]; then
-        python3 -m venv --system-site-packages "$REPO_ROOT/.venv"
-    fi
-    # --system-site-packages so the venv sees the apt python3-soapysdr binding.
-    "$REPO_ROOT/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
-    if [[ "$INSTALL_STRIQT" != "no" ]]; then
-        say "Installing radio-verified striqt 0.7.0 (commit ${STRIQT_COMMIT}) — may take a while…"
-        # One transaction lets pip choose a mutually compatible numpy,
-        # pandas, seaborn, FastAPI, uvicorn and striqt stack.
-        "$REPO_ROOT/.venv/bin/python" -m pip install --upgrade \
-            -r "$REPO_ROOT/live/requirements.txt" \
-            -c "$REPO_ROOT/live/constraints.txt" \
-            "striqt @ git+https://github.com/usnistgov/striqt@${STRIQT_COMMIT}" \
-            || die "Python/radio stack installation failed (the environment was not left marked complete)"
-    else
-        "$REPO_ROOT/.venv/bin/python" -m pip install --upgrade \
-            -r "$REPO_ROOT/live/requirements.txt" \
-            -c "$REPO_ROOT/live/constraints.txt" \
-            || die "Python dependency installation failed"
-    fi
-    # This venv intentionally exposes the distro's site-packages so the apt
-    # SoapySDR binding is usable.  `pip check` therefore audits unrelated apt
-    # packages too (for example editor-only types-seaborn) and can reject an
-    # otherwise valid LINDA install.  The targeted runtime imports below are
-    # the meaningful consistency check for this mixed apt/pip environment.
-    # Offline plot assets: the repo vendors uPlot; restore it when missing so
-    # hotspot/ethernet modes never depend on a CDN.
-    if [[ ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.js" || ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.css" ]]; then
-        say "Fetching missing vendored uPlot assets…"
-        mkdir -p "$REPO_ROOT/live/web/vendor"
-        if [[ ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.js" ]]; then
-            curl -fsSL https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js \
-                -o "$REPO_ROOT/live/web/vendor/uPlot.min.js"
-        fi
-        if [[ ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.css" ]]; then
-            curl -fsSL https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css \
-                -o "$REPO_ROOT/live/web/vendor/uPlot.min.css"
-        fi
-    fi
-    echo "2d27e8ad3d228164525ce213f9dc716f39b4e3aee0cc773fb3491c96cf4921a2  $REPO_ROOT/live/web/vendor/uPlot.min.js" \
-        | sha256sum -c - >/dev/null \
-        || die "uPlot JavaScript asset is missing or has an invalid checksum"
-    echo "df630c6a8d6f8eeaff264b50f73ce5b114f646ffd9a0bb74f049b0a00135fa04  $REPO_ROOT/live/web/vendor/uPlot.min.css" \
-        | sha256sum -c - >/dev/null \
-        || die "uPlot CSS asset is missing or has an invalid checksum"
-    # Sanity: can the core import?
-    "$REPO_ROOT/.venv/bin/python3" - <<'PYCHECK' || die "live/core import check failed"
-import sys
-sys.path.insert(0, "live")
-import core
-from core import devices
-print("  live/core import OK")
-try:
-    found = devices.discover()
-    print(f"  radios detected: {[f['label'] for f in found] or 'none'}")
-except RuntimeError as e:
-    print(f"  (device discovery unavailable: {e})")
-PYCHECK
-    printf '%s\n' "$wanted" > "$marker"
-    if [[ $IS_ROOT -eq 1 ]]; then
-        chown -R "$SERVICE_USER:$SERVICE_USER" "$REPO_ROOT/.venv"
-    fi
-}
-
-verify_install() {
-    say "Verifying installed software…"
-    local py="$REPO_ROOT/.venv/bin/python"
-    "$py" - <<'PYCHECK' || die "required Python imports failed"
-import fastapi, numpy, uvicorn
-print("  web runtime Python imports OK")
-PYCHECK
-
-    if [[ "$INSTALL_STRIQT" != "no" ]]; then
-        "$py" - <<'PYCHECK' || die "striqt is not importable in .venv"
-import striqt
-from striqt.sensor import specs
-print("  striqt.sensor import OK")
-PYCHECK
-    fi
-
-    if [[ "$DEVICE" != "demo" ]]; then
-        "$py" - <<'PYCHECK' || die "SoapySDR Python bindings are unavailable in .venv"
-import SoapySDR
-print("  SoapySDR Python import OK")
-PYCHECK
-        command -v SoapySDRUtil >/dev/null \
-            || die "SoapySDRUtil is missing after installation"
-    fi
-
-    if [[ "$DEVICE" == "pluto" ]]; then
-        SoapySDRUtil --info 2>&1 | grep -qiE 'pluto|libiio' \
-            || die "Pluto selected, but SoapyPlutoSDR is not installed. It is not packaged before Debian forky — build it from source (github.com/pothosware/SoapyPlutoSDR, needs libiio-dev + libad9361-dev + cmake) and re-run setup.sh"
-    elif [[ "$DEVICE" == "driver=uhd" || "$DEVICE" == driver=uhd,serial=* ]]; then
-        SoapySDRUtil --info 2>&1 | grep -qiE 'uhd|usrp' \
-            || die "USRP selected, but the SoapyUHD driver is not installed"
-        # Without images the device enumerates and then refuses to open, which
-        # surfaces much later as an opaque streaming failure. Say it here.
-        if ! uhd_images_present; then
-            if [[ $SKIP_HARDWARE_CHECK -eq 1 ]]; then
-                warn "UHD firmware/FPGA images are absent; the USRP will not open"
-                warn "until you run: sudo uhd_images_downloader"
-            else
-                die "UHD firmware/FPGA images are absent — a USRP cannot open without them. Run: sudo uhd_images_downloader"
-            fi
-        fi
-    elif [[ "$DEVICE" == air* ]]; then
-        SoapySDRUtil --info 2>&1 | grep -qi 'SoapyAIRT' \
-            || die "Deepwave selected, but proprietary SoapyAIRT is absent. Use the Deepwave AIR-T software image/installer, then rerun setup.sh"
-    fi
-    if [[ "$MODE" == "kiosk" ]]; then
-        command -v chromium >/dev/null || command -v chromium-browser >/dev/null \
-            || die "kiosk browser executable is missing"
-        systemctl is-enabled --quiet lightdm \
-            || die "kiosk display manager is not enabled"
-    fi
-}
-
-qualify_hardware() {
-    [[ $SKIP_HARDWARE_CHECK -eq 0 ]] || {
-        warn "hardware qualification skipped by request"
-        return 0
-    }
-    local selector="$DEVICE"
-    local py="$REPO_ROOT/.venv/bin/python"
-    say "Running short end-to-end ${selector} qualification…"
-    if [[ "$selector" == "demo" ]]; then
-        "$py" "$REPO_ROOT/live/tools/hardware_qual.py" --demo --quick --timeout 10
-    else
-        timeout 180s runuser -u "$SERVICE_USER" -- \
-            "$py" "$REPO_ROOT/live/tools/hardware_qual.py" \
-            --device "$selector" --quick --timeout 10 \
-            || die "radio qualification failed; connect/power the selected radio, inspect SoapySDRUtil --find, or provision with --skip-hardware-check"
-    fi
-}
-
-stop_existing_service() {
-    if [[ $HAVE_SYSTEMD -eq 1 && $IS_ROOT -eq 1 ]] \
-            && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        WAS_SERVICE_ACTIVE=1
-        say "Stopping existing $SERVICE_NAME during installation/qualification…"
-        systemctl stop "$SERVICE_NAME"
-    fi
-}
-
-# ── 3. Interactive questions ────────────────────────────────────────────────
-ask_tui() {
-    [[ $ASSUME_DEFAULTS -eq 1 ]] && return 0
-    if command -v whiptail >/dev/null && [[ -t 0 ]]; then
-        MODE=$(whiptail --title "Radio viewer setup" --nocancel --menu \
-            "Default mode (started on boot / by 'systemctl start radio-web'):" \
-            18 72 5 \
-            web      "Web server on the existing network (default)" \
-            hotspot  "Web server + own Wi-Fi access point (no internet needed)" \
-            ethernet "Web server + plug-and-play Ethernet (laptop direct)" \
-            kiosk    "Web UI fullscreen on the radio's own display" \
-            terminal "No service — run the curses monitor manually" \
-            3>&1 1>&2 2>&3) || true
-        PORT=$(whiptail --title "Port" --nocancel --inputbox \
-            "Web server port:" 9 50 "$PORT" 3>&1 1>&2 2>&3) || true
-        MDNS_HOST=$(whiptail --title "Hostname" --nocancel --inputbox \
-            "mDNS hostname (reach the radio at <name>.local):" 9 60 \
-            "$MDNS_HOST" 3>&1 1>&2 2>&3) || true
-        DEVICE=$(whiptail --title "Radio" --nocancel --menu \
-            "Which radio will this host drive?" 18 64 7 \
-            auto     "Auto-detect one attached SoapySDR radio (default)" \
-            uhd      "Ettus USRP B205mini/B2xx (UHD)" \
-            air8201b "AIR8201B (Deepwave AIR-T)" \
-            air7201b "AIR7201B" \
-            air7101b "AIR7101B" \
-            pluto    "PlutoSDR" \
-            demo     "Demo (synthetic IQ, no hardware)" \
-            3>&1 1>&2 2>&3) || true
-        if [[ "$MODE" == "hotspot" ]]; then
-            HOTSPOT_SSID=$(whiptail --nocancel --inputbox \
-                "Hotspot SSID:" 9 50 "$HOTSPOT_SSID" 3>&1 1>&2 2>&3) || true
-            HOTSPOT_PASS=$(whiptail --nocancel --passwordbox \
-                "Hotspot password (min 8 chars; empty = generate):" 9 60 \
-                3>&1 1>&2 2>&3) || true
-        fi
-        if whiptail --title "Autostart" --yesno \
-            "Enable the radio-web service to start on boot?" 8 55; then
-            AUTOSTART="yes"; else AUTOSTART="no"; fi
-    else
-        echo "(whiptail/tty unavailable — plain prompts; Enter accepts defaults)"
-        read -rp "Mode [web/hotspot/ethernet/kiosk/terminal] ($MODE): " a || true
-        MODE="${a:-$MODE}"
-        read -rp "Port ($PORT): " a || true;             PORT="${a:-$PORT}"
-        read -rp "mDNS hostname ($MDNS_HOST): " a || true; MDNS_HOST="${a:-$MDNS_HOST}"
-        read -rp "Device [auto default/uhd/air8201b/air7201b/air7101b/pluto/demo] ($DEVICE): " a || true
-        DEVICE="${a:-$DEVICE}"
-        read -rp "Autostart on boot? [yes/no] ($AUTOSTART): " a || true
-        AUTOSTART="${a:-$AUTOSTART}"
+        info "no GPS receiver attached — recordings will set gps_valid=0"
     fi
     return 0
 }
 
-# ── 4. Credentials + environment file ──────────────────────────────────────
-genpw() { openssl rand -hex 12 2>/dev/null || head -c24 /dev/urandom | base64 | tr -d '+/=' ; }
+# ── 10. Python environment ──────────────────────────────────────────────────
+# The venv is ISOLATED (no --system-site-packages). The old installer exposed
+# the distro's site-packages so the apt SoapySDR binding was importable, but
+# that dragged apt's numpy/scipy/matplotlib in alongside pip's: on this Pi the
+# system carried numpy 2.2.4 and apt's scipy was compiled against it, while
+# pip installed numpy 2.1.3 into the venv — a NumPy ABI mismatch that only
+# detonates deep inside an analysis call. Instead: isolate everything, then
+# link in the one module that genuinely has no wheel, SoapySDR.
+link_soapysdr() {
+    [[ "$RADIO_KIND" != "demo" ]] || return 0
+    local src_dir site f
+    src_dir="$(python3 -c 'import SoapySDR, os; print(os.path.dirname(SoapySDR.__file__))' 2>/dev/null || true)"
+    if [[ -z "$src_dir" ]]; then
+        warn "the system SoapySDR binding is not importable; real radios will not work"
+        return 0
+    fi
+    site="$("$VENV_PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+    # Debian ships SoapySDR.py + _SoapySDR*.so side by side; other builds (the
+    # AIR-T's pixi environment among them) ship it as a package directory.
+    # Link whichever shape is present.
+    if [[ -d "$src_dir" && -f "$src_dir/__init__.py" ]]; then
+        ln -sfn "$src_dir" "$site/$(basename "$src_dir")"
+        for f in "$(dirname "$src_dir")"/_SoapySDR*.so; do
+            [[ -e "$f" ]] && ln -sf "$f" "$site/$(basename "$f")"
+        done
+    else
+        for f in "$src_dir"/SoapySDR.py "$src_dir"/_SoapySDR*.so; do
+            [[ -e "$f" ]] || continue
+            ln -sf "$f" "$site/$(basename "$f")"
+        done
+    fi
+    "$VENV_PY" -c 'import SoapySDR' 2>/dev/null \
+        && ok "SoapySDR linked into the venv" \
+        || warn "SoapySDR still not importable inside the venv"
+    return 0
+}
+
+install_python() {
+    say "Building the Python environment"
+    local marker="$VENV/.linda-env-id" wanted current backup
+    wanted="$(
+        sha256sum "$REPO_ROOT/live/requirements.txt" "$REPO_ROOT/live/constraints.txt"
+        printf '%s\n' "$STRIQT_COMMIT" "$RADIO_KIND"
+        python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))'
+    )"
+    wanted="$(printf '%s' "$wanted" | sha256sum | awk '{print $1}')"
+    current="$(cat "$marker" 2>/dev/null || true)"
+    if [[ -d "$VENV" && "$current" != "$wanted" ]]; then
+        backup="$VENV.backup.$(date +%Y%m%d%H%M%S)"
+        info "existing venv does not match this configuration; moved to $backup"
+        mv "$VENV" "$backup"
+    fi
+    [[ -d "$VENV" ]] || python3 -m venv "$VENV"
+    "$VENV_PY" -m pip install --upgrade -q pip setuptools wheel \
+        || die "could not bootstrap pip in the venv"
+    link_soapysdr
+
+    say "Installing striqt 0.7.0 (${STRIQT_COMMIT:0:7}) and the web runtime"
+    info "this is the slow step — several minutes on a Pi"
+    # One transaction so pip resolves numpy/pandas/xarray/zarr/striqt/FastAPI
+    # against each other exactly once.
+    "$VENV_PY" -m pip install --upgrade \
+        -r "$REPO_ROOT/live/requirements.txt" \
+        -c "$REPO_ROOT/live/constraints.txt" \
+        "striqt @ git+https://github.com/usnistgov/striqt@${STRIQT_COMMIT}" \
+        || die "Python dependency installation failed (transcript: $LOG_FILE)"
+    printf '%s\n' "$wanted" > "$marker"
+    [[ $IS_ROOT -eq 1 ]] && chown -R "$SERVICE_USER:$SERVICE_USER" "$VENV"
+    ok "Python environment ready"
+    return 0
+}
+
+# Offline plot assets: the repo vendors uPlot so hotspot/ethernet modes never
+# reach for a CDN. Restore it if it went missing, and verify what we ship.
+install_web_assets() {
+    local dir="$REPO_ROOT/live/web/vendor"
+    mkdir -p "$dir"
+    [[ -s "$dir/uPlot.min.js" ]] || curl -fsSL \
+        https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js -o "$dir/uPlot.min.js"
+    [[ -s "$dir/uPlot.min.css" ]] || curl -fsSL \
+        https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css -o "$dir/uPlot.min.css"
+    echo "2d27e8ad3d228164525ce213f9dc716f39b4e3aee0cc773fb3491c96cf4921a2  $dir/uPlot.min.js" \
+        | sha256sum -c - >/dev/null || die "uPlot JS asset missing or corrupt"
+    echo "df630c6a8d6f8eeaff264b50f73ce5b114f646ffd9a0bb74f049b0a00135fa04  $dir/uPlot.min.css" \
+        | sha256sum -c - >/dev/null || die "uPlot CSS asset missing or corrupt"
+    return 0
+}
+
+# ── 11. Proof that it works ─────────────────────────────────────────────────
+verify_software() {
+    say "Verifying the installation"
+    "$VENV_PY" - <<'PY' || die "the web runtime is not importable"
+import fastapi, numpy, uvicorn
+print(f"    fastapi {fastapi.__version__}  uvicorn {uvicorn.__version__}  numpy {numpy.__version__}")
+PY
+    "$VENV_PY" - <<'PY' || die "striqt is not importable — the radio pipeline cannot run"
+import striqt
+from striqt.sensor import specs
+print(f"    striqt {getattr(striqt, '__version__', '?')} + striqt.sensor")
+PY
+    ( cd "$REPO_ROOT" && "$VENV_PY" -c '
+import sys; sys.path.insert(0, "live")
+import core
+print("    live/core imports clean")
+' ) || die "live/core failed to import"
+    ok "software verified"
+    return 0
+}
+
+verify_radio() {
+    # Guard on the SELECTOR, not the detected kind: when nothing was found we
+    # deliberately configured demo, and reporting that as a radio failure
+    # would be wrong.
+    [[ "$DEVICE" != "demo" ]] || { RADIO_CHECK_STATUS="demo (no hardware)"; return 0; }
+    if [[ $SKIP_RADIO_CHECK -eq 1 ]]; then
+        RADIO_CHECK_STATUS="skipped by request"
+        warn "radio check skipped"
+        return 0
+    fi
+    say "Talking to the radio"
+    local found
+    found="$( cd "$REPO_ROOT" && UHD_IMAGES_DIR="${UHD_IMAGES_PATH:-}" "$VENV_PY" -c '
+import sys; sys.path.insert(0, "live")
+from core import devices
+try:
+    rows = devices.discover()
+except RuntimeError as e:
+    print("ERR", e); raise SystemExit
+for r in rows:
+    print("HIT", r["device"], r["label"])
+' 2>/dev/null | grep '^HIT' || true )"
+    if [[ -z "$found" ]]; then
+        RADIO_CHECK_STATUS="FAILED — no radio enumerated"
+        warn "SoapySDR enumerated no radios."
+        warn "Check power/cabling, then:  SoapySDRUtil --find"
+        return 0
+    fi
+    info "enumerated:"
+    printf '%s\n' "$found" | sed 's/^HIT /      /'
+
+    # Enumeration only proves the driver loaded. Capture proves the whole
+    # path — open, tune, stream, and echo the setting back in a frame header.
+    # UHD_IMAGES_DIR is passed explicitly: the qualification runs as the
+    # service user, who does not inherit this shell's exports. It is only set
+    # when we actually found images — pointing UHD at an empty or bogus path
+    # is worse than leaving it to its own search.
+    local -a runner=(timeout 240s runuser -u "$SERVICE_USER" --)
+    if [[ -n "$UHD_IMAGES_PATH" ]]; then
+        runner+=(env "UHD_IMAGES_DIR=$UHD_IMAGES_PATH")
+    fi
+    if "${runner[@]}" \
+            "$VENV_PY" "$REPO_ROOT/live/tools/hardware_qual.py" \
+            --device "$DEVICE" --quick --timeout 15; then
+        RADIO_CHECK_STATUS="passed (captured and verified)"
+        ok "the radio streams and settings apply"
+    else
+        RADIO_CHECK_STATUS="FAILED — enumerated but did not capture"
+        warn "the radio enumerated but the capture test failed (see above)"
+    fi
+    return 0
+}
+
+# ── 12. Service configuration ───────────────────────────────────────────────
+genpw() { openssl rand -hex 12 2>/dev/null || head -c24 /dev/urandom | base64 | tr -d '+/='; }
 
 write_env_file() {
-    [[ $IS_ROOT -eq 1 ]] || { warn "not root — skipping $ENV_FILE"; return 0; }
-    say "Writing $ENV_FILE (username-only role login + signed sessions)…"
+    [[ $IS_ROOT -eq 1 ]] || return 0
+    say "Writing $ENV_FILE"
     mkdir -p "$ENV_DIR"
     local secret
     if [[ -f "$ENV_FILE" ]] && grep -q RADIO_SESSION_SECRET "$ENV_FILE"; then
-        echo "  existing session-signing secret kept"
-        # Refresh mode/device settings, migrate old files away from passwords,
-        # and retain any customized role usernames.
-        sed -i -e "s/^RADIO_MODE=.*/RADIO_MODE=\"$MODE\"/" \
-               -e "s/^RADIO_PORT=.*/RADIO_PORT=\"$PORT\"/" \
-               -e "s/^RADIO_DEVICE=.*/RADIO_DEVICE=\"$DEVICE\"/" \
-               -e '/^\(ADMIN\|VIEWER\|INTERN\)_PASS=/d' "$ENV_FILE"
-        grep -q '^ADMIN_USER=' "$ENV_FILE" || echo 'ADMIN_USER="admin"' >> "$ENV_FILE"
-        grep -q '^VIEWER_USER=' "$ENV_FILE" || echo 'VIEWER_USER="viewer"' >> "$ENV_FILE"
-        grep -q '^INTERN_USER=' "$ENV_FILE" || echo 'INTERN_USER="intern"' >> "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
-        return 0
+        secret="$(grep '^RADIO_SESSION_SECRET=' "$ENV_FILE" | cut -d'"' -f2)"
+        info "keeping the existing session-signing secret"
+    else
+        secret="$(openssl rand -hex 32 2>/dev/null || genpw)"
+        CREDS_NOTE="admin · viewer · intern  (username only, no password)"
     fi
-    secret="$(openssl rand -hex 32 2>/dev/null || genpw)"
     cat > "$ENV_FILE" <<EOF
-# Generated by setup.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ) — mode/creds for radio-web.
-# Edit + 'systemctl restart radio-web' to apply. chmod 600 — keep it that way.
-# Values are quoted for systemd EnvironmentFile parsing.
+# Generated by LINDA setup.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ).
+# Edit, then: systemctl restart $SERVICE_NAME.  Keep this file mode 0600.
 RADIO_MODE="$MODE"
 RADIO_PORT="$PORT"
 RADIO_DEVICE="$DEVICE"
@@ -709,15 +738,89 @@ VIEWER_USER="viewer"
 INTERN_USER="intern"
 RADIO_SESSION_SECRET="$secret"
 EOF
+    # UHD locates a B2xx FPGA image through this variable. Debian's downloader
+    # and Debian's libuhd disagree about the default path, so state it.
+    [[ -n "$UHD_IMAGES_PATH" ]] && echo "UHD_IMAGES_DIR=\"$UHD_IMAGES_PATH\"" >> "$ENV_FILE"
     chmod 600 "$ENV_FILE"
-    CREDS_NOTE="admin (admin role)   viewer (viewer role)   intern (intern role)"
+    ok "service configuration written"
+    return 0
 }
 
-# ── 5. systemd unit + sudoers + mDNS ───────────────────────────────────────
+setup_network() {
+    [[ $IS_ROOT -eq 1 ]] || return 0
+    case "$MODE" in
+      hotspot|ethernet) ;;
+      *) return 0 ;;
+    esac
+    apt_install network-manager || die "$MODE mode needs NetworkManager"
+    command -v nmcli >/dev/null 2>&1 || die "nmcli missing after installing NetworkManager"
+    systemctl enable --now NetworkManager >/dev/null 2>&1 || true
+    if systemctl is-active --quiet dhcpcd 2>/dev/null; then
+        info "disabling dhcpcd (it conflicts with NetworkManager)"
+        systemctl disable --now dhcpcd || true
+        REBOOT_REQUIRED=1
+    fi
+    if [[ "$MODE" == "hotspot" ]]; then
+        local wifi
+        wifi="$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="wifi"{print $1; exit}')"
+        [[ -n "$wifi" ]] || die "no Wi-Fi interface for hotspot mode"
+        [[ -n "$HOTSPOT_PASS" ]] || HOTSPOT_PASS="$(genpw)"
+        (( ${#HOTSPOT_PASS} >= 8 )) || die "hotspot password must be 8-63 characters"
+        say "Configuring the Wi-Fi access point on $wifi"
+        nmcli connection delete radio-hotspot >/dev/null 2>&1 || true
+        nmcli connection add type wifi ifname "$wifi" con-name radio-hotspot \
+            autoconnect yes ssid "$HOTSPOT_SSID" \
+            802-11-wireless.mode ap 802-11-wireless.band bg \
+            ipv4.method shared wifi-sec.key-mgmt wpa-psk \
+            wifi-sec.psk "$HOTSPOT_PASS" >/dev/null \
+            || die "NetworkManager rejected the hotspot profile"
+        HOTSPOT_NOTE="SSID $HOTSPOT_SSID   password $HOTSPOT_PASS   http://10.42.0.1:$PORT"
+        REBOOT_REQUIRED=1
+    else
+        local eth
+        eth="$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="ethernet"{print $1; exit}')"
+        [[ -n "$eth" ]] || die "no Ethernet interface for shared-ethernet mode"
+        say "Configuring shared Ethernet on $eth"
+        nmcli connection delete radio-ethernet >/dev/null 2>&1 || true
+        nmcli connection add type ethernet ifname "$eth" con-name radio-ethernet \
+            autoconnect yes ipv4.method shared >/dev/null \
+            || die "NetworkManager rejected the shared-ethernet profile"
+        ETHERNET_NOTE="plug a laptop into $eth → http://10.42.0.1:$PORT"
+        REBOOT_REQUIRED=1
+    fi
+    return 0
+}
+
+install_kiosk() {
+    [[ "$MODE" == "kiosk" && $IS_ROOT -eq 1 ]] || return 0
+    say "Configuring kiosk display"
+    command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1 \
+        || apt_install chromium || apt_install chromium-browser \
+        || die "kiosk mode needs Chromium and this distribution has none"
+    apt_install xserver-xorg xinit openbox lightdm dbus-x11 \
+        || die "kiosk mode needs X, Openbox and LightDM"
+    install -d -m 0755 /etc/lightdm/lightdm.conf.d
+    cat > /etc/lightdm/lightdm.conf.d/50-radio-kiosk.conf <<EOF
+[Seat:*]
+autologin-user=$SERVICE_USER
+autologin-user-timeout=0
+user-session=openbox
+EOF
+    systemctl set-default graphical.target >/dev/null 2>&1 || true
+    systemctl enable lightdm >/dev/null 2>&1 || true
+    REBOOT_REQUIRED=1
+    ok "kiosk display configured"
+    return 0
+}
+
 install_service() {
-    [[ $IS_ROOT -eq 1 && $HAVE_SYSTEMD -eq 1 ]] || { warn "skipping systemd unit"; return 0; }
-    [[ "$MODE" == "terminal" ]] && { echo "  terminal mode — no service installed"; return 0; }
-    say "Installing systemd unit $UNIT_FILE…"
+    [[ $IS_ROOT -eq 1 && $HAVE_SYSTEMD -eq 1 ]] || { warn "no systemd — skipping the service"; return 0; }
+    if [[ "$MODE" == "terminal" ]]; then
+        info "terminal mode — no background service installed"
+        return 0
+    fi
+    say "Installing the $SERVICE_NAME service"
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$REPO_ROOT/recordings"
     sed -e "s|@REPO_ROOT@|$REPO_ROOT|g" \
         -e "s|@SERVICE_USER@|$SERVICE_USER|g" \
         -e "s|@SERVICE_UID@|$(id -u "$SERVICE_USER")|g" \
@@ -726,153 +829,114 @@ install_service() {
         "$REPO_ROOT/deploy/radio-web.service.template" > "$UNIT_FILE"
     chmod +x "$REPO_ROOT/deploy/run_service.sh"
     systemctl daemon-reload
-    say "Installing Reset-Radio sudoers rule…"
-    bash "$REPO_ROOT/live/install_radio_web_sudoers.sh" "$SERVICE_USER" "$SERVICE_NAME" \
-        || warn "sudoers install failed — the Reset Radio button won't work"
+    bash "$REPO_ROOT/live/install_radio_web_sudoers.sh" "$SERVICE_USER" "$SERVICE_NAME" >/dev/null \
+        || warn "sudoers rule failed — the Reset Radio button will not work"
+
+    # mDNS. Note we do NOT rename the machine unless asked: silently changing
+    # someone's hostname to "radio" is a hostile default.
     if [[ -n "$MDNS_HOST" ]]; then
-        say "mDNS: radio will be reachable at ${MDNS_HOST}.local"
-        hostnamectl set-hostname "$MDNS_HOST" 2>/dev/null \
-            || warn "could not set hostname (set it manually for ${MDNS_HOST}.local)"
-        # hostnamectl does not update /etc/hosts.  A stale 127.0.1.1 entry
-        # makes every subsequent sudo invocation print "unable to resolve
-        # host".  Replace the Debian host alias while keeping localhost/IPv6.
+        hostnamectl set-hostname "$MDNS_HOST" 2>/dev/null || warn "could not set the hostname"
         if grep -q '^127\.0\.1\.1[[:space:]]' /etc/hosts; then
             sed -i "s/^127\\.0\\.1\\.1.*/127.0.1.1 $MDNS_HOST/" /etc/hosts
         else
             printf '127.0.1.1 %s\n' "$MDNS_HOST" >> /etc/hosts
         fi
-        if [[ -d /etc/cloud/cloud.cfg.d ]]; then
-            cat > /etc/cloud/cloud.cfg.d/99-radio-hostname.cfg <<'EOF'
-# Managed by NIST-Omran setup.sh.
-preserve_hostname: true
-manage_etc_hosts: false
-EOF
-        fi
-        systemctl enable --now avahi-daemon 2>/dev/null || warn "avahi not available"
-    fi
-    # Open the port when UFW is enforcing (common on Ubuntu images).
-    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
-        ufw allow "$PORT/tcp" >/dev/null 2>&1 \
-            && echo "  ufw: allowed $PORT/tcp" \
-            || warn "could not add the ufw rule for $PORT/tcp"
-    fi
-    if [[ "$AUTOSTART" == "yes" ]]; then
-        systemctl enable "$SERVICE_NAME" >/dev/null
-        systemctl restart "$SERVICE_NAME"
-        echo "  service enabled + started"
     else
-        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
-        echo "  autostart disabled (start manually: systemctl start $SERVICE_NAME)"
+        MDNS_HOST="$(hostname -s)"
     fi
+    systemctl enable --now avahi-daemon >/dev/null 2>&1 || warn "avahi unavailable — .local will not resolve"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        ufw allow "$PORT/tcp" >/dev/null 2>&1 && info "ufw: opened $PORT/tcp" || true
+    fi
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE_NAME"
+    ok "service installed and started"
+    return 0
 }
 
-# ── 6. Network profiles (hotspot / plug-and-play ethernet) ─────────────────
-setup_network() {
-    [[ $IS_ROOT -eq 1 ]] || return 0
-    case "$MODE" in
-    hotspot)
-        [[ $HAVE_NMCLI -eq 1 ]] || die "hotspot needs NetworkManager (nmcli)"
-        local wifi_dev
-        wifi_dev="$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="wifi"{print $1; exit}')"
-        [[ -n "$wifi_dev" ]] || die "no Wi-Fi interface found for hotspot mode"
-        nmcli -f WIFI-PROPERTIES.AP device show "$wifi_dev" 2>/dev/null | grep -qi 'yes' \
-            || die "Wi-Fi interface $wifi_dev does not advertise access-point support"
-        [[ -n "$HOTSPOT_PASS" ]] || HOTSPOT_PASS="$(genpw)"
-        say "Configuring Wi-Fi access point '$HOTSPOT_SSID' on $wifi_dev…"
-        nmcli connection delete radio-hotspot >/dev/null 2>&1 || true
-        nmcli connection add type wifi ifname "$wifi_dev" con-name radio-hotspot \
-            autoconnect yes ssid "$HOTSPOT_SSID" \
-            802-11-wireless.mode ap 802-11-wireless.band bg \
-            ipv4.method shared wifi-sec.key-mgmt wpa-psk \
-            wifi-sec.psk "$HOTSPOT_PASS" >/dev/null
-        nmcli connection show radio-hotspot >/dev/null \
-            || die "NetworkManager did not retain the hotspot profile"
-        REBOOT_REQUIRED=1
-        HOTSPOT_NOTE="SSID: $HOTSPOT_SSID   password: $HOTSPOT_PASS   URL: http://10.42.0.1:$PORT"
-        ;;
-    ethernet)
-        [[ $HAVE_NMCLI -eq 1 ]] || die "ethernet mode needs NetworkManager (nmcli)"
-        local eth_dev
-        eth_dev="$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="ethernet"{print $1; exit}')"
-        [[ -n "$eth_dev" ]] || die "no ethernet interface found for shared-ethernet mode"
-        say "Configuring plug-and-play (shared) Ethernet on $eth_dev…"
-        # ipv4.method=shared: the radio serves DHCP on this port, so a directly
-        # connected laptop configures itself — open http://10.42.0.1:PORT (or
-        # http://<hostname>.local:PORT via mDNS).
-        nmcli connection delete radio-ethernet >/dev/null 2>&1 || true
-        nmcli connection add type ethernet ifname "$eth_dev" con-name radio-ethernet \
-            autoconnect yes ipv4.method shared >/dev/null
-        nmcli connection show radio-ethernet >/dev/null \
-            || die "NetworkManager did not retain the shared-ethernet profile"
-        REBOOT_REQUIRED=1
-        ETHERNET_NOTE="plug a laptop into $eth_dev and open http://10.42.0.1:$PORT (or http://${MDNS_HOST}.local:$PORT)"
-        ;;
-    esac
-}
-
-# ── 7. Health check ────────────────────────────────────────────────────────
 health_check() {
-    [[ "$MODE" == "terminal" ]] && return 0
-    [[ $HAVE_SYSTEMD -eq 1 && $IS_ROOT -eq 1 && "$AUTOSTART" == "yes" ]] || return 0
-    say "Post-install health check…"
-    for _ in $(seq 1 20); do
+    [[ "$MODE" != "terminal" ]] || return 0
+    [[ $IS_ROOT -eq 1 && $HAVE_SYSTEMD -eq 1 ]] || return 0
+    say "Waiting for the viewer to answer"
+    local i
+    for i in $(seq 1 30); do
         if curl -fsS "http://localhost:$PORT/health" >/dev/null 2>&1; then
-            curl -fsS "http://localhost:$PORT/health" | head -c 400; echo
-            echo "  HEALTHY."
+            ok "$(curl -fsS "http://localhost:$PORT/health" | head -c 200)"
             return 0
         fi
         sleep 1
     done
-    systemctl --no-pager --full status "$SERVICE_NAME" 2>&1 | tail -30 >&2 || true
-    journalctl -u "$SERVICE_NAME" -n 80 --no-pager >&2 || true
-    die "service did not answer /health in 20 seconds"
+    journalctl -u "$SERVICE_NAME" -n 60 --no-pager >&2 || true
+    die "the service did not answer /health within 30 seconds"
+}
+
+stop_existing_service() {
+    if [[ $HAVE_SYSTEMD -eq 1 && $IS_ROOT -eq 1 ]] \
+            && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        WAS_SERVICE_ACTIVE=1
+        systemctl stop "$SERVICE_NAME"
+        info "stopped the running $SERVICE_NAME for the duration of setup"
+    fi
+    return 0
 }
 
 # ── main ────────────────────────────────────────────────────────────────────
 if [[ $DEPS_ONLY -eq 1 ]]; then
-    install_python_deps
-    DEVICE=demo verify_install
+    RADIO_KIND="demo"
+    install_python
+    install_web_assets
+    verify_software
     SETUP_COMPLETE=1
+    say "Dependencies installed."
+    echo "    demo:  ./.venv/bin/python live/striqt_web_server.py --demo"
     exit 0
 fi
 
-bootstrap_prompter
-ask_tui
-normalize_device_selector
-validate_configuration
-stop_existing_service
-install_system_deps
-install_radio_permissions
+preflight
+install_base                 # lsusb must exist before we can detect anything
+detect_radio
+ask_questions
+resolve_selector
+install_soapy_core
+install_radio_driver
+install_udev_rules
 install_gps
-install_python_deps
-verify_install
-qualify_hardware
+install_kiosk
+install_python
+install_web_assets
+stop_existing_service
+verify_software
+verify_radio
 write_env_file
 setup_network
 install_service
 health_check
 
-say "Setup complete."
-echo "  mode:      $MODE"
-echo "  device:    $DEVICE"
-[[ "$MODE" != "terminal" ]] && echo "  URL:       http://${MDNS_HOST}.local:$PORT  (or the host's IP)"
-[[ -n "${CREDS_NOTE:-}" ]]    && echo "  logins:    $CREDS_NOTE"
-[[ -n "${HOTSPOT_NOTE:-}" ]]  && echo "  hotspot:   $HOTSPOT_NOTE"
-[[ -n "${ETHERNET_NOTE:-}" ]] && echo "  ethernet:  $ETHERNET_NOTE"
-echo "  login:      enter admin, viewer, or intern as the username; no password"
-echo "  logs:      journalctl -u $SERVICE_NAME -f"
-if command -v gpspipe >/dev/null 2>&1; then
-    if timeout 6 gpspipe -w -n 12 2>/dev/null | grep -q '"class":"TPV"'; then
-        echo "  gps:       receiver reporting — recordings will carry coordinates"
-    else
-        echo "  gps:       no fix yet (recordings record gps_valid=0). Check with:"
-        echo "             curl -s -u admin: http://localhost:$PORT/gps"
-    fi
-fi
-echo "  terminal:  ./.venv/bin/python live/striqt_standalone_terminal.py --demo"
-if [[ -e /var/run/reboot-required ]]; then REBOOT_REQUIRED=1; fi
-if [[ $REBOOT_REQUIRED -eq 1 ]]; then
-    echo "  reboot:    REQUIRED (udev/groups/network/display or package updates changed)"
-    echo "             sudo reboot"
-fi
 SETUP_COMPLETE=1
+printf '\n\033[1;32m╔══════════════════════════════════════════════════╗\033[0m\n'
+printf '\033[1;32m║  LINDA is installed and running                  ║\033[0m\n'
+printf '\033[1;32m╚══════════════════════════════════════════════════╝\033[0m\n'
+echo "    open        http://${MDNS_HOST}.local:$PORT     (or this host's IP)"
+echo "    sign in as  admin        — username only, no password"
+echo "    radio       $DEVICE  ($RADIO_LABEL)"
+echo "    radio check $RADIO_CHECK_STATUS"
+echo "    mode        $MODE"
+[[ -n "${HOTSPOT_NOTE:-}" ]]  && echo "    hotspot     $HOTSPOT_NOTE"
+[[ -n "${ETHERNET_NOTE:-}" ]] && echo "    ethernet    $ETHERNET_NOTE"
+echo "    logs        journalctl -u $SERVICE_NAME -f"
+echo "    transcript  $LOG_FILE"
+if [[ "$RADIO_CHECK_STATUS" == FAILED* ]]; then
+    printf '\n\033[1;33m    The software is installed, but the radio did not pass its check.\n'
+    printf '    The UI will load; live data will not until the radio works.\n'
+    printf '    Diagnose with:  SoapySDRUtil --find\033[0m\n'
+fi
+if [[ "$DEVICE" == "demo" && "$RADIO_KIND" != "demo" ]]; then
+    printf '\n\033[1;33m    No radio was detected, so demo mode was configured.\n'
+    printf '    Plug the radio in and re-run: sudo bash setup.sh\033[0m\n'
+fi
+[[ -e /var/run/reboot-required ]] && REBOOT_REQUIRED=1
+if [[ $REBOOT_REQUIRED -eq 1 ]]; then
+    printf '\n\033[1;33m    A reboot is required (USB buffer / groups / network / display).\n'
+    printf '    sudo reboot\033[0m\n'
+fi
+echo
