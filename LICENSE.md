@@ -1,6 +1,6 @@
 # NIST Software Licensing Statement
 
-NIST-developed software is provided by NIST as a public service.
+NIST-developed software is provided by the National Institute of Standards and Technology (NIST) as a public service.
 You may use, copy, and distribute copies of the software in any
 medium, provided that you keep intact this entire notice. You may
 improve, modify, and create derivative works of the software or
