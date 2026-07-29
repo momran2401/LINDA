@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # core.striqt_compat (imported first, via the package) handles the AIR-T pixi
 # LD_LIBRARY_PATH re-exec before any scipy/striqt import.
-from core import devices, health, state
+from core import devices, gps, health, state
 from core.acquisition import Acquirer, Computer, DemoAcquirer
 from core.config import SharedConfig
 from core.constants import BACKENDS, CALIBRATED_GRID_BACKENDS, DEVICE_PROFILES
@@ -640,12 +640,20 @@ async def preset_apply_endpoint(preset_id: str, request: Request):
         return JSONResponse({"error": str(exc)}, status_code=400)
 
 
+@app.get("/gps")
+async def gps_status_endpoint():
+    """Current GPS fix. Recordings stamp every capture with this (or with
+    gps_valid=0 when there is no fix) — check it BEFORE a long run."""
+    return JSONResponse(_json_safe({"gps": gps.status()}))
+
+
 @app.get("/record")
 async def record_status_endpoint():
     """Recording state plus a form seed derived from the current live view."""
     return JSONResponse(_json_safe({
         "recording": _recording.status(),
         "defaults": _recording.defaults(),
+        "gps": gps.status(),
         "config": current_config(),
     }))
 

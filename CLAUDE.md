@@ -152,6 +152,28 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   `compute_blocks` substitutes quicklook (disclosed) when striqt is absent —
   a striqt-less host must never freeze in a compute-error loop.
 
+## GPS position in recordings (`core/gps.py`)
+
+- The radios run gpsd on localhost:2947. `GpsReader` is a stdlib socket client
+  (the pixi env has NO python `gps` module) held process-wide; it reconnects
+  with backoff and tracks fix staleness. gpsd 3.17 emits `alt`; 3.20+ splits it
+  into `altMSL`/`altHAE` — all three are accepted.
+- `gps_peripherals_class()` builds the striqt `Peripherals` subclass that
+  `sweep_runner` uses in place of `NoPeripherals`. striqt merges `acquire()`'s
+  dict into each capture's `extra_data`, which becomes per-capture variables in
+  the archived Dataset (`compute/datasets.py` broadcasts scalars along the
+  capture dim). Fields: `gps_{latitude_deg,longitude_deg,altitude_m,fix_mode,
+  satellites_used,time_unix,fix_age_s,error_horizontal_m,error_vertical_m,valid}`.
+- **No fix ⇒ NaN + `gps_valid=0`, never 0.0/0.0** — null-island coordinates in a
+  research dataset are worse than an honest gap. A 2-D fix records position but
+  NaN altitude. `acquire()` only reads a cached snapshot, so a wedged receiver
+  can never slow or fail a sweep.
+- `GET /gps` and the Record tab show the live fix (and name WHY it isn't valid:
+  daemon unreachable / no device attached / no fix yet / stale). `RADIO_GPS=0`
+  disables the integration; `RADIO_GPS_HOST`/`RADIO_GPS_PORT` relocate gpsd.
+- Recordings therefore embed the precise site location — relevant to any
+  data-release decision (see the recordings note below).
+
 ## Recording (Record tab → `core/recording.py` → `sweep_runner.py`)
 
 - The live viewer opens the radio **gapless** (`core/devices/sources.py`), where

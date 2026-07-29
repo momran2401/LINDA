@@ -758,3 +758,4 @@ body:not(.mode-ahawi) .ahawi-only { display: none !important; }
             cursor: pointer; }
 #ahawi-apply.staged { border-color: var(--accent); color: var(--accent);
                       box-shadow: 0 0 0 1px var(--accent) inset; }
+#gps-status.gps-bad { color: #ffb74d; }

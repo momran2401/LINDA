@@ -4,7 +4,13 @@
     {
       "name": "radio-demo",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["live/striqt_web_server.py", "--demo", "--port", "8092", "--quantize"],
+      "runtimeArgs": [
+        "live/striqt_web_server.py",
+        "--demo",
+        "--port",
+        "8092",
+        "--quantize"
+      ],
       "port": 8092
     }
   ]

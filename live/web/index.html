@@ -118,6 +118,7 @@
                 <button id="ahawi-apply" title="Apply the staged capture length / segment duration / alignment and start a fresh capture">Apply</button>
             </div>
 
+
             <label class="ctrl-row">Analysis
                 <select id="analysis-sel">
                     <option value="spectrogram" selected>Spectrogram</option>
@@ -162,6 +163,9 @@
         <section class="rail-panel pro-only admin-only" data-panel="record">
             <h3 class="settings-h">Record current view</h3>
             <div id="record-summary" class="record-summary">Loading current settings…</div>
+            <!-- GPS stamps every capture in the archive; check the fix BEFORE
+                 committing to a long run. -->
+            <div id="gps-status" class="record-summary" title="Position written into every capture of the recording">GPS: checking…</div>
             <label class="record-field">Center (MHz)<input id="record-center" type="number" step="0.001"></label>
             <label class="record-field">Rate (MS/s)<input id="record-rate" type="number" step="0.01"></label>
             <label class="record-field">Gain (dB)<input id="record-gain" type="number" step="0.1"></label>

@@ -754,11 +754,50 @@ function updateRecordingUI(rec) {
     if (stop) stop.disabled = !active || rec.state === "stopping";
 }
 
+// GPS fix shown in the Record panel: recordings stamp every capture with this
+// (gps_valid=0 when there is no fix), so it must be checkable BEFORE a run.
+function updateGpsStatus(g) {
+    const el = document.getElementById("gps-status");
+    if (!el) return;
+    if (!g) { el.textContent = "GPS: unknown"; return; }
+    if (!g.enabled) { el.textContent = "GPS: disabled — captures record gps_valid=0"; return; }
+    if (g.valid) {
+        // NaN serializes to null, and isFinite(null) is TRUE in JS (Number(null)
+        // is 0) — a 2-D fix would otherwise claim an altitude of "0 m".
+        const num = (v) => typeof v === "number" && isFinite(v);
+        const alt = num(g.altitude_m) ? `, ${g.altitude_m.toFixed(0)} m` : "";
+        const sats = g.satellites_used != null ? ` · ${g.satellites_used} sats` : "";
+        const acc = num(g.error_horizontal_m) ? ` · ±${g.error_horizontal_m.toFixed(1)} m` : "";
+        el.textContent = `GPS: ${g.mode}-D fix — ${g.latitude.toFixed(5)}, ` +
+                         `${g.longitude.toFixed(5)}${alt}${sats}${acc}`;
+        el.classList.remove("gps-bad");
+        return;
+    }
+    // Every not-valid case names itself: the operator should know whether to
+    // wait for satellites or go fix the daemon.
+    let why;
+    if (!g.connected) why = `gpsd unreachable${g.error ? " (" + g.error + ")" : ""}`;
+    else if (g.error) why = g.error;
+    else if (g.stale) why = `fix is stale (${g.age_s}s old)`;
+    else if (g.mode <= 1) why = "no fix yet — receiver needs sky view";
+    else why = "no position";
+    el.textContent = `GPS: ${why} — captures will record gps_valid=0`;
+    el.classList.add("gps-bad");
+}
+
+async function refreshGpsStatus() {
+    try {
+        const r = await fetch("/gps", {cache: "no-store"});
+        if (r.ok) updateGpsStatus((await r.json()).gps);
+    } catch (_) { /* transient; the panel keeps its last text */ }
+}
+
 async function loadRecordingPanel() {
     const r = await fetch("/record", {cache: "no-store"});
     if (!r.ok) throw new Error(`record status HTTP ${r.status}`);
     const data = await r.json();
     updateRecordingUI(data.recording);
+    updateGpsStatus(data.gps);
     if (recordingSeeded) return;
     recordingSeeded = true;
     const d = data.defaults || {};
@@ -775,6 +814,15 @@ async function loadRecordingPanel() {
 
 document.querySelector('.rail-tab[data-tab="record"]')?.addEventListener("click", () => {
     loadRecordingPanel().catch(e => logMsg(e.message, "ERROR"));
+    // A fix can arrive (or drop) while the panel is open — keep it live while
+    // the operator is deciding whether to start a run.
+    refreshGpsStatus();
+    if (!window._gpsTimer) {
+        window._gpsTimer = setInterval(() => {
+            const panel = document.querySelector('.rail-panel[data-panel="record"]');
+            if (panel && panel.classList.contains("active")) refreshGpsStatus();
+        }, 5000);
+    }
 });
 document.getElementById("record-start")?.addEventListener("click", async () => {
     const durationText = document.getElementById("record-duration").value.trim();
