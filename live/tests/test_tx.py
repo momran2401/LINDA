@@ -179,6 +179,32 @@ class FakeDevice:
         raise RuntimeError("no status")
 
 
+class TriggerBoundDevice(FakeDevice):
+    """Reproduces the AIR8201B's real refusal.
+
+    Observed on hardware: AirStack's SoapyAIRT arms every stream from ONE FPGA
+    trigger block, so `setupStream(SOAPY_SDR_TX)` raises
+    "Trigger in use, can't set up new stream!" while the live RX stream exists.
+    `release_trigger` models whether merely DEACTIVATING the RX stream is
+    enough (it is not on the real radio — the stream has to be closed).
+    """
+
+    def __init__(self, release_on_deactivate=False, **kw):
+        super().__init__(**kw)
+        self.rx_stream_open = True
+        self.release_on_deactivate = release_on_deactivate
+        self.setup_attempts = 0
+        self.stream_args = None
+
+    def setupStream(self, d, fmt, chans, args=None):
+        self.setup_attempts += 1
+        if self.rx_stream_open:
+            raise RuntimeError("Trigger in use, can't set up new stream!")
+        self.stream_args = args
+        self.calls.append(("setupStream", tuple(chans)))
+        return "stream"
+
+
 class FakeSource:
     def __init__(self, device):
         self._device = device
@@ -197,6 +223,24 @@ class FakeAcquirer:
     def __init__(self, device):
         self.source = FakeSource(device) if device else None
         self.shared = FakeShared()
+        self.paused = 0
+        self.resumed = 0
+
+    def pause_and_release(self, timeout=10.0):
+        """Mirrors Acquirer's pause path: closes the RX stream but KEEPS the
+        device initialized (source.close() would deinitialize the AIR-T's
+        AD9371 management sensors for the life of the process)."""
+        self.paused += 1
+        dev = self.source._device if self.source else None
+        if isinstance(dev, TriggerBoundDevice):
+            dev.rx_stream_open = False
+        return True
+
+    def resume(self):
+        self.resumed += 1
+        dev = self.source._device if self.source else None
+        if isinstance(dev, TriggerBoundDevice):
+            dev.rx_stream_open = True
 
 
 @pytest.fixture
@@ -355,6 +399,105 @@ def test_demo_mode_is_simulated_and_injects_a_visible_carrier():
     assert abs(off - 2e6) < 1.0 and amp == txmod.DEFAULT_AMPLITUDE
     ctl.stop()
     assert ctl.demo_injection() is None
+
+
+# ---------------------------------------------------------------------------
+# The AIR-T trigger conflict: one FPGA trigger, two streams that both want it
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def trigger_bound(monkeypatch):
+    dev = TriggerBoundDevice()
+    ctl = txmod.TxController()
+    ctl.bind(FakeAcquirer(dev), demo=False)
+    monkeypatch.setattr(txmod, "_soapy", lambda: object())
+    monkeypatch.setattr(txmod, "_tx_dir", lambda: 0)
+    ctl.acknowledge("admin")
+    return ctl, dev
+
+
+def test_full_duplex_radio_never_disturbs_the_live_view(controller):
+    """A driver that allows both streams must not cost the viewer anything."""
+    ctl, _dev = controller
+    ctl.acknowledge("admin")
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6})
+    assert _wait_state(ctl, "transmitting")
+    assert ctl.status()["plan"]["rx_mode"] == txmod.TX_COEXIST
+    assert ctl._acquirer.paused == 0
+    ctl.stop()
+
+
+def test_trigger_conflict_falls_back_to_releasing_the_receiver(trigger_bound):
+    """The real AIR8201B failure: TX setup is refused while RX holds the
+    trigger. The transmission must still happen — by handing the radio over
+    the same way a recording does — and must say that it did."""
+    ctl, dev = trigger_bound
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6})
+    assert _wait_state(ctl, "transmitting")
+    status = ctl.status()
+    assert status["plan"]["rx_mode"] == txmod.TX_RX_RELEASED
+    assert "LIVE VIEW IS DOWN" in status["plan"]["rx_note"]
+    assert ctl._acquirer.paused == 1
+    assert dev.setup_attempts >= 2        # it tried the cheap rungs first
+    ctl.stop()
+
+
+def test_the_receiver_comes_back_after_the_transmission(trigger_bound):
+    """Whatever the ladder took away it has to give back — including on the
+    failure path, or one transmission leaves the viewer dark forever."""
+    ctl, dev = trigger_bound
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "duration_s": 0.3})
+    assert _wait_state(ctl, "idle", timeout=8)
+    assert ctl._acquirer.resumed == 1
+    assert dev.rx_stream_open is True
+    assert dev.closed is True             # TX stream released the trigger
+
+
+def test_tx_stream_is_closed_before_the_receiver_is_restored(trigger_bound):
+    """Ordering matters: the TX stream holds the very trigger the RX stream
+    needs back, so resuming first would just move the conflict."""
+    ctl, dev = trigger_bound
+    order = []
+    real_close = dev.closeStream
+    dev.closeStream = lambda s: (order.append("tx_closed"), real_close(s))[1]
+    real_resume = ctl._acquirer.resume
+    ctl._acquirer.resume = lambda: (order.append("rx_resumed"), real_resume())[1]
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "duration_s": 0.3})
+    assert _wait_state(ctl, "idle", timeout=8)
+    assert order == ["tx_closed", "rx_resumed"]
+
+
+def test_deepwave_tx_buffer_size_arg_is_passed(trigger_bound):
+    """Deepwave's own TX example passes tx_buffer_size; drivers that don't
+    know the key ignore it."""
+    ctl, dev = trigger_bound
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "duration_s": 0.3})
+    assert _wait_state(ctl, "idle", timeout=8)
+    assert dev.stream_args and "tx_buffer_size" in dev.stream_args
+
+
+def test_a_bad_request_fails_fast_instead_of_dropping_the_receiver():
+    """Only a RESOURCE conflict may escalate. A driver rejecting the request
+    itself must not cost the operator their live view."""
+    dev = TriggerBoundDevice()
+
+    def refuse(d, fmt, chans, args=None):
+        raise RuntimeError("invalid channel index")
+
+    dev.setupStream = refuse
+    ctl = txmod.TxController()
+    ctl.bind(FakeAcquirer(dev), demo=False)
+    ctl.acknowledge("admin")
+    import core.tx as _t
+    orig_soapy, orig_dir = _t._soapy, _t._tx_dir
+    _t._soapy, _t._tx_dir = (lambda: object()), (lambda: 0)
+    try:
+        ctl.start({"waveform": "cw", "frequency_hz": 2450e6})
+        assert _wait_state(ctl, "idle", timeout=8)
+        assert ctl._acquirer.paused == 0        # viewer was never touched
+        assert "invalid channel index" in (ctl.status()["error"] or "")
+    finally:
+        _t._soapy, _t._tx_dir = orig_soapy, orig_dir
 
 
 # ---------------------------------------------------------------------------
