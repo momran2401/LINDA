@@ -93,3 +93,51 @@ except Exception as e:
     striqt_shared = None
     _ANALYSIS_OK = False
     _ANALYSIS_ERR = e
+
+
+# ---------------------------------------------------------------------------
+# SoapySDR compatibility: any radio that reports PER-CHANNEL sensors
+# ---------------------------------------------------------------------------
+def _patch_soapy_arginfo_subscript():
+    """Let ``ArgInfo[0]`` return the ArgInfo, working around a striqt 0.7.0 bug.
+
+    ``sources/soapy.py::_probe_channel`` builds each channel's sensor table as
+
+        name=device.getSensorInfo(*args, key).name,          # line 179
+        info=_SoapyArgInfo.from_soapy(device.getSensorInfo(*args, key)[0]),
+
+    The first line treats the return value as an object; the second subscripts
+    it. ``Device.getSensorInfo()`` returns a single ``SoapySDR.ArgInfo``, so the
+    ``[0]`` raises ``TypeError: 'ArgInfo' object is not subscriptable`` and the
+    source never opens. The device-level copy of the same code (line 248) has no
+    ``[0]``, which confirms the stray index is the typo. It only fires on radios
+    that expose per-channel sensors — the AIR-T does not, a USRP B2xx does
+    (lo_locked, rssi), so this went unnoticed upstream and made every generic
+    SoapySDR radio unusable.
+
+    Teaching ArgInfo that ``x[0] is x`` is the smallest correct fix: it hands
+    ``_SoapyArgInfo.from_soapy()`` exactly the ArgInfo it already expects,
+    without copying striqt's probe logic into this repo. Any index other than
+    0/-1 raises IndexError, so an accidental iteration terminates after one
+    item instead of spinning.
+
+    Remove this once the installed striqt drops the stray index.
+    """
+    try:
+        import SoapySDR
+    except Exception:
+        return  # demo hosts have no SoapySDR; nothing to patch
+    arg_info = getattr(SoapySDR, 'ArgInfo', None)
+    if arg_info is None or hasattr(arg_info, '__getitem__'):
+        return
+    def _getitem(self, index):
+        if index in (0, -1):
+            return self
+        raise IndexError(index)
+    try:
+        arg_info.__getitem__ = _getitem
+    except Exception:
+        pass  # never let a compatibility patch break the import
+
+
+_patch_soapy_arginfo_subscript()
