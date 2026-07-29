@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 100" role="img" aria-labelledby="title desc">
+  <title id="title">LINDA</title>
+  <desc id="desc">LINDA wordmark with a five-bar PSD envelope</desc>
+  <!-- Matches the header brand lockup: PSD envelope, shared frequency axis, and wordmark. -->
+  <g fill="#4ea3ff">
+    <rect x="12" y="42" width="8" height="16" opacity=".4"/>
+    <rect x="26" y="34" width="8" height="24" opacity=".62"/>
+    <rect x="40" y="14" width="8" height="44"/>
+    <rect x="54" y="34" width="8" height="24" opacity=".62"/>
+    <rect x="68" y="46" width="8" height="12" opacity=".4"/>
+    <rect x="12" y="66" width="364" height="4"/>
+  </g>
+  <text x="96" y="58" fill="#b3bac4" font-family="Arial, Helvetica, sans-serif" font-size="48" font-weight="700" letter-spacing="7">LINDA</text>
+</svg>
