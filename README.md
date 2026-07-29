@@ -50,7 +50,7 @@ one
 
 ---
 
-Internet access from anywhere (optional): `bash live/run_web.sh --tunnel`
+**Internet access from anywhere (optional)**: `bash live/run_web.sh --tunnel`
 starts the server plus a Cloudflare Tunnel and prints a public URL.
 
 ---
