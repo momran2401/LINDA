@@ -153,9 +153,9 @@ validate_configuration() {
     case "$ARCH" in x86_64|aarch64|arm64) ;; *)
         die "unsupported architecture: $ARCH (supported: x86_64, aarch64/arm64)"
     esac
-    python3 - <<'PY' || die "Python 3.9 through 3.12 is required"
+    python3 - <<'PY' || die "Python 3.9 through 3.13 is required"
 import sys
-raise SystemExit(0 if (3, 9) <= sys.version_info[:2] <= (3, 12) else 1)
+raise SystemExit(0 if (3, 9) <= sys.version_info[:2] <= (3, 13) else 1)
 PY
     local free_kb mem_kb
     free_kb="$(df -Pk "$REPO_ROOT" | awk 'NR==2 {print $4}')"
@@ -322,8 +322,11 @@ install_python_deps() {
             -c "$REPO_ROOT/live/constraints.txt" \
             || die "Python dependency installation failed"
     fi
-    "$REPO_ROOT/.venv/bin/python" -m pip check \
-        || die "Python dependency consistency check failed"
+    # This venv intentionally exposes the distro's site-packages so the apt
+    # SoapySDR binding is usable.  `pip check` therefore audits unrelated apt
+    # packages too (for example editor-only types-seaborn) and can reject an
+    # otherwise valid LINDA install.  The targeted runtime imports below are
+    # the meaningful consistency check for this mixed apt/pip environment.
     # Offline plot assets: the repo vendors uPlot; restore it when missing so
     # hotspot/ethernet modes never depend on a CDN.
     if [[ ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.js" || ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.css" ]]; then

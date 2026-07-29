@@ -57,7 +57,7 @@ developed and tested on a laptop without hardware
 - **Linux** (automated full setup: Debian/Raspberry Pi OS 12–13 or Ubuntu
   22.04/24.04 on x86-64 or 64-bit ARM). Other platforms can use manual demo
   setup.
-- **Python 3.9–3.12**
+- **Python 3.9–3.13**
 - Python packages: `fastapi`, `uvicorn`, `numpy` (see
   [`live/requirements.txt`](live/requirements.txt))
 - For real radios: **SoapySDR** with your radio's driver module
@@ -98,8 +98,8 @@ The installer is **idempotent** (safe to re-run) and takes care of:
   hotspot/ethernet modes), and Chromium/X/LightDM (for kiosk mode)
 - a Python virtualenv at `.venv/` with one consistently resolved
   FastAPI/uvicorn/numpy/striqt dependency set; the installer
-  preserves and rebuilds stale environments, then runs `pip check` and import
-  checks before configuring the service
+  preserves and rebuilds stale environments, then runs targeted import checks
+  before configuring the service
 - username-only role logins and a generated session-signing secret written to
   `/etc/radio-web/radio.env` (mode 0600)
 - the `radio-web` systemd service (auto-start on boot, hardened, journald
