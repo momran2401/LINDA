@@ -12,6 +12,9 @@
 # What it does (idempotent — safe to re-run):
 #   1. Detects distro/arch; installs system deps via apt when available
 #      (SoapySDR plus the selected radio driver, avahi mDNS, NetworkManager).
+#      For a USRP it also downloads the UHD firmware/FPGA images (a B2xx has
+#      no on-board flash and will not open without them) and raises the usbfs
+#      buffer so USB 3 streaming does not overflow.
 #   2. Creates ./.venv and installs live/requirements.txt (+ striqt, optional).
 #   3. Asks (TUI) for: default mode (web / hotspot / ethernet / kiosk /
 #      terminal), port, mDNS hostname, radio, hotspot SSID/password,
@@ -173,6 +176,89 @@ PY
     fi
 }
 
+# ── USRP (UHD) host preparation ─────────────────────────────────────────────
+# A USRP B2xx has no on-board flash: UHD uploads the firmware and the FPGA
+# image over USB every time the device is opened.  Debian cannot redistribute
+# those images, so a fresh host enumerates the radio in lsusb and then fails to
+# open it until they are downloaded.
+UHD_IMAGES_DIR=""
+uhd_images_present() {
+    local dir
+    for dir in /usr/share/uhd/images /usr/local/share/uhd/images; do
+        if [[ -d "$dir" ]] && compgen -G "$dir/*" >/dev/null 2>&1; then
+            UHD_IMAGES_DIR="$dir"
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_uhd_images() {
+    if uhd_images_present; then
+        echo "  UHD images already present in $UHD_IMAGES_DIR"
+        return 0
+    fi
+    local downloader
+    downloader="$(command -v uhd_images_downloader || true)"
+    [[ -n "$downloader" ]] || downloader=/usr/libexec/uhd/utils/uhd_images_downloader.py
+    if [[ ! -x "$downloader" ]]; then
+        warn "uhd_images_downloader is missing; a USRP cannot open without its"
+        warn "FPGA image. Reinstall uhd-host, then re-run setup.sh."
+        return 0
+    fi
+    # Restrict the download to the USB family when one is plugged in — the
+    # full image set is a much larger transfer than a B2xx needs.
+    local types="${RADIO_UHD_IMAGE_TYPES:-}"
+    if [[ -z "$types" ]] && lsusb -d 2500: >/dev/null 2>&1; then
+        types="b2xx"
+    fi
+    say "Downloading UHD firmware/FPGA images${types:+ (${types})}…"
+    if [[ -n "$types" ]]; then
+        "$downloader" -t "$types" || warn "UHD image download failed (no internet?)"
+    else
+        "$downloader" || warn "UHD image download failed (no internet?)"
+    fi
+    return 0
+}
+
+# USRP B2xx over USB 3: the kernel's default 16 MB usbfs buffer overflows
+# continuously above a few MS/s.  Ettus' documented fix is a kernel parameter.
+# usbcore is built into the Raspberry Pi kernel, so /etc/modprobe.d has no
+# effect there — the value has to go on the kernel command line.
+tune_usb_for_usrp() {
+    local want=1000
+    local sysfs=/sys/module/usbcore/parameters/usbfs_memory_mb
+    local current=""
+    [[ -r "$sysfs" ]] && current="$(cat "$sysfs" 2>/dev/null || true)"
+    if [[ "$current" =~ ^[0-9]+$ ]] && (( current >= want )); then
+        echo "  usbfs buffer already ${current} MB"
+        return 0
+    fi
+    if [[ -w "$sysfs" ]] && echo "$want" > "$sysfs" 2>/dev/null; then
+        echo "  usbfs buffer raised to ${want} MB for this boot"
+    fi
+    local cmdline="" candidate
+    for candidate in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+        [[ -f "$candidate" ]] && { cmdline="$candidate"; break; }
+    done
+    if [[ -z "$cmdline" ]]; then
+        warn "could not persist usbfs_memory_mb=$want (no Pi-style cmdline.txt)."
+        warn "Add 'usbcore.usbfs_memory_mb=$want' to this host's kernel command"
+        warn "line for sustained USRP streaming."
+        return 0
+    fi
+    if grep -q 'usbcore\.usbfs_memory_mb=' "$cmdline"; then
+        sed -i "s/usbcore\.usbfs_memory_mb=[0-9]*/usbcore.usbfs_memory_mb=$want/" "$cmdline"
+    else
+        # cmdline.txt must remain ONE line — append to it, never add a line.
+        cp -n "$cmdline" "$cmdline.nist-omran.bak" 2>/dev/null || true
+        sed -i "1s|\$| usbcore.usbfs_memory_mb=$want|" "$cmdline"
+        REBOOT_REQUIRED=1
+    fi
+    echo "  usbfs buffer persisted in $cmdline (usbcore.usbfs_memory_mb=$want)"
+    return 0
+}
+
 # ── 1. System packages (apt) ────────────────────────────────────────────────
 install_system_deps() {
     [[ $HAVE_APT -eq 1 && $IS_ROOT -eq 1 ]] || {
@@ -184,12 +270,21 @@ install_system_deps() {
     apt-get update
     # These are required on a clean Debian-family host.  Do not hide failures:
     # a half-created venv is much harder to diagnose than a failed installer.
+    #   git      — pip installs striqt from a git URL
+    #   curl     — /health probe and the uPlot asset restore
+    #   usbutils — lsusb, used below to recognise an attached USRP
+    #   build-essential + python3-dev — source-build fallback for pip. Every
+    #     pinned dependency ships an aarch64 wheel today, but a missing
+    #     compiler is the most confusing pip failure mode on ARM; drop these
+    #     two only if you are deliberately building a minimal image.
     apt-get install -y ca-certificates curl git openssl sudo \
-        python3 python3-venv python3-pip python3-dev \
-        build-essential pkg-config cmake \
-        whiptail avahi-daemon libgl1 iproute2 usbutils pciutils
+        python3 python3-venv python3-pip python3-dev build-essential \
+        whiptail avahi-daemon iproute2 usbutils
     if [[ "$DEVICE" != "demo" ]]; then
-        apt-get install -y python3-soapysdr soapysdr-tools libsoapysdr-dev \
+        # soapysdr-tools carries SoapySDRUtil (driver enumeration + the checks
+        # in verify_install).  libsoapysdr-dev is NOT installed: nothing here
+        # compiles against the SoapySDR headers.
+        apt-get install -y python3-soapysdr soapysdr-tools \
             || die "required SoapySDR packages are unavailable from this distro's repositories"
     fi
 
@@ -204,12 +299,26 @@ install_system_deps() {
     fi
     case "$selected_driver" in
         driver=uhd|driver=uhd,serial=*)
-            apt-get install -y soapysdr-module-uhd uhd-host uhd-images \
+            # There is no "uhd-images" package in Debian or Ubuntu — uhd-host
+            # ships the downloader and the images are fetched separately
+            # (install_uhd_images below).
+            apt-get install -y soapysdr-module-uhd uhd-host \
                 || die "USRP selected, but soapysdr-module-uhd/uhd-host are unavailable"
+            install_uhd_images
+            tune_usb_for_usrp
             ;;
         pluto)
-            apt-get install -y soapysdr-module-plutosdr libiio-utils libiio-dev libad9361-dev \
-                || die "Pluto selected, but its SoapySDR/libiio packages are unavailable"
+            # SoapyPlutoSDR is not packaged before Debian forky, so on every
+            # release this installer supports the driver must be built from
+            # source.  libiio-utils is only the iio_info diagnostic.
+            apt-get install -y libiio-utils || true
+            if ! apt-get install -y soapysdr-module-plutosdr; then
+                warn "soapysdr-module-plutosdr is not in this release's repositories"
+                warn "(it first appears in Debian forky). Build SoapyPlutoSDR from"
+                warn "source — apt-get install libiio-dev libad9361-dev cmake, then"
+                warn "cmake/make/make install github.com/pothosware/SoapyPlutoSDR —"
+                warn "and re-run setup.sh."
+            fi
             ;;
         auto)
             warn "auto selected with no detectable USB radio; only the SoapySDR core was installed"
@@ -291,7 +400,10 @@ EOF
 # makes that work on a FRESH host instead of only where someone already set it
 # up by hand. Every failure below is a warning: no GPS must never fail setup.
 install_gps() {
-    [[ $IS_ROOT -eq 1 ]] || return 0
+    [[ $IS_ROOT -eq 1 && $HAVE_APT -eq 1 ]] || return 0
+    # The demo source produces synthetic IQ; stamping it with a real position
+    # would be a lie, so there is nothing for gpsd to do on a demo host.
+    [[ "$DEVICE" != "demo" ]] || return 0
     say "Installing GPS support (gpsd, optional)…"
     if ! apt-get install -y gpsd gpsd-clients; then
         warn "gpsd could not be installed — recordings will record gps_valid=0"
@@ -444,10 +556,20 @@ PYCHECK
 
     if [[ "$DEVICE" == "pluto" ]]; then
         SoapySDRUtil --info 2>&1 | grep -qiE 'pluto|libiio' \
-            || die "Pluto selected, but the SoapyPlutoSDR/libiio driver is not installed by this distro"
+            || die "Pluto selected, but SoapyPlutoSDR is not installed. It is not packaged before Debian forky — build it from source (github.com/pothosware/SoapyPlutoSDR, needs libiio-dev + libad9361-dev + cmake) and re-run setup.sh"
     elif [[ "$DEVICE" == "driver=uhd" || "$DEVICE" == driver=uhd,serial=* ]]; then
         SoapySDRUtil --info 2>&1 | grep -qiE 'uhd|usrp' \
             || die "USRP selected, but the SoapyUHD driver is not installed"
+        # Without images the device enumerates and then refuses to open, which
+        # surfaces much later as an opaque streaming failure. Say it here.
+        if ! uhd_images_present; then
+            if [[ $SKIP_HARDWARE_CHECK -eq 1 ]]; then
+                warn "UHD firmware/FPGA images are absent; the USRP will not open"
+                warn "until you run: sudo uhd_images_downloader"
+            else
+                die "UHD firmware/FPGA images are absent — a USRP cannot open without them. Run: sudo uhd_images_downloader"
+            fi
+        fi
     elif [[ "$DEVICE" == air* ]]; then
         SoapySDRUtil --info 2>&1 | grep -qi 'SoapyAIRT' \
             || die "Deepwave selected, but proprietary SoapyAIRT is absent. Use the Deepwave AIR-T software image/installer, then rerun setup.sh"
@@ -506,7 +628,7 @@ ask_tui() {
             "mDNS hostname (reach the radio at <name>.local):" 9 60 \
             "$MDNS_HOST" 3>&1 1>&2 2>&3) || true
         DEVICE=$(whiptail --title "Radio" --nocancel --menu \
-            "Which radio will this host drive?" 17 64 6 \
+            "Which radio will this host drive?" 18 64 7 \
             auto     "Auto-detect one attached SoapySDR radio (default)" \
             uhd      "Ettus USRP B205mini/B2xx (UHD)" \
             air8201b "AIR8201B (Deepwave AIR-T)" \

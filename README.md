@@ -61,9 +61,10 @@ developed and tested on a laptop without hardware
 - Python packages: `fastapi`, `uvicorn`, `numpy` (see
   [`live/requirements.txt`](live/requirements.txt))
 - For real radios: **SoapySDR** with your radio's driver module
-  (`SoapyAIRT` for Deepwave, `soapysdr-module-uhd` + `uhd-host` + `uhd-images`
-  for an Ettus USRP B205mini/B2xx, `soapysdr-module-plutosdr` for Pluto, …) and
-  the
+  (`SoapyAIRT` for Deepwave; `soapysdr-module-uhd` + `uhd-host` **plus the UHD
+  images** — `sudo uhd_images_downloader` — for an Ettus USRP B205mini/B2xx;
+  `SoapyPlutoSDR` for Pluto, which must be built from source before Debian
+  forky packages it) and the
   **striqt** acquisition/analysis library:
 
   ```sh
@@ -91,11 +92,14 @@ sudo bash setup.sh --skip-hardware-check
 
 The installer is **idempotent** (safe to re-run) and takes care of:
 
-- apt packages: build tooling, SoapySDR + the driver stack for the selected
-  radio (UHD/SoapyUHD for `--device=uhd`), avahi (mDNS), whiptail,
-  USB/udev permissions, only the selected driver's firmware utilities,
-  NetworkManager (for
-  hotspot/ethernet modes), and Chromium/X/LightDM (for kiosk mode)
+- apt packages: build tooling, SoapySDR + **only** the driver stack the
+  selected radio uses (UHD/SoapyUHD for `--device=uhd`), avahi (mDNS),
+  whiptail, USB/udev permissions, NetworkManager (for hotspot/ethernet modes),
+  and Chromium/X/LightDM (for kiosk mode)
+- for a USRP: the UHD firmware/FPGA images (a B2xx uploads its image over USB
+  at every open, so it cannot stream without them) and
+  `usbcore.usbfs_memory_mb=1000`, without which USB 3 capture overflows
+  continuously on a Pi
 - a Python virtualenv at `.venv/` with one consistently resolved
   FastAPI/uvicorn/numpy/striqt dependency set; the installer
   preserves and rebuilds stale environments, then runs targeted import checks
