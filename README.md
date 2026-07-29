@@ -2,7 +2,7 @@
   <img src="live/web/linda-logo.svg" alt="LINDA" width="400">
 </p>
 
-# LINDA — Live IQ Navigation and Display Application
+# Live IQ Navigation and Display Application
 
 A live RF visualization suite for software-defined radios, built by Mustafa Omran, Aric Sanders, and Dan Kuester.
 
