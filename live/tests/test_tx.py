@@ -180,21 +180,43 @@ class FakeDevice:
 
 
 class TriggerBoundDevice(FakeDevice):
-    """Reproduces the AIR8201B's real refusal.
+    """Reproduces the AIR8201B's real refusals, both of them.
 
-    Observed on hardware: AirStack's SoapyAIRT arms every stream from ONE FPGA
-    trigger block, so `setupStream(SOAPY_SDR_TX)` raises
-    "Trigger in use, can't set up new stream!" while the live RX stream exists.
-    `release_trigger` models whether merely DEACTIVATING the RX stream is
-    enough (it is not on the real radio — the stream has to be closed).
+    AirStack's SoapyAIRT arms every stream from ONE FPGA trigger block, and the
+    live RX stream holds it. Two distinct errors were observed on hardware:
+
+        Trigger in use, can't set up new stream!     (setupStream)
+        Trigger in use, can't change frequency!     (setFrequency)
+
+    The second is the important one — the trigger gates TUNING, not just stream
+    creation — so this fake gates both. `rx_stream_open` is cleared only when
+    the acquirer releases the radio, matching the real driver, where
+    deactivating the stream is not enough.
     """
 
-    def __init__(self, release_on_deactivate=False, **kw):
+    def __init__(self, **kw):
         super().__init__(**kw)
         self.rx_stream_open = True
-        self.release_on_deactivate = release_on_deactivate
         self.setup_attempts = 0
+        self.tune_attempts = 0
         self.stream_args = None
+
+    def _guard_tuning(self, what):
+        self.tune_attempts += 1
+        if self.rx_stream_open:
+            raise RuntimeError(f"Trigger in use, can't change {what}!")
+
+    def setSampleRate(self, d, ch, v):
+        self._guard_tuning("sample rate")
+        super().setSampleRate(d, ch, v)
+
+    def setFrequency(self, d, ch, v):
+        self._guard_tuning("frequency")
+        super().setFrequency(d, ch, v)
+
+    def setGain(self, d, ch, v):
+        self._guard_tuning("gain")
+        super().setGain(d, ch, v)
 
     def setupStream(self, d, fmt, chans, args=None):
         self.setup_attempts += 1
@@ -438,7 +460,12 @@ def test_trigger_conflict_falls_back_to_releasing_the_receiver(trigger_bound):
     assert status["plan"]["rx_mode"] == txmod.TX_RX_RELEASED
     assert "LIVE VIEW IS DOWN" in status["plan"]["rx_note"]
     assert ctl._acquirer.paused == 1
-    assert dev.setup_attempts >= 2        # it tried the cheap rungs first
+    # It tried the cheap rungs before taking the viewer down. On this radio the
+    # refusal comes from the TUNING call, so the cheap rungs never even reach
+    # setupStream — which is exactly why the ladder retries the whole arming
+    # sequence rather than just the stream call.
+    assert dev.tune_attempts >= 3         # rung 0, rung 1, then the real one
+    assert dev.setup_attempts == 1        # only once, after the radio was free
     ctl.stop()
 
 
@@ -467,6 +494,59 @@ def test_tx_stream_is_closed_before_the_receiver_is_restored(trigger_bound):
     assert order == ["tx_closed", "rx_resumed"]
 
 
+def test_tuning_never_runs_while_the_receiver_holds_the_trigger(trigger_bound):
+    """The second hardware failure: "Trigger in use, can't change frequency!".
+
+    An earlier version tuned BEFORE climbing the ladder, so setFrequency ran
+    against a busy trigger — sometimes raising, sometimes just failing its
+    readback and reporting MISMATCH with 0 samples. Every successful tuning
+    call must happen after the radio has been freed.
+    """
+    ctl, dev = trigger_bound
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "gain_db": 0.0,
+               "sample_rate_hz": 20e6, "duration_s": 0.3})
+    assert _wait_state(ctl, "transmitting")
+    # The plan's values are what the driver ended up holding, which can only
+    # happen if the setters ran inside the freed window.
+    actual = ctl.status()["plan"]["actual"]
+    assert actual["frequency_hz"] == 2450e6
+    assert actual["sample_rate_hz"] == 20e6
+    assert ctl.status()["plan"]["rx_mode"] == txmod.TX_RX_RELEASED
+    ctl.stop()
+
+
+def test_a_setting_already_correct_is_not_rewritten(controller):
+    """Asking this radio to "change" the rate to the value it already runs is
+    both pointless and a way to earn a trigger conflict for nothing."""
+    ctl, dev = controller
+    ctl.acknowledge("admin")
+    # Put the driver on the exact values the plan will ask for.
+    dev.set_values.update({"rate": 15.36e6, "freq": 2450e6, "gain": -40.0})
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "gain_db": -40.0,
+               "sample_rate_hz": 15.36e6, "duration_s": 0.3})
+    assert _wait_state(ctl, "idle", timeout=8)
+    setters = [c[0] for c in dev.calls
+               if c[0] in ("setSampleRate", "setFrequency", "setGain")]
+    assert setters == [], f"rewrote settings that were already correct: {setters}"
+
+
+def test_pump_reports_why_it_stopped(controller):
+    """A transmission that reports 0 samples must say why, or the log is a
+    mystery that costs a trip to the radio to resolve."""
+    ctl, _dev = controller
+    ctl.acknowledge("admin")
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "duration_s": 0.3})
+    assert _wait_state(ctl, "idle", timeout=8)
+    stages = " ".join(s["detail"] for s in _op_stages(ctl))
+    assert "duration" in stages
+
+
+def _op_stages(ctl):
+    from core.operations import OPERATIONS
+    op = OPERATIONS.get(ctl.status()["op_id"])
+    return op["stages"] if op else []
+
+
 def test_deepwave_tx_buffer_size_arg_is_passed(trigger_bound):
     """Deepwave's own TX example passes tx_buffer_size; drivers that don't
     know the key ignore it."""
@@ -479,7 +559,9 @@ def test_deepwave_tx_buffer_size_arg_is_passed(trigger_bound):
 def test_a_bad_request_fails_fast_instead_of_dropping_the_receiver():
     """Only a RESOURCE conflict may escalate. A driver rejecting the request
     itself must not cost the operator their live view."""
-    dev = TriggerBoundDevice()
+    # A plain device: tuning works, so the ONLY failure is the stream request
+    # itself, and it is not a resource conflict.
+    dev = FakeDevice()
 
     def refuse(d, fmt, chans, args=None):
         raise RuntimeError("invalid channel index")
