@@ -91,7 +91,10 @@ class GpsReader(threading.Thread):
         self._sats = None         # satellites used, from SKY
         self._device = None
         self._connected = False
-        self._error = "not started"
+        # None means "nothing has gone wrong yet" — during the first moments
+        # that reads as connecting, not as a failure. Only a real error or a
+        # deviceless gpsd fills this in.
+        self._error = None
 
     # --- lifecycle ---
 

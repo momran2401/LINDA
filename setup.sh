@@ -285,6 +285,57 @@ EOF
     REBOOT_REQUIRED=1
 }
 
+# ── GPS (optional): position stamped into every recorded capture ────────────
+# The live viewer never needs GPS; recordings embed the fix when one is
+# available and record gps_valid=0 when it is not. Installing gpsd here is what
+# makes that work on a FRESH host instead of only where someone already set it
+# up by hand. Every failure below is a warning: no GPS must never fail setup.
+install_gps() {
+    [[ $IS_ROOT -eq 1 ]] || return 0
+    say "Installing GPS support (gpsd, optional)…"
+    if ! apt-get install -y gpsd gpsd-clients; then
+        warn "gpsd could not be installed — recordings will record gps_valid=0"
+        return 0
+    fi
+    # Bind whatever gpsd already knows about, then look for an unbound
+    # receiver. USB GPS units enumerate as ttyACM*/ttyUSB*; a module wired to
+    # the board's UART pins has to be named explicitly with RADIO_GPS_DEVICE.
+    local device="${RADIO_GPS_DEVICE:-}"
+    if [[ -z "$device" ]]; then
+        local candidate
+        for candidate in /dev/ttyACM* /dev/ttyUSB*; do
+            [[ -e "$candidate" ]] || continue
+            # Only claim a device that actually speaks NMEA: these ports are
+            # also where Arduinos, modems and FTDI cables show up, and adding
+            # a non-GPS device to gpsd is a confusing dead end.
+            if timeout 4 grep -qam1 '^\$G[PNLAB]' "$candidate" 2>/dev/null; then
+                device="$candidate"
+                break
+            fi
+        done
+    fi
+    if [[ -n "$device" && -e "$device" ]]; then
+        say "  GPS receiver detected on $device"
+        if [[ -f /etc/default/gpsd ]] && ! grep -q "$device" /etc/default/gpsd; then
+            sed -i "s|^DEVICES=.*|DEVICES=\"$device\"|" /etc/default/gpsd \
+                || true
+            grep -q '^DEVICES=' /etc/default/gpsd \
+                || echo "DEVICES=\"$device\"" >> /etc/default/gpsd
+        fi
+        systemctl enable gpsd 2>/dev/null || true
+        systemctl restart gpsd 2>/dev/null || true
+        gpsdctl add "$device" 2>/dev/null || true
+    else
+        warn "no NMEA receiver found on ttyACM*/ttyUSB* — recordings will"
+        warn "record gps_valid=0 until one is attached. Plug in a USB GPS and"
+        warn "re-run setup, or for a UART-wired module:"
+        warn "  sudo RADIO_GPS_DEVICE=/dev/ttyTHS1 bash setup.sh"
+        warn "Set RADIO_GPS=0 in /etc/radio-web/radio.env to disable entirely."
+    fi
+    getent group dialout >/dev/null \
+        && usermod -aG dialout "$SERVICE_USER" 2>/dev/null || true
+}
+
 # ── 2. Python virtualenv ────────────────────────────────────────────────────
 install_python_deps() {
     say "Creating venv + installing Python deps…"
@@ -659,6 +710,7 @@ validate_configuration
 stop_existing_service
 install_system_deps
 install_radio_permissions
+install_gps
 install_python_deps
 verify_install
 qualify_hardware
@@ -676,6 +728,14 @@ echo "  device:    $DEVICE"
 [[ -n "${ETHERNET_NOTE:-}" ]] && echo "  ethernet:  $ETHERNET_NOTE"
 echo "  login:      enter admin, viewer, or intern as the username; no password"
 echo "  logs:      journalctl -u $SERVICE_NAME -f"
+if command -v gpspipe >/dev/null 2>&1; then
+    if timeout 6 gpspipe -w -n 12 2>/dev/null | grep -q '"class":"TPV"'; then
+        echo "  gps:       receiver reporting — recordings will carry coordinates"
+    else
+        echo "  gps:       no fix yet (recordings record gps_valid=0). Check with:"
+        echo "             curl -s -u admin: http://localhost:$PORT/gps"
+    fi
+fi
 echo "  terminal:  ./.venv/bin/python live/striqt_standalone_terminal.py --demo"
 if [[ -e /var/run/reboot-required ]]; then REBOOT_REQUIRED=1; fi
 if [[ $REBOOT_REQUIRED -eq 1 ]]; then
