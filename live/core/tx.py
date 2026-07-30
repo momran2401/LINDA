@@ -240,6 +240,53 @@ def _cf32():
         return "CF32"
 
 
+#: Wire formats we can produce, best first.
+#
+# CS16 leads because it is what the AIR-T's DMA actually wants — Deepwave's own
+# TX example uses it — and because asking for CF32 there is a SILENT failure:
+# `setupStream` returns a stream, `activateStream` succeeds, and then
+# `writeStream` times out forever. Observed on hardware as a transmission that
+# ran for five minutes reporting 0 samples with no error at all. Always ask the
+# radio what it wants rather than assuming the convenient format.
+_TX_FORMAT_PREFERENCE = ("CS16", "CF32")
+
+
+def _pick_tx_format(dev, d, ch):
+    """(format, full_scale, how_we_decided) for this radio's TX stream."""
+    try:
+        fmt, full_scale = dev.getNativeStreamFormat(d, ch)
+        fmt = str(fmt)
+        scale = float(full_scale) or 32767.0
+        if fmt in _TX_FORMAT_PREFERENCE:
+            return fmt, scale, "driver's native format"
+    except Exception:
+        pass
+    try:
+        supported = [str(f) for f in dev.getStreamFormats(d, ch)]
+    except Exception:
+        supported = []
+    for fmt in _TX_FORMAT_PREFERENCE:
+        if fmt in supported:
+            return fmt, (32767.0 if fmt == "CS16" else 1.0), "driver's format list"
+    return _cf32(), 1.0, "fallback (driver named no TX formats)"
+
+
+def _encode_tx(buf, fmt, full_scale):
+    """complex64 → the wire format this radio wants. Returns (array, stride).
+
+    `stride` is array elements per IQ sample, because writeStream counts
+    SAMPLES while a CS16 buffer is interleaved int16 — getting that wrong
+    transmits half a buffer of garbage.
+    """
+    if fmt == "CS16":
+        # complex64.view(float32) is already [I, Q, I, Q, …] — exactly the CS16
+        # interleaving, so no reshaping is needed.
+        inter = buf.view(np.float32) * full_scale
+        np.clip(inter, -full_scale, full_scale, out=inter)
+        return np.ascontiguousarray(inter.astype(np.int16)), 2
+    return buf, 1
+
+
 def _bounds(ranges):
     """min/max across a SoapySDR range list, tolerating Range objects or pairs.
 
@@ -327,6 +374,7 @@ class TxController:
         self._samples = 0
         self._underflows = 0
         self._op_id = None
+        self._stop_reason = "not stopped"
         self._acknowledged = set()  # subjects that have seen the legal notice
         self._caps_cache = None
 
@@ -607,6 +655,10 @@ class TxController:
             if not already_idle and self._state != "stopping":
                 self._state = "stopping"
             op_id = self._op_id
+            # Remember WHO asked. A transmission cancelled during arming is
+            # otherwise unattributable, and the usual culprit — Acquirer
+            # recovery calling TX.shutdown() — looks like nothing at all.
+            self._stop_reason = reason
         if already_idle:
             return self.status()
         OPERATIONS.stage(op_id, "stopping", reason)
@@ -680,12 +732,13 @@ class TxController:
         stream = None
         rx_mode = TX_COEXIST
         try:
-            stream, actual, mismatched, rx_mode = self._arm_with_escalation(
-                dev, d, ch, plan, op_id)
+            (stream, actual, mismatched, rx_mode, fmt,
+             full_scale) = self._arm_with_escalation(dev, d, ch, plan, op_id)
             with self._lock:
                 self._plan["actual"] = dict(actual)
                 self._plan["rx_mode"] = rx_mode
                 self._plan["rx_note"] = TX_RX_MODE_NOTES[rx_mode]
+                self._plan["stream_format"] = fmt
             if actual.get("sample_rate_hz") and abs(
                     actual["sample_rate_hz"] - wave.fs) > 1.0:
                 # Regenerate against the real rate so a driver that snapped the
@@ -703,13 +756,14 @@ class TxController:
                 self._started_at = time.time()
             OPERATIONS.stage(
                 op_id, "data-path",
-                f"TX stream active ({chunk} samples/write, "
+                f"TX stream active ({fmt}, {chunk} samples/write, "
                 f"{TX_RX_MODE_NOTES[rx_mode]})"
                 + (f" — WARNING: driver did not honour {', '.join(mismatched)}"
                    if mismatched else ""),
                 level="warn" if mismatched else "info")
 
-            why = self._pump(dev, stream, wave, plan, chunk, op_id)
+            why = self._pump(dev, stream, wave, plan, chunk, op_id,
+                             fmt, full_scale)
 
             elapsed = time.time() - (self._started_at or time.time())
             verdict = "mismatch" if mismatched else (
@@ -770,7 +824,7 @@ class TxController:
                 continue
             try:
                 actual, mismatched = self._tune_tx(dev, d, ch, plan, op_id)
-                stream = self._setup_tx_stream(dev, d, ch)
+                stream, fmt, full_scale, how = self._setup_tx_stream(dev, d, ch)
             except Exception as exc:
                 self._abandon_rung(rung, op_id)
                 last = exc
@@ -799,7 +853,11 @@ class TxController:
                     if final:
                         raise
                     continue
-            return stream, actual, mismatched, rung
+            OPERATIONS.stage(
+                op_id, "applied",
+                f"TX stream open in {fmt} (full scale {full_scale:g}, chosen "
+                f"from the {how})")
+            return stream, actual, mismatched, rung, fmt, full_scale
         raise last or RuntimeError("could not arm the transmitter")
 
     def _enter_rung(self, rung, op_id):
@@ -809,7 +867,8 @@ class TxController:
         if self._stop_evt.is_set():
             # Stop was requested while we were climbing. Do not take the
             # viewer down for a transmission nobody is waiting for.
-            raise RuntimeError("transmission cancelled before it started")
+            raise RuntimeError(
+                f"transmission cancelled while arming — {self._stop_reason}")
         if rung == TX_RX_QUIESCED:
             enable_stream(self._source(), False)
             return
@@ -910,14 +969,20 @@ class TxController:
         return actual, mismatched
 
     def _setup_tx_stream(self, dev, d, ch):
-        # Deepwave's own TX example passes tx_buffer_size; drivers that do not
-        # know the key ignore it, and the no-args form is retried for bindings
-        # whose setupStream takes no kwargs at all.
+        """Open the TX stream in the format the RADIO wants.
+
+        Returns (stream, format, full_scale, how). Deepwave's own TX example
+        passes tx_buffer_size; drivers that do not know the key ignore it, and
+        the no-args form is retried for bindings whose setupStream takes no
+        kwargs at all.
+        """
+        fmt, full_scale, how = _pick_tx_format(dev, d, ch)
         try:
-            return dev.setupStream(d, _cf32(), [ch],
-                                   {"tx_buffer_size": str(DEFAULT_CHUNK)})
+            stream = dev.setupStream(d, fmt, [ch],
+                                     {"tx_buffer_size": str(DEFAULT_CHUNK)})
         except TypeError:
-            return dev.setupStream(d, _cf32(), [ch])
+            stream = dev.setupStream(d, fmt, [ch])
+        return stream, fmt, full_scale, how
 
     def _restore_rx(self, rx_mode, op_id):
         """Give the live view back. Only rung 2 actually took it away."""
@@ -932,7 +997,8 @@ class TxController:
                              f"could not resume live acquisition: {exc}",
                              level="error")
 
-    def _pump(self, dev, stream, wave, plan, chunk, op_id):
+    def _pump(self, dev, stream, wave, plan, chunk, op_id,
+              fmt="CF32", full_scale=1.0):
         """Feed the TX stream until stop, duration, or the device disappears.
 
         Returns a short reason for WHY it returned. A transmission that reports
@@ -951,6 +1017,7 @@ class TxController:
         duration = plan["duration_s"]
         started = time.time()
         my_dev = dev
+        stalled_since = None
 
         if self._stop_evt.is_set():
             # Something asked us to stop between arming and the first write —
@@ -977,11 +1044,11 @@ class TxController:
                     level="warn")
                 return "radio was reopened underneath the transmission"
 
-            buf = wave.next(chunk)
+            wire, stride = _encode_tx(wave.next(chunk), fmt, full_scale)
             written = 0
             while written < chunk and not self._stop_evt.is_set():
                 try:
-                    res = dev.writeStream(stream, [buf[written:]],
+                    res = dev.writeStream(stream, [wire[written * stride:]],
                                           chunk - written, timeoutUs=200000)
                 except Exception as exc:
                     raise RuntimeError(f"writeStream failed: {exc}") from exc
@@ -996,6 +1063,23 @@ class TxController:
                     raise RuntimeError(f"writeStream returned {ret}")
             with self._lock:
                 self._samples += written
+                total = self._samples
+
+            # A radio that accepts the stream but never consumes a sample is
+            # the worst failure this feature can have: it looks like it is
+            # transmitting, forever, at 0 samples. Give it a few seconds and
+            # then say so instead of spinning silently.
+            if total == 0:
+                if stalled_since is None:
+                    stalled_since = time.time()
+                elif time.time() - stalled_since > 5.0:
+                    raise RuntimeError(
+                        f"the TX stream accepted no samples for 5 s in {fmt} "
+                        f"format — the radio opened and activated the stream "
+                        f"but is not consuming it. This is what a wrong wire "
+                        f"format looks like on this driver.")
+            else:
+                stalled_since = None
 
             status_fn = getattr(dev, "readStreamStatus", None)
             if status_fn is not None:
