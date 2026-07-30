@@ -920,9 +920,23 @@ function updateTxUI(tx) {
                                                       : "Transmitting";
             const s = txEl("tx-live-settings");
             if (s) {
+                // Duty cycle = samples the DAC actually took vs what a
+                // continuous carrier needs. Well under 100% means the output
+                // is a gappy burst train, which the sample count alone would
+                // happily report as a healthy carrier.
+                const plan = tx.plan || {};
+                const rate = (plan.actual && plan.actual.sample_rate_hz)
+                    || plan.sample_rate_hz || 0;
+                const el = tx.elapsed_s || 0;
+                const duty = (rate > 0 && el > 0)
+                    ? (tx.samples_written || 0) / (rate * el) : null;
                 s.textContent = fmtTxPlan(tx.plan) +
-                    `\nelapsed ${(tx.elapsed_s || 0).toFixed(1)} s   ` +
+                    `\nelapsed ${el.toFixed(1)} s   ` +
                     `${tx.samples_written || 0} samples` +
+                    (duty !== null ? `   ${(duty * 100).toFixed(0)}% duty` : "") +
+                    (duty !== null && duty < 0.9
+                        ? "   ⚠ DAC STARVED — output is not a continuous carrier"
+                        : "") +
                     (tx.underflows ? `   ⚠ ${tx.underflows} underflow(s)` : "");
             }
             startTxWave();

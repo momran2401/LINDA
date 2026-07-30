@@ -303,6 +303,16 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   succeeds, and `writeStream` then times out forever — observed on hardware as
   a transmission that ran five minutes reporting 0 samples with no error.
   `_pump()` now raises after 5 s of accepting nothing rather than spinning.
+- **A `writeStream` timeout means the DAC queue is FULL, not that the samples
+  are unwanted.** `_pump()` carries ONE buffer across timeouts and re-offers
+  the same samples. The obvious loop — build a chunk, write what you can, move
+  on — silently drops the unwritten remainder and jumps the waveform phase by a
+  whole chunk on every timeout. Measured on an AIR8201B: 6.18M samples in 2.0 s
+  at a requested 15.36 MS/s, i.e. the DAC fed **20% of real time** — a gappy
+  burst train with a phase discontinuity at every gap, reported as a clean CW
+  carrier by every other field. The verdict, `/tx` status, the qual, and the UI
+  all now report **duty cycle**; under 90% is a `mismatch` and says
+  "DAC WAS STARVED".
 - `_pump()` returns WHY it stopped (`duration elapsed`, `stopped by request`,
   `stopped before the first write`, `radio was reopened underneath the
   transmission`) and the verdict quotes it. A transmission reporting "0

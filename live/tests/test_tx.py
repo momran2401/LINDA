@@ -657,6 +657,102 @@ def test_cs16_encoding_preserves_the_tone_and_fills_the_dac_range():
     assert 0.9 <= np.abs(back).max() <= 1.0        # uses the DAC's range
 
 
+class BackpressureDevice(FakeDevice):
+    """Accepts only part of each write, and times out every few calls — what a
+    real DAC queue does when it fills up."""
+
+    native_format = ("CS16", 32767.0)
+
+    def __init__(self, accept=4096, timeout_every=3, **kw):
+        super().__init__(**kw)
+        self.accept = accept
+        self.timeout_every = timeout_every
+        self.attempts = 0
+        self.received = []          # every int16 element the radio took, in order
+
+    def writeStream(self, s, buffers, n, timeoutUs=0):
+        try:
+            from SoapySDR import SOAPY_SDR_TIMEOUT
+        except Exception:
+            SOAPY_SDR_TIMEOUT = -1
+        self.attempts += 1
+
+        class R:
+            pass
+        r = R()
+        if self.timeout_every and self.attempts % self.timeout_every == 0:
+            r.ret = SOAPY_SDR_TIMEOUT
+            return r
+        take = min(self.accept, n)
+        self.received.extend(buffers[0][:take * 2].tolist())
+        self.written += take
+        r.ret = take
+        return r
+
+
+def test_a_timeout_never_drops_samples_or_jumps_the_waveform_phase():
+    """Regression for a gappy carrier measured on hardware.
+
+    A timeout means the DAC's queue is full, not that the samples are
+    unwanted. Abandoning the partial buffer and generating the next chunk
+    drops the remainder AND advances the waveform phase by a whole chunk —
+    observed as 6.18M samples in 2.0 s at a requested 15.36 MS/s (20% duty),
+    reported as a clean CW carrier. What the radio receives must be the
+    waveform, contiguously, with nothing skipped.
+    """
+    dev = BackpressureDevice(accept=4096, timeout_every=3)
+    ctl = txmod.TxController()
+    ctl.bind(FakeAcquirer(dev), demo=False)
+    ctl.acknowledge("admin")
+    import core.tx as _t
+    orig = (_t._soapy, _t._tx_dir)
+    _t._soapy, _t._tx_dir = (lambda: object()), (lambda: 0)
+    try:
+        ctl.start({"waveform": "cw", "frequency_hz": 2450e6,
+                   "sample_rate_hz": 4e6, "duration_s": 0.5})
+        assert _wait_state(ctl, "idle", timeout=15)
+    finally:
+        _t._soapy, _t._tx_dir = orig
+
+    got = np.array(dev.received, dtype=np.int16)
+    assert got.size > 8192, "the fake radio never received a usable run"
+    # Rebuild what the radio was handed and confirm it is still ONE continuous
+    # tone. A dropped remainder or a phase jump smears this peak immediately.
+    iq = (got[0::2].astype(np.float64) + 1j * got[1::2].astype(np.float64)) / 32767.0
+    n = (iq.size // 4096) * 4096
+    ref = txmod.Waveform("cw", 4e6, {"offset_hz": 0.0, "amplitude": 0.5}).next(n)
+    assert np.allclose(iq[:n], ref, atol=2e-4), "transmitted samples are not the waveform"
+
+
+def test_the_verdict_calls_out_a_starved_dac(controller):
+    """A transmitter fed 20% of real time must not report a clean carrier."""
+    ctl, dev = controller
+    try:
+        from SoapySDR import SOAPY_SDR_TIMEOUT
+    except Exception:
+        SOAPY_SDR_TIMEOUT = -1
+    state = {"n": 0}
+
+    def trickle(s, buffers, n, timeoutUs=0):
+        state["n"] += 1
+
+        class R:
+            pass
+        r = R()
+        # Accept one small write, then stall — a badly starved DAC.
+        r.ret = 256 if state["n"] == 1 else SOAPY_SDR_TIMEOUT
+        return r
+
+    dev.writeStream = trickle
+    ctl.acknowledge("admin")
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "duration_s": 1.0})
+    assert _wait_state(ctl, "idle", timeout=12)
+    op = _op_stages(ctl)
+    detail = " ".join(s["detail"] for s in op)
+    assert "STARVED" in detail, detail
+    assert "duty" in detail
+
+
 def test_a_radio_that_never_consumes_samples_fails_instead_of_spinning(controller):
     """Regression for the five-minute silent no-op: a stream that accepts
     nothing must be reported, not pumped forever at 0 samples."""

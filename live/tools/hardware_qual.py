@@ -39,6 +39,7 @@ from core.constants import (DEFAULT_CENTER, DEFAULT_SAMPLE_RATE,  # noqa: E402
 from core.acquisition import Acquirer, Computer, DemoAcquirer  # noqa: E402
 from core.config import SharedConfig                           # noqa: E402
 from core.operations import OPERATIONS                         # noqa: E402
+from core.shims import query_device_envelope                   # noqa: E402
 from core.striqt_compat import _SENSOR_OK                      # noqa: E402
 
 
@@ -79,7 +80,7 @@ def run_point(shared, acquirer, field, value, header_key, timeout):
     return op["state"], f"applied {want}, frame echoed, op {op['state']}"
 
 
-def qualify_tx(acquirer, args, is_demo):
+def qualify_tx(acquirer, shared, args, is_demo):
     """Closed-loop TX qualification: transmit, then look for it on RX.
 
     This is the only test in this file that RADIATES, which is why it is opt-in
@@ -104,6 +105,21 @@ def qualify_tx(acquirer, args, is_demo):
     # is keyed. A qualification that mistakes LO feedthrough for its own
     # transmission is worse than no qualification.
     offset = 1e6
+
+    # Point the RECEIVER at the transmit frequency first. Without this the
+    # closed-loop check looks for a 2450 MHz carrier in a 3750 MHz frame and
+    # can only ever report "could not locate the commanded bin".
+    env = shared.envelope()
+    if env["freq_min"] <= freq <= env["freq_max"]:
+        ack = shared.update({"center": freq})
+        if ack.get("op_id") is not None:
+            wait_for(lambda: OPERATIONS.get(ack["op_id"])["state"] != "running",
+                     args.timeout)
+        print(f"   receiver tuned to {freq/1e6:.6g} MHz for the loopback check")
+    else:
+        out.append(("transmit seen on RX", "unverified",
+                    f"{freq/1e6:.6g} MHz is outside this radio's RX range — "
+                    f"cannot check its own emission"))
     print(f"→ transmit {args.tx_freq_mhz:.6g} MHz "
           f"(+{offset/1e6:g} MHz offset) for {args.tx_seconds:g} s")
     print("   *** THIS RADIATES — confirm the load/antenna and your authority ***")
@@ -143,40 +159,67 @@ def qualify_tx(acquirer, args, is_demo):
 
     time.sleep(min(args.tx_seconds, 2.0))
     status = txmod.TX.status()
-    out.append(("transmit streaming",
-                "success" if status["samples_written"] > 0 else "failed",
-                f"{status['samples_written']} samples written"
-                + (f", {status['underflows']} underflow(s)"
-                   if status["underflows"] else "")))
+    samples = status["samples_written"]
+    # Duty cycle is the difference between a carrier and a burst train. A
+    # transmitter that only gets 20% of its samples into the DAC still reports
+    # a large sample count and a perfect readback.
+    rate = (status["plan"] or {}).get("sample_rate_hz") or 1.0
+    elapsed = max(status["elapsed_s"] or 0.0, 1e-6)
+    duty = samples / (rate * elapsed)
+    if samples <= 0:
+        out.append(("transmit streaming", "failed", "0 samples written"))
+    elif duty < 0.9:
+        out.append(("transmit streaming", "mismatch",
+                    f"{samples} samples but only {duty:.0%} duty — the DAC was "
+                    f"starved, so the output is a gappy burst train, not a "
+                    f"continuous carrier"))
+    else:
+        out.append(("transmit streaming", "success",
+                    f"{samples} samples written, {duty:.0%} duty"
+                    + (f", {status['underflows']} underflow(s)"
+                       if status["underflows"] else "")))
 
     # Closed loop: is the carrier actually in the receiver's band?
-    header, blocks = acquirer.latest()
-    seen = None
-    if header is not None and blocks:
-        import numpy as np
-        row = np.asarray(blocks[0])
-        row = row[0] if row.ndim > 1 else row
-        f0 = header.get("freqs_hz_f0")
-        step = header.get("freqs_hz_step")
-        if f0 is not None and step:
-            want = freq + offset - float(header.get("center", 0.0))
-            bins = f0 + step * np.arange(row.size)
-            near = np.abs(bins - want) <= max(3 * abs(step), 100e3)
-            if near.any():
-                seen = float(row[near].max() - np.median(row))
-    if seen is None:
-        out.append(("transmit seen on RX", "unverified",
-                    "could not locate the commanded bin in the frame header — "
-                    "check the RX centre covers the TX frequency"))
-    elif seen >= 6.0:
-        out.append(("transmit seen on RX", "verified",
-                    f"carrier is {seen:.1f} dB over the in-band median at the "
-                    f"commanded offset"))
+    rx_mode = (status["plan"] or {}).get("rx_mode")
+    if rx_mode == txmod.TX_RX_RELEASED:
+        # This radio had to shut its receiver down to transmit, so it cannot
+        # hear itself, ever. Say so plainly instead of reporting a failure the
+        # operator cannot act on.
+        out.append((
+            "transmit seen on RX", "unverified",
+            "this radio cannot receive while transmitting, so it cannot "
+            "verify its own emission. Confirm the carrier with a second "
+            "receiver or a spectrum analyser — driver readback alone does "
+            "NOT prove RF left the connector"))
     else:
-        out.append(("transmit seen on RX", "mismatch",
-                    f"only {seen:.1f} dB over median at the commanded offset — "
-                    f"driver accepted the tuning but nothing is coming out "
-                    f"(no antenna/loopback, or the PA is not keyed)"))
+        header, blocks = acquirer.latest()
+        seen = None
+        if header is not None and blocks:
+            import numpy as np
+            row = np.asarray(blocks[0])
+            row = row[0] if row.ndim > 1 else row
+            f0 = header.get("freqs_hz_f0")
+            step = header.get("freqs_hz_step")
+            if f0 is not None and step:
+                want = freq + offset - float(header.get("center", 0.0))
+                bins = f0 + step * np.arange(row.size)
+                near = np.abs(bins - want) <= max(3 * abs(step), 100e3)
+                if near.any():
+                    seen = float(row[near].max() - np.median(row))
+        if seen is None:
+            out.append(("transmit seen on RX", "unverified",
+                        "could not locate the commanded bin in the frame "
+                        "header — check the RX centre covers the TX frequency"))
+        elif seen >= 6.0:
+            out.append(("transmit seen on RX", "verified",
+                        f"carrier is {seen:.1f} dB over the in-band median at "
+                        f"the commanded offset"))
+        else:
+            out.append(("transmit seen on RX", "mismatch",
+                        f"only {seen:.1f} dB over median at the commanded "
+                        f"offset — driver accepted the tuning but nothing is "
+                        f"coming out (no antenna/loopback, or the PA is not "
+                        f"keyed)"))
 
     txmod.TX.stop("qualification complete")
     out.append(("transmit stops on request",
@@ -279,7 +322,23 @@ def main():
         home_rate = legal_rates[0] if legal_rates else home_rate
     neighbours = [r for r in legal_rates if r != home_rate]
     rates = [home_rate] + (neighbours[:1] if args.quick else neighbours)
-    gains = [env["gain_min"], min(env["gain_max"], env["gain_min"] + 10)]
+    # Gain points come from the LIVE DRIVER, not the profile envelope.
+    # air8201b declares -60..10 dB (a striqt calibrated-gain convention, and
+    # deliberately not queried at runtime — see CLAUDE.md), but SoapyAIRT
+    # rejects -60 and -50 outright:
+    #   Invalid parameter passed to SoapyAIRT::setGain()! gain (outside range)
+    # Qualifying a radio against bounds it does not implement fails a healthy
+    # radio, so ask it and intersect with the profile.
+    gain_lo, gain_hi = env["gain_min"], env["gain_max"]
+    probed = query_device_envelope(acquirer.source) if not is_demo else {}
+    if probed.get("gain_min") is not None:
+        if (probed["gain_min"], probed["gain_max"]) != (gain_lo, gain_hi):
+            print(f"[gain] driver reports {probed['gain_min']:g}..."
+                  f"{probed['gain_max']:g} dB; profile declares "
+                  f"{gain_lo:g}...{gain_hi:g} — qualifying against the driver")
+        gain_lo = max(gain_lo, probed["gain_min"])
+        gain_hi = min(gain_hi, probed["gain_max"])
+    gains = [gain_lo, min(gain_hi, gain_lo + 10)]
 
     points = ([("center", c, "center") for c in centers]
               + [("sample_rate", r, "fs") for r in rates]
@@ -297,16 +356,20 @@ def main():
         results.append((label, verdict, detail))
 
     if args.tx:
-        for row in qualify_tx(acquirer, args, is_demo):
+        for row in qualify_tx(acquirer, shared, args, is_demo):
             print(f"   {row[1].upper()}: {row[2]}")
             results.append(row)
         print()
 
     # Sustained streaming check after all changes.
+    # Wait for a FRESH frame rather than sleeping a fixed 3 s and comparing.
+    # A radio that had to be released for a transmission is still re-arming
+    # when a fixed sleep expires, so the old check failed a radio that was
+    # merely still coming back.
     hdr0 = acquirer.latest()[0]
-    time.sleep(3.0)
-    hdr1 = acquirer.latest()[0]
-    streaming = hdr1 and hdr0 and hdr1["time"] > hdr0["time"]
+    t0 = (hdr0 or {}).get("time", 0.0)
+    streaming = wait_for(
+        lambda: (acquirer.latest()[0] or {}).get("time", 0.0) > t0, 20.0)
     results.append(("sustained streaming after all changes",
                     "success" if streaming else "failed",
                     "frames still advancing" if streaming else "stream stalled"))
