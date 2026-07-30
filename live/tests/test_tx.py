@@ -152,7 +152,14 @@ class FakeDevice:
     def getGain(self, d, ch):
         return self.set_values.get("gain", 0.0)
 
-    def setupStream(self, d, fmt, chans):
+    #: What this radio says it wants on the wire. The AIR-T answers CS16.
+    native_format = ("CF32", 1.0)
+
+    def getNativeStreamFormat(self, d, ch):
+        return self.native_format
+
+    def setupStream(self, d, fmt, chans, args=None):
+        self.stream_format = fmt
         self.calls.append(("setupStream", tuple(chans)))
         return "stream"
 
@@ -170,6 +177,7 @@ class FakeDevice:
 
     def writeStream(self, s, buffers, n, timeoutUs=0):
         self.written += n
+        self.wire_dtype = getattr(buffers[0], "dtype", None)
 
         class R:
             ret = n
@@ -580,6 +588,72 @@ def test_a_bad_request_fails_fast_instead_of_dropping_the_receiver():
         assert "invalid channel index" in (ctl.status()["error"] or "")
     finally:
         _t._soapy, _t._tx_dir = orig_soapy, orig_dir
+
+
+# ---------------------------------------------------------------------------
+# Wire format: ask the radio, never assume
+# ---------------------------------------------------------------------------
+
+def test_waveform_is_encoded_in_the_format_the_radio_asked_for(controller):
+    """The AIR-T's DMA wants CS16. Handing it CF32 sets up and activates
+    cleanly and then never consumes a sample — five minutes of "transmitting"
+    at 0 samples with no error, which is what the hardware actually did."""
+    ctl, dev = controller
+    dev.native_format = ("CS16", 32767.0)
+    ctl.acknowledge("admin")
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "duration_s": 0.3})
+    assert _wait_state(ctl, "idle", timeout=8)
+    assert dev.stream_format == "CS16"
+    assert dev.wire_dtype == np.int16
+    assert ctl.status()["plan"]["stream_format"] == "CS16"
+
+
+def test_cf32_radio_still_gets_cf32(controller):
+    ctl, dev = controller
+    dev.native_format = ("CF32", 1.0)
+    ctl.acknowledge("admin")
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "duration_s": 0.3})
+    assert _wait_state(ctl, "idle", timeout=8)
+    assert dev.stream_format == "CF32"
+    assert dev.wire_dtype == np.complex64
+
+
+def test_cs16_encoding_preserves_the_tone_and_fills_the_dac_range():
+    """Interleaving and scaling have to be right or the radio transmits
+    garbage that still 'works' as far as every status field is concerned."""
+    fs = 4e6
+    w = txmod.Waveform("cw", fs, {"offset_hz": 500e3, "amplitude": 1.0})
+    buf = w.next(4096)
+    wire, stride = txmod._encode_tx(buf, "CS16", 32767.0)
+    assert stride == 2 and wire.dtype == np.int16 and wire.size == buf.size * 2
+    # Round-trip and confirm it is still the same tone at the same offset.
+    back = (wire[0::2].astype(np.float32)
+            + 1j * wire[1::2].astype(np.float32)) / 32767.0
+    assert abs(_peak_offset_hz(back, fs) - 500e3) < fs / 4096
+    assert 0.9 <= np.abs(back).max() <= 1.0        # uses the DAC's range
+
+
+def test_a_radio_that_never_consumes_samples_fails_instead_of_spinning(controller):
+    """Regression for the five-minute silent no-op: a stream that accepts
+    nothing must be reported, not pumped forever at 0 samples."""
+    ctl, dev = controller
+    try:
+        from SoapySDR import SOAPY_SDR_TIMEOUT
+    except Exception:
+        SOAPY_SDR_TIMEOUT = -1
+
+    def always_timeout(s, buffers, n, timeoutUs=0):
+        class R:
+            ret = SOAPY_SDR_TIMEOUT
+        return R()
+
+    dev.writeStream = always_timeout
+    ctl.acknowledge("admin")
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6})
+    assert _wait_state(ctl, "idle", timeout=20)
+    err = ctl.status()["error"] or ""
+    assert "accepted no samples" in err, err
+    assert ctl.status()["samples_written"] == 0
 
 
 # ---------------------------------------------------------------------------

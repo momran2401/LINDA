@@ -285,6 +285,15 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   defaults to the live RX rate, the common case touches the rate not at all.
   Deepwave's own TX example passes `tx_buffer_size`, so `setupStream` is called
   with it (no-args retry for bindings that reject kwargs).
+- **Ask the radio what wire format it wants — never assume.** `_pick_tx_format()`
+  reads `getNativeStreamFormat` (then `getStreamFormats`, then falls back),
+  preferring **CS16**, and `_encode_tx()` converts the complex64 waveform,
+  returning the array-elements-per-sample stride because `writeStream` counts
+  SAMPLES while a CS16 buffer is interleaved int16. Requesting CF32 on the
+  AIR-T is a SILENT failure: `setupStream` returns a stream, `activateStream`
+  succeeds, and `writeStream` then times out forever — observed on hardware as
+  a transmission that ran five minutes reporting 0 samples with no error.
+  `_pump()` now raises after 5 s of accepting nothing rather than spinning.
 - `_pump()` returns WHY it stopped (`duration elapsed`, `stopped by request`,
   `stopped before the first write`, `radio was reopened underneath the
   transmission`) and the verdict quotes it. A transmission reporting "0
