@@ -5,12 +5,12 @@
 
 <h1 align="center">Live IQ Navigation and Display Application</h1>
 
+Built by the GOAT *Mustafa A. Omran*
+under supervision of *Aric W. Sanders, and Dan Kuester*.
+
 LINDA is a live RF visualization suite for software-defined radios. It streams
 real-time spectrogram waterfalls and power spectral density (PSD) displays to a web browser, SSH terminal, or the radio's local
 display. A synthetic demo mode supports development without radio hardware.
-
-Built by *Mustafa A. Omran*
-under supervision of *Aric W. Sanders, and Dan Kuester*.
 
 Use LINDA to inspect live RF activity from a supported SDR: tune a receive
 channel, observe its waterfall and PSD, adjust capture settings, record data, transmit signals
