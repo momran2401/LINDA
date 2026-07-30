@@ -1,8 +1,6 @@
 <p align="center">
   <img src="live/web/linda-logo.svg" alt="LINDA" width="400">
 </p>
-
-
 <h1 align="center">Live IQ Navigation and Display Application</h1>
 
 Built by the GOAT *Mustafa A. Omran*
