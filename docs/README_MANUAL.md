@@ -532,6 +532,5 @@ it, or omit the flag to preserve them.
 
 - [Root README](../README.md) — concise overview and quick start.
 - [Repository overview](REPO_OVERVIEW.md) — codebase architecture and source map.
-- [striqt README](../striqt/README.md) — upstream package install and CLI notes.
-- [striqt documentation source](../striqt/doc/) — upstream specifications and API documentation source.
+- [striqt README](https://github.com/usnistgov/striqt/blob/main/README.md) — upstream package install and CLI notes.
 
