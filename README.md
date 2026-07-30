@@ -61,7 +61,7 @@ starts the server plus a Cloudflare Tunnel and prints a public URL.
 
 ## Troubleshooting
 - **Setup fails after Installing GPS support** — no GPS serial device was
-    detected. Re-run with sudo env RADIO_GPS_DEVICE=none bash setup.sh; this
+    detected. Re-run with `sudo env RADIO_GPS_DEVICE=none bash setup.sh`; this
     skips GPS probing for that run and recordings will set gps_valid=0.
 - **No frames / "waiting for first frame"** — check `journalctl -u radio-web
   -f` (or the OPS tab's journal pane). The operation log names the exact
