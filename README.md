@@ -2,7 +2,11 @@
   <img src="live/web/linda-logo.svg" alt="LINDA" width="400">
 </p>
 
-# LINDA — Live IQ Navigation and Display Application
+
+<p align="center">
+  
+  # LINDA — Live IQ Navigation and Display Application
+</p>
 
 LINDA is a live RF visualization suite for software-defined radios. It streams
 real-time spectrogram waterfalls and power spectral density (PSD) displays—one
