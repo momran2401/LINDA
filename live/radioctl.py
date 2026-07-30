@@ -48,10 +48,31 @@ class Client:
             headers["Authorization"] = self.auth
         return headers
 
+    @staticmethod
+    def _decode(response):
+        """Parse a JSON response body — and name the ACTUAL problem when the
+        body is not JSON. An unauthenticated GET is 303-redirected to the
+        /login page, urllib follows it, and json.load then fails with
+        "Expecting value: line 1 column 1" — which reads as a dead server when
+        the real story is a missing username."""
+        body = response.read()
+        try:
+            return json.loads(body)
+        except ValueError:
+            if b"<" in body[:64]:      # HTML — the login page
+                raise RuntimeError(
+                    "the server answered with its login page, not JSON — "
+                    "authentication is required. Pass --user admin (before "
+                    "the subcommand) or set RADIOCTL_USER=admin.")
+            raise RuntimeError(
+                "the server answered with something that is not JSON "
+                f"({body[:80]!r}) — is {response.url} really the radio-web "
+                "server?")
+
     def get(self, path):
         req = urllib.request.Request(self.base + path, headers=self._headers())
         with urllib.request.urlopen(req, timeout=6) as response:
-            return json.load(response)
+            return self._decode(response)
 
     def post(self, path, payload):
         req = urllib.request.Request(
@@ -60,7 +81,7 @@ class Client:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as response:
-            return json.load(response)
+            return self._decode(response)
 
 
 def print_status(client):
@@ -215,7 +236,7 @@ def print_gps(client):
     try:
         gps = client.get("/gps")["gps"]
     except Exception as exc:
-        print(f"gps: cannot reach the server — {exc}", file=sys.stderr)
+        print(f"gps: {exc}", file=sys.stderr)
         return 2
     if not gps.get("enabled"):
         print("gps          : disabled (RADIO_GPS=0)")
@@ -261,7 +282,7 @@ def print_tx(client):
     try:
         status = client.get("/tx")["tx"]
     except Exception as exc:
-        print(f"tx: cannot reach the server — {exc}", file=sys.stderr)
+        print(f"tx: {exc}", file=sys.stderr)
         return 2
     if not status.get("available"):
         print("transmit     : unavailable — {}".format(

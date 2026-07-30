@@ -231,7 +231,30 @@ def main():
     print(f"\n=== hardware qualification: {state.DEVICE_LABEL} "
           f"(channels {state.CHANNELS}) ===\n")
     if not wait_for(lambda: acquirer.latest()[0], args.timeout * 2):
-        print("FAILED: no first frame — radio never streamed", file=sys.stderr)
+        # The overwhelmingly common cause is that the radio-web service is
+        # running and already owns the radio. The AIR-T allows exactly one
+        # process to hold its FPGA descriptors, so the failure surfaces as
+        # "Failed to open FPGA registers (errno = 16)" — EBUSY — which reads
+        # like broken hardware if you do not know to look for the service.
+        print("FAILED: no first frame — the radio never streamed.",
+              file=sys.stderr)
+        if not is_demo:
+            print(
+                "\n  This tool needs EXCLUSIVE use of the radio, and only one\n"
+                "  process can hold an AIR-T at a time. If the log above says\n"
+                "  'Failed to open FPGA registers (errno = 16)', the radio-web\n"
+                "  service already owns it. Stop it, qualify, then start it:\n"
+                "\n"
+                "      sudo systemctl stop radio-web\n"
+                "      python3 live/tools/hardware_qual.py "
+                + (f"--tx --tx-freq-mhz {args.tx_freq_mhz:g}" if args.tx
+                   else "--device auto") + "\n"
+                "      sudo systemctl start radio-web\n"
+                "\n"
+                "  To transmit WITHOUT stopping the service, use the web UI or\n"
+                "  'radioctl.py tx start' — both drive the running server.",
+                file=sys.stderr)
+        shared.stop()
         sys.exit(1)
 
     env = shared.envelope()
