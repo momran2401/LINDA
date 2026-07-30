@@ -9,24 +9,14 @@ LINDA is a live RF visualization suite for software-defined radios. It streams
 real-time spectrogram waterfalls and power spectral density (PSD) displays to a web browser, SSH terminal, or the radio's local
 display. A synthetic demo mode supports development without radio hardware.
 
-Built by *Mustafa Omran*
-under supervision of *Aric Sanders, and Dan Kuester*.
-
-## Use case
+Built by *Mustafa A. Omran*
+under supervision of *Aric W. Sanders, and Dan Kuester*.
 
 Use LINDA to inspect live RF activity from a supported SDR: tune a receive
 channel, observe its waterfall and PSD, adjust capture settings, record data, transmit signals
 and inspect operating status from the same browser interface. The web server
 shares one radio stream with multiple browser clients; use demo mode for safe
 UI and pipeline testing when no SDR is attached.
-
-```sh
-# Start a local synthetic viewer
-bash live/run_web.sh --demo
-
-# Start a real device selected automatically by SoapySDR
-bash live/run_web.sh --device auto
-```
 
 ## Installation
 
@@ -53,6 +43,16 @@ bash setup.sh --deps-only
 Open `http://localhost:8000`. After the full installer completes, open
 `http://<hostname>.local:8000` and sign in as `admin`, `viewer`, or `intern`.
 There is no password.
+
+## Use case
+
+```sh
+# Start a local synthetic viewer
+bash live/run_web.sh --demo
+
+# Start a real device selected automatically by SoapySDR
+bash live/run_web.sh --device auto
+```
 
 ## Workflow
 
