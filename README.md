@@ -97,7 +97,7 @@ transmit safety, diagnostics, and troubleshooting.
 - `live/` — LINDA's web server, terminal/kiosk front ends, RF control tools,
   recordings, and tests.
 - `striqt` — separately developed upstream RF acquisition and analysis
-  library; see its [README](striqt/README.md) and documentation.
+  library; see its [README](https://github.com/usnistgov/striqt/blob/main/README.md) and documentation.
 - `setup.sh` / `uninstall_linda.sh` — idempotent installation and
   removal of program.
 
@@ -109,7 +109,7 @@ pytest -q live/tests
 
 ## AI Assistance
 
-Parts of this project were built with the help of generative AI tools, such as Claude Code, and OpenAI Codex. 
+Parts of this project were built with the help of generative AI tools. 
 All AI-generated outputs were reviewed, tested, and edited by the human project maintainer.
 
 ## License and Attribution
