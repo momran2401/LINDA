@@ -112,6 +112,12 @@ pytest -q live/tests
 Parts of this project were built with the help of generative AI tools. 
 All AI-generated outputs were reviewed, tested, and edited by the human project maintainer.
 
+## Additional references
+
+- [LINDA manual](docs/README_MANUAL.md) — detailed operational manual.
+- [Repository overview](REPO_OVERVIEW.md) — codebase architecture and source map.
+- [striqt README](https://github.com/usnistgov/striqt/blob/main/README.md) — upstream package install and CLI notes.
+
 ## License and Attribution
 
 This work was developed in connection with the NIST SURF project “Development
