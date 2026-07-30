@@ -3,17 +3,15 @@
 </p>
 
 
-<p align="center">
-  
-  # LINDA — Live IQ Navigation and Display Application
-</p>
+<h1 align="center">Live IQ Navigation and Display Application</h1>
 
 LINDA is a live RF visualization suite for software-defined radios. It streams
 real-time spectrogram waterfalls and power spectral density (PSD) displays—one
 pane per receive channel—to a web browser, SSH terminal, or the radio's local
 display. A synthetic demo mode supports development without radio hardware.
 
-Built by *Mustafa Omran, Aric Sanders, and Dan Kuester*.
+Built by *Mustafa Omran*
+under supervision of *Aric Sanders, and Dan Kuester*.
 
 ## Installation
 
@@ -44,7 +42,7 @@ There is no password.
 ## Use case
 
 Use LINDA to inspect live RF activity from a supported SDR: tune a receive
-channel, observe its waterfall and PSD, adjust capture settings, record data,
+channel, observe its waterfall and PSD, adjust capture settings, record data, transmit signals
 and inspect operating status from the same browser interface. The web server
 shares one radio stream with multiple browser clients; use demo mode for safe
 UI and pipeline testing when no SDR is attached.
@@ -60,7 +58,7 @@ bash live/run_web.sh --device auto
 ## Workflow
 
 1. Install LINDA or create the demo environment.
-2. Start the `radio-web` service (the installer does this) or run the web
+2. Start the `radio-web` service (the installer does this automatically) or run the web
    server manually.
 3. Open the server URL in a browser and choose the appropriate username role.
 4. Tune and configure the receive path, then monitor, record, or export the
@@ -98,17 +96,16 @@ transmit safety, diagnostics, and troubleshooting.
 
 - `live/` — LINDA's web server, terminal/kiosk front ends, RF control tools,
   recordings, and tests.
-- `striqt/` — separately developed upstream RF acquisition and analysis
+- `striqt` — separately developed upstream RF acquisition and analysis
   library; see its [README](striqt/README.md) and documentation.
-- `setup.sh` / `uninstall_linda.sh` — idempotent installation and careful
-  removal of the host integration.
+- `setup.sh` / `uninstall_linda.sh` — idempotent installation and
+  removal of program.
 
 ## Testing
 
 ```sh
 pytest -q live/tests
 ```
->>>>>>> 0a7f2a1 (README)
 
 ## AI Assistance
 
