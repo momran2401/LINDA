@@ -782,11 +782,24 @@ class TxController:
                 "unverified" if actual.get("frequency_hz") is None else "verified")
             with self._lock:
                 samples, unders = self._samples, self._underflows
+            # Duty cycle: samples the DAC actually took vs samples a continuous
+            # carrier needs for the time we were keyed. Anything well under
+            # 100% means the output was a gappy burst train, which every other
+            # field in this verdict would happily report as a clean carrier.
+            wire_rate = actual.get("sample_rate_hz") or plan["sample_rate_hz"]
+            expected = wire_rate * elapsed
+            duty = (samples / expected) if expected > 0 else 0.0
+            starved = 0.0 < duty < 0.9
+            if starved:
+                verdict = "mismatch"
             self._finish(
                 op_id, verdict,
                 f"transmitted {elapsed:.1f} s, {samples} samples "
+                f"({samples / wire_rate:.2f} s of signal, {duty:.0%} duty) "
                 f"({why})"
                 + (f", {unders} underflow(s)" if unders else "")
+                + (" — DAC WAS STARVED: the output was a gappy burst train, "
+                   "not a continuous carrier" if starved else "")
                 + (f" — readback disagreed on {', '.join(mismatched)}"
                    if mismatched else ""))
         finally:
@@ -1008,6 +1021,7 @@ class TxController:
         started = time.time()
         my_dev = dev
         stalled_since = None
+        pending = None          # [(wire, stride), samples_already_accepted]
 
         if self._stop_evt.is_set():
             # Something asked us to stop between arming and the first write —
@@ -1034,25 +1048,41 @@ class TxController:
                     level="warn")
                 return "radio was reopened underneath the transmission"
 
-            wire, stride = _encode_tx(wave.next(chunk), fmt, full_scale)
-            written = 0
-            while written < chunk and not self._stop_evt.is_set():
-                try:
-                    res = dev.writeStream(stream, [wire[written * stride:]],
-                                          chunk - written, timeoutUs=200000)
-                except Exception as exc:
-                    raise RuntimeError(f"writeStream failed: {exc}") from exc
-                ret = getattr(res, "ret", None)
-                if ret is None:
-                    ret = res[0] if isinstance(res, (list, tuple)) else int(res)
-                if ret > 0:
-                    written += int(ret)
-                elif ret == SOAPY_SDR_TIMEOUT:
-                    break      # re-check stop/duration, then retry this chunk
-                else:
-                    raise RuntimeError(f"writeStream returned {ret}")
+            # ONE buffer at a time, carried across timeouts.
+            #
+            # The obvious loop — build a chunk, write what you can, move on —
+            # is wrong in a way that only shows up on the air. A timeout means
+            # the DAC's queue is full, not that the samples are unwanted; if
+            # the partial buffer is abandoned and the next chunk is generated,
+            # every timeout silently DROPS the unwritten remainder and jumps
+            # the waveform's phase by a whole chunk. Measured on an AIR8201B:
+            # 6.18M samples in 2.0 s at a requested 15.36 MS/s — the DAC fed
+            # 20% of real time, i.e. a gappy burst train with a phase
+            # discontinuity at every gap, reported as a clean CW carrier.
+            if pending is None:
+                pending = [_encode_tx(wave.next(chunk), fmt, full_scale), 0]
+            (wire, stride), written = pending
+            try:
+                res = dev.writeStream(stream, [wire[written * stride:]],
+                                      chunk - written, timeoutUs=200000)
+            except Exception as exc:
+                raise RuntimeError(f"writeStream failed: {exc}") from exc
+            ret = getattr(res, "ret", None)
+            if ret is None:
+                ret = res[0] if isinstance(res, (list, tuple)) else int(res)
+            if ret > 0:
+                written += int(ret)
+                # Keep the SAME buffer until the radio has taken all of it.
+                pending = None if written >= chunk else [(wire, stride), written]
+                with self._lock:
+                    self._samples += int(ret)
+            elif ret == SOAPY_SDR_TIMEOUT or ret == 0:
+                # Queue full (or the driver reports no progress). Re-check stop
+                # and duration, then offer the very same samples again.
+                pass
+            else:
+                raise RuntimeError(f"writeStream returned {ret}")
             with self._lock:
-                self._samples += written
                 total = self._samples
 
             # A radio that accepts the stream but never consumes a sample is
