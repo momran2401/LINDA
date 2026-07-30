@@ -63,8 +63,7 @@ bash live/run_web.sh --device auto
 4. Tune and configure the receive path, then monitor, record, or export the
    resulting data.
 
-<<<<<<< HEAD
-## Troubleshooting
+## Quick Troubleshooting
 - **Setup fails after Installing GPS support** — no GPS serial device was
     detected. Re-run with `sudo env RADIO_GPS_DEVICE=none bash setup.sh`; this
     skips GPS probing for that run and recordings will set gps_valid=0.
