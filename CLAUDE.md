@@ -270,15 +270,24 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   sometimes raising, sometimes just failing its readback and reporting
   `MISMATCH` with 0 samples, depending on whether the Computer happened to
   have the RX stream disabled at that instant.
-- The ladder gives up as little as possible and DISCLOSES which rung it needed
+- The ladder has exactly TWO rungs and DISCLOSES which it needed
   (`plan.rx_mode`/`rx_note`, banner, op log): `coexist` (true full duplex —
-  other radios) → `rx_quiesced` (RX deactivated for the arming window, then
-  restored) → `rx_released` (RX stream closed for the whole transmission via
-  `acquirer.pause_and_release()`, the same handoff recording uses; the
+  other radios) → `rx_released` (RX stream closed for the whole transmission
+  via `acquirer.pause_and_release()`, the same handoff recording uses; the
   waterfall freezes and the UI says **LIVE VIEW PAUSED**). Only driver messages
   matching `_STREAM_CONFLICT_MARKERS` escalate — a bad request must fail fast
   rather than cost the operator their live view. The TX stream is closed BEFORE
   the RX stream is restored: it holds the very trigger RX needs back.
+- **Never call `enable_stream(source, False)` to free the radio for TX.** A
+  middle rung that did exactly that was tried and removed: the Acquirer thread
+  is blocked in a read on that stream, so disabling it underneath produces
+  `Inactive RF hardware detected` → `recovering after: TIMEOUT (error code -1)`
+  → `_recover()` → `TX.shutdown()`, killing the transmission that caused it,
+  and leaves the channel refusing to re-arm with `Invalid RX channel state to
+  set up triggering!`. A stream another thread is reading must be taken by
+  ASKING that thread (`pause_and_release`), never by pulling it out from under
+  it. Confirmed on an AIR8201B: tuning TX0 while RX streams is FINE; only
+  `setupStream` needs the RX stream closed.
 - `_tune_tx()` writes only settings the radio is not ALREADY on. Not an
   optimization: asking this driver to "change" the rate to the value it is
   already running earns a `Trigger in use` for nothing. Since the TX rate

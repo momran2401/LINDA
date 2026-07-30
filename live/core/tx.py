@@ -76,13 +76,25 @@ DEFAULT_CHUNK = 16384
 # first and discloses which rung it actually needed, because the last one costs
 # the operator their live view.
 TX_COEXIST      = "coexist"       # true full duplex; viewer never notices
-TX_RX_QUIESCED  = "rx_quiesced"   # RX briefly deactivated; viewer blips
 TX_RX_RELEASED  = "rx_released"   # RX stream closed for the whole transmission
+
+# There is deliberately NO middle rung that merely deactivates the RX stream.
+# It was tried, and it is unsafe on principle: the Acquirer thread is sitting
+# in a blocking read on that stream, so disabling it underneath produces
+#
+#     [WARNING] Inactive RF hardware detected, ignoring data transfer request!
+#     [radio] recovering after: TIMEOUT (error code -1)
+#
+# — the Acquirer concludes the radio is broken and calls _recover(), which
+# calls TX.shutdown() and kills the very transmission that caused it. It then
+# leaves the RX channel in a state where re-arming fails with "Invalid RX
+# channel state to set up triggering!". A stream another thread is actively
+# reading must be taken away by ASKING that thread (pause_and_release), never
+# by pulling it out from under it.
 
 #: Human wording for each rung — used in the op log and shown in the UI.
 TX_RX_MODE_NOTES = {
     TX_COEXIST: "live view keeps running (radio does full duplex)",
-    TX_RX_QUIESCED: "live view blipped while the TX stream was created",
     TX_RX_RELEASED: "LIVE VIEW IS DOWN — this radio cannot receive while "
                     "transmitting; it resumes when you press Stop",
 }
@@ -668,10 +680,10 @@ class TxController:
             thread.join(timeout=timeout)
         return self.status()
 
-    def shutdown(self):
+    def shutdown(self, reason="the radio is being released or shut down"):
         """Stop unconditionally — process exit, reset-radio, source teardown."""
         if self.active():
-            self.stop("server is shutting down or the radio is being released")
+            self.stop(reason)
 
     # -- writer thread -----------------------------------------------------
 
@@ -786,7 +798,7 @@ class TxController:
             self._restore_rx(rx_mode, op_id)
 
     #: The ladder, cheapest first.
-    _RX_RUNGS = (TX_COEXIST, TX_RX_QUIESCED, TX_RX_RELEASED)
+    _RX_RUNGS = (TX_COEXIST, TX_RX_RELEASED)
 
     def _source(self):
         return getattr(self._acquirer, "source", None)
@@ -836,23 +848,6 @@ class TxController:
                     f"trigger ({exc}) — giving up more of the live view and "
                     f"retrying", level="warn")
                 continue
-            # Armed. On the quiesced rung the viewer is only owed a blip, so
-            # put RX back; if it will not restart alongside the TX stream, drop
-            # the stream and escalate rather than leave the waterfall silently
-            # dead.
-            if rung == TX_RX_QUIESCED:
-                try:
-                    enable_stream(self._source(), True)
-                except Exception as exc:
-                    OPERATIONS.stage(
-                        op_id, "applying",
-                        f"RX would not restart alongside the TX stream "
-                        f"({exc}) — releasing the radio instead", level="warn")
-                    _close_stream(dev, stream)
-                    last = exc
-                    if final:
-                        raise
-                    continue
             OPERATIONS.stage(
                 op_id, "applied",
                 f"TX stream open in {fmt} (full scale {full_scale:g}, chosen "
@@ -869,9 +864,6 @@ class TxController:
             # viewer down for a transmission nobody is waiting for.
             raise RuntimeError(
                 f"transmission cancelled while arming — {self._stop_reason}")
-        if rung == TX_RX_QUIESCED:
-            enable_stream(self._source(), False)
-            return
         # TX_RX_RELEASED — hand the radio over exactly the way a recording
         # does. The Acquirer's pause path closes the RX stream while KEEPING
         # the AIR-T device initialized (source.close() would deinitialize the
@@ -890,9 +882,7 @@ class TxController:
     def _abandon_rung(self, rung, op_id):
         """Undo whatever _enter_rung took, so the next rung starts clean."""
         try:
-            if rung == TX_RX_QUIESCED:
-                enable_stream(self._source(), True)
-            elif rung == TX_RX_RELEASED:
+            if rung == TX_RX_RELEASED:
                 self._acquirer.resume()
         except Exception:
             pass

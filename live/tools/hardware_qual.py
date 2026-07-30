@@ -120,7 +120,11 @@ def qualify_tx(acquirer, args, is_demo):
     except Exception as exc:                       # noqa: BLE001
         return [("transmit start", "failed", str(exc))]
 
-    if not wait_for(lambda: txmod.TX.status()["state"] == "transmitting", 10.0):
+    # Generous: on a radio that cannot receive while transmitting, arming has
+    # to wait for the live acquirer to release the stream (up to 15 s by
+    # itself). A timeout here cancels the transmission mid-arm, which is a
+    # confusing way to fail a radio that was about to work.
+    if not wait_for(lambda: txmod.TX.status()["state"] == "transmitting", 40.0):
         txmod.TX.stop("qualification timed out waiting for the carrier")
         return [("transmit start", "failed", "never reached the transmitting state")]
 

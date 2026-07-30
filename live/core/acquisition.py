@@ -473,8 +473,9 @@ class Acquirer(threading.Thread):
         # Stop transmitting BEFORE the device handle is disturbed. The writer
         # thread notices a swapped handle on its own, but that is the backstop;
         # keying a PA into a stream whose device is being torn down is not
-        # something to leave to a race.
-        TX.shutdown()
+        # something to leave to a race. Name the reason: a transmission killed
+        # by a recovery it did not cause is otherwise untraceable.
+        TX.shutdown(f"the acquirer is recovering the radio after: {reason}")
         if state.DEVICE in devices.DEEPWAVE_MODELS and self.source is not None:
             # source.close() deinitializes the AD9371 management sensors for
             # this process. Recover AIR-T by replacing only its RX stream.

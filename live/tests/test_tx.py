@@ -468,13 +468,37 @@ def test_trigger_conflict_falls_back_to_releasing_the_receiver(trigger_bound):
     assert status["plan"]["rx_mode"] == txmod.TX_RX_RELEASED
     assert "LIVE VIEW IS DOWN" in status["plan"]["rx_note"]
     assert ctl._acquirer.paused == 1
-    # It tried the cheap rungs before taking the viewer down. On this radio the
-    # refusal comes from the TUNING call, so the cheap rungs never even reach
-    # setupStream — which is exactly why the ladder retries the whole arming
-    # sequence rather than just the stream call.
-    assert dev.tune_attempts >= 3         # rung 0, rung 1, then the real one
+    # It tried coexisting first, then released. There is deliberately no middle
+    # "just deactivate RX" rung — see the comment on TX_RX_MODE_NOTES.
+    assert dev.tune_attempts >= 2         # rung 0, then the real one
     assert dev.setup_attempts == 1        # only once, after the radio was free
     ctl.stop()
+
+
+def test_the_receiver_stream_is_never_pulled_from_under_the_acquirer(trigger_bound):
+    """Regression for a cascade seen on hardware.
+
+    An earlier middle rung deactivated the RX stream directly. The Acquirer
+    thread was blocked reading it, so it got a TIMEOUT, decided the radio was
+    broken, ran _recover() — which calls TX.shutdown() and killed the very
+    transmission that caused it — and left the channel in a state where
+    re-arming failed with "Invalid RX channel state to set up triggering!".
+    The only sanctioned way to take the stream is to ASK the Acquirer.
+    """
+    ctl, dev = trigger_bound
+    disabled = []
+    import core.shims as shims
+    real = shims.enable_stream
+    # core.tx imported enable_stream by name, so patch it there.
+    txmod.enable_stream = lambda src, on: disabled.append(on)
+    try:
+        ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "duration_s": 0.3})
+        assert _wait_state(ctl, "idle", timeout=8)
+        assert disabled == [], (
+            "TX disabled the RX stream directly instead of asking the acquirer")
+        assert ctl._acquirer.paused == 1
+    finally:
+        txmod.enable_stream = real
 
 
 def test_the_receiver_comes_back_after_the_transmission(trigger_bound):
