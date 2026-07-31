@@ -455,7 +455,12 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   both graph rows collapsed (measured: 2px waterfall pane, 8px PSD row).
   Phones therefore get explicit `min-height` cards, `grid-template-areas`
   reordered to put graphs BEFORE the control rail, and no nested scroll
-  region. The block restates `grid-template-columns: 1fr` rather than
+  region. Card heights are budgeted so the WHOLE UI fits about two phone
+  screens (~1.9 at 375×812) — this is a demo surface meant to show a graph is
+  live, not to be measured off. Instrument-grade panes push it to three
+  screens and nothing is gained; anyone who wants a close look taps a pane
+  header for focus mode (78vh), which is the right way to read one graph on a
+  phone anyway. The block restates `grid-template-columns: 1fr` rather than
   inheriting it, because it also matches a LANDSCAPE phone (812×375) where
   the older 720px block does not run — without it every area sat in the
   288px rail column. Matched on size only, never `pointer: coarse`: that

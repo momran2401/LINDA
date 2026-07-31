@@ -773,10 +773,12 @@ body.light-theme ::-webkit-scrollbar-thumb:hover { background: #aab6c7; }
 
     /* Give the header its space back. 179px of a 812px phone was 22% of the
        screen before a single pixel of signal. */
-    #app-header { padding: 7px 12px; gap: 6px 12px; }
-    #freq-mhz { font-size: 20px; }
+    #app-header { padding: 6px 12px; gap: 5px 10px; }
+    #freq-mhz { font-size: 18px; }
     .hdiv { display: none; }
-    #applied-settings { font-size: 9px; line-height: 1.35; gap: 2px; }
+    #applied-settings { font-size: 8.5px; line-height: 1.3; gap: 1px; }
+    .status-pill, #signout-btn, .mode-opt, #theme-toggle { padding-top: 2px; padding-bottom: 2px; }
+    .brand-sub { margin-top: 1px; }
     #applied-settings .ap-row { flex-wrap: wrap; gap: 4px 10px; white-space: normal; }
     /* The status cluster (connected · role · calibration · DAN/ARIC · theme ·
        sign out) is `margin-left:auto; flex:0 0 auto` and does not wrap, so at
@@ -822,10 +824,16 @@ body.light-theme ::-webkit-scrollbar-thumb:hover { background: #aab6c7; }
         display: flex; flex-direction: column; gap: 8px;
         flex: 0 0 auto; min-height: 0;
     }
-    /* Real heights, because there is no longer a parent height to divide. */
-    .wf-pane { min-height: 34vh; }
-    #psd-row  { flex: 0 0 auto; min-height: 32vh; }
+    /* Real heights, because there is no longer a parent height to divide.
+       Sized to SHOW that a graph is live, not to measure anything off it —
+       the whole UI should be reachable in about two screens of scrolling, and
+       instrument-grade panes put it at three. Anyone who wants a close look
+       taps the header and gets 78vh (focus mode, below), which is the right
+       way to read one graph on a phone anyway. */
+    .wf-pane { min-height: 22vh; }
+    #psd-row  { flex: 0 0 auto; min-height: 22vh; }
     #log-row  { flex: 0 0 auto; }
+    #log-pre  { height: 74px; font-size: 10px; line-height: 1.5; }
 
     /* Focus mode earns its keep here: one graph, full screen, one tap. The
        desktop rules hide the siblings; these give the survivor a height,
@@ -865,8 +873,8 @@ body.light-theme ::-webkit-scrollbar-thumb:hover { background: #aab6c7; }
     /* Share the width evenly. Without a basis the panes size to their content
        — a canvas that is width:100% of nothing — and collapse to ~130px in an
        812px viewport, which is the portrait bug wearing a different hat. */
-    .wf-pane { flex: 1 1 0; min-width: 0; min-height: 68vh; }
-    #psd-row  { min-height: 62vh; }
+    .wf-pane { flex: 1 1 0; min-width: 0; min-height: 52vh; }
+    #psd-row  { min-height: 46vh; }
     body[data-focus^="wf"] .wf-pane.pane-focused { min-height: 80vh; }
     body[data-focus="psd"] #psd-row { min-height: 80vh; }
 }
