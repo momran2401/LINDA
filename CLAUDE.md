@@ -435,6 +435,21 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   double-ruling — that keeps row separators right however many tabs a mode hides.
 - OPS rail tab renders `{"op": ...}` WS events + `/operations` backfill.
 - Waterfall panes are cloned per header `channels`; one channel = full width.
+- **Focus mode**: clicking a pane's HEADER (`.wf-title`, or the PSD
+  `.panel-head` — the canvases already own a crosshair and the band-drag
+  gesture) gives that graph the whole dashboard; Esc or a second click
+  restores. It is worth having because `.wf-canvas`'s bitmap is exactly
+  `nfft × depth` stretched by CSS with `image-rendering: pixelated`: at 1024
+  bins in a half-width pane the browser drops **47% of the frequency bins**
+  nearest-neighbour before you see them (measured). Focus is a per-client
+  VIEW state — it sends nothing and never touches `rows`, which is global
+  config: one viewer zooming must not change the frame geometry every other
+  viewer is watching, nor write an op per click. It also frees no buffer (the
+  ring is `(channels, MAX_TAIL)` — per channel), so don't market it that way.
+  Hidden panes keep INGESTING (`wfBuf` feeds the PSD, band monitor and
+  hold/min traces) and skip only `paintWaterfall`; `setFocus` repaints them
+  in full on restore, so a restored pane shows continuous history rather than
+  a seam.
 - Read-only roles: `SAFE_SELECTOR` whitelist in app.js gates what they may touch.
 
 ## Key constants (core/constants.py)
