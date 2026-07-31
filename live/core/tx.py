@@ -64,6 +64,11 @@ DEFAULT_AMPLITUDE = 0.5
 #: Samples per writeStream call when the driver reports no MTU.
 DEFAULT_CHUNK = 16384
 
+#: How long an acknowledgment of the legal notice stays valid. Short enough that
+#: an operator returning to a long-running server is shown the notice again
+#: rather than inheriting a colleague's acceptance from hours ago.
+ACK_TTL_S = 900.0
+
 # How the TX stream had to be obtained, best case first. Observed on a real
 # AIR8201B: `setupStream(SOAPY_SDR_TX)` fails with
 #
@@ -387,7 +392,7 @@ class TxController:
         self._underflows = 0
         self._op_id = None
         self._stop_reason = "not stopped"
-        self._acknowledged = set()  # subjects that have seen the legal notice
+        self._acknowledged = {}     # subject -> monotonic time of acknowledgment
         self._caps_cache = None
 
     # -- wiring ------------------------------------------------------------
@@ -407,15 +412,28 @@ class TxController:
         """Record that `subject` has been shown the legal notice.
 
         Server-side because a modal the client can delete from the DOM is not a
-        gate. Cleared by a process restart, which is the honest scope: a new
-        server is a new session.
+        gate.
+
+        The acknowledgment EXPIRES (ACK_TTL_S). It used to last for the life of
+        the process, and `subject` is the role name — so the first admin to
+        accept the notice silently acknowledged it on behalf of every later
+        admin session, forever. Anyone signing in afterwards reached a live
+        "arm TX" path having never been shown the notice, while the notice
+        itself promises that every transmission is attributable to its
+        operator. A short TTL means a returning operator sees it again.
         """
         with self._lock:
-            self._acknowledged.add(str(subject))
+            self._acknowledged[str(subject)] = time.monotonic()
 
     def is_acknowledged(self, subject):
         with self._lock:
-            return str(subject) in self._acknowledged
+            at = self._acknowledged.get(str(subject))
+            if at is None:
+                return False
+            if time.monotonic() - at > ACK_TTL_S:
+                del self._acknowledged[str(subject)]
+                return False
+            return True
 
     # -- capabilities ------------------------------------------------------
 

@@ -10,7 +10,7 @@ in `live/`. The `striqt/` subdirectory is an upstream NIST library (Dr. Dan
 Kuester & Aric Sanders) included as a dependency — treat it as **read-only**
 unless explicitly told otherwise.
 
-> **`striqt/` is NOT the striqt that runs on the radio.** `setup.sh` installs a
+> **`striqt/` is NOT the striqt that runs on the radio.** `install_linda.sh` installs a
 > pinned, radio-verified v0.7.0 (`STRIQT_COMMIT` = `2e7696d`); the vendored
 > directory is a *later* snapshot with a different source API — `arm_spec`,
 > `_read_stream`, `setup_spec`, `RxStream.open`, and one-step `from_spec()`
@@ -91,7 +91,7 @@ bash live/run_web.sh [--tunnel]                     # launcher (tunnel optional)
 python3 live/striqt_kiosk.py --demo                 # local fullscreen browser
 python3 live/striqt_standalone_terminal.py --demo --backend quicklook
 python3 live/radioctl.py status                     # SSH client for a RUNNING server
-sudo bash setup.sh                                  # full installer + TUI
+sudo bash install_linda.sh                                  # full installer + TUI
 ```
 
 Copying recordings off the radio (both run on YOUR machine, never on the radio):
@@ -118,7 +118,7 @@ lazily because 3.9 binds them to the current event loop at construction.
 `radioctl.py self-test` qualifies settings THROUGH a running server and
 restores the starting configuration afterwards.
 
-The web UI is CDN-free: uPlot is vendored in `live/web/vendor/` (setup.sh
+The web UI is CDN-free: uPlot is vendored in `live/web/vendor/` (install_linda.sh
 re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 
 ## AHAWI mode (coherent capture → segmented replay)
@@ -188,10 +188,10 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   unreachable / no device attached / no fix yet / stale. The reader starts with
   the server, not on first request. `RADIO_GPS=0` disables the integration;
   `RADIO_GPS_HOST`/`RADIO_GPS_PORT` relocate gpsd.
-- `setup.sh install_gps()` provisions gpsd on a FRESH host: installs it, probes
+- `install_linda.sh install_gps()` provisions gpsd on a FRESH host: installs it, probes
   for a port actually emitting satellite data, binds it in `/etc/default/gpsd`
   so it survives reboot, and warns without failing setup when there is no
-  receiver. `RADIO_GPS_DEVICE=/dev/ttyTHS1 bash setup.sh` names a port
+  receiver. `RADIO_GPS_DEVICE=/dev/ttyTHS1 bash install_linda.sh` names a port
   explicitly and skips the probe. `gps_probe_ttys()` walks
   `ttyACM*`/`ttyUSB*`/`ttyTHS*`/`ttyAMA*` — the AIR-T wires its onboard GNSS
   module to a Tegra UART, so a USB-only probe reports "no receiver" on a radio
@@ -341,7 +341,7 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   (`DemoAcquirer._synth_chunk`), so the whole flow — menu, notice, animation,
   ops log, "did I tune where I meant to" — is verifiable with no radio and
   nothing radiated.
-- `setup.sh detect_tx_support()` writes `RADIO_TX=1` by default, `0` only when
+- `install_linda.sh detect_tx_support()` writes `RADIO_TX=1` by default, `0` only when
   the driver reports zero TX channels or the family is known receive-only
   (rtlsdr/airspy). `radioctl.py tx status|start|stop` is the SSH path (`start`
   requires `--i-have-a-license`). `hardware_qual.py --tx --tx-freq-mhz N`
@@ -376,7 +376,7 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   uses a signed cookie (`/login` form); Basic username auth remains accepted
   for curl/API (`curl -u admin:`).
   `RADIO_AUTH_DISABLE=1` for demo/dev.
-- Production: `setup.sh` configures role usernames and generates
+- Production: `install_linda.sh` configures role usernames and generates
   `RADIO_SESSION_SECRET` into
   `/etc/radio-web/radio.env` (0600) and installs the systemd unit
   (`deploy/radio-web.service.template` → `deploy/run_service.sh`, mode from
@@ -393,9 +393,13 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 - Capture form shows MHz / MS/s (converted to Hz on send via
   `FIELD_UNITS`/`dataset.unitScale`); Apply sends only fields changed vs the
   last server seed (`formBaseline`).
-- PSD (uPlot): wheel zoom / drag pan / Shift-drag box zoom / Alt-drag band
-  selection / double-click reset; zoom survives frames via
-  `setData(data, psdZoomX === null)`.
+- PSD (uPlot): the x axis is NOT zoomable or pannable — it always live-follows
+  the full sampled span (see the comment in `setupBandDrag`). The one gesture
+  is a plain unmodified drag on the plot's `over` div to create, move, or
+  resize the band-monitor region; the band is drawn from a uPlot draw hook, not
+  a canvas. Legend keys toggle series. `setupBandDrag` re-registers its window
+  listeners on every plot rebuild and drops the previous set via an
+  `AbortController`.
 - Rail nav is a collapsing tab bar: a 38 px `.rail-strip` names the active tool
   (label + one tick per visible tab + chevron) and the 3-column `.rail-menu`
   drops over the panel on hover/click, collapsing again on select. Tabs keep

@@ -358,6 +358,12 @@ body.mode-noob #dashboard { overflow-y: auto; }
 .swatch-mean { background: var(--mean); }
 .swatch-max  { background: var(--max); }
 body.analysis-psd #psd-row .legend-key { display: none; }
+/* The PSD backend returns statistic traces, not a time axis, so there is no
+   waterfall to draw. The row used to stay visible holding the LAST calibrated
+   frame's pixels — a frozen image that reads as live data. Hide it and let the
+   PSD pane take the height. */
+body.analysis-psd #waterfall-row { display: none; }
+body.analysis-psd #psd-row { flex: 1 1 auto; }
 
 /* waterfalls — fill available height */
 #waterfall-row {

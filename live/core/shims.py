@@ -153,7 +153,7 @@ def stream_buffers_for(source, samples):
 # ---------------------------------------------------------------------------
 # Source-spec accessors + the finite-capture (recording) mode swap
 #
-# These target the INSTALLED striqt — v0.7.0, pinned by commit in setup.sh —
+# These target the INSTALLED striqt — v0.7.0, pinned by commit in install_linda.sh —
 # whose source objects expose __setup__/setup_spec/arm_spec/_read_stream. The
 # NEWER striqt snapshot vendored under striqt/ renamed every one of those (see
 # INSTALLED_STRIQT_API.txt). Code written against the vendored tree therefore

@@ -27,6 +27,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -160,13 +161,23 @@ def authenticate(auth_header) -> "str | None":
 # survives the cookie-only path that Safari/iOS use for the WS upgrade. The role
 # is inside the HMAC, so a viewer cannot self-elevate by editing the cookie.
 #
-# The signing secret comes from RADIO_SESSION_SECRET when set; otherwise it is
-# derived deterministically from the role/user mapping. That fallback is public
-# and forgeable, so production setup always generates RADIO_SESSION_SECRET.
-
+# The signing secret comes from RADIO_SESSION_SECRET when set; otherwise a
+# RANDOM per-process key is generated.
+#
+# The old fallback derived the key from the role/user mapping — i.e. from
+# "admin", "viewer", "intern", the documented defaults. Anyone who read the
+# README could recompute the key and mint a valid admin cookie, which was
+# verified in practice against a demo server: a forged cookie retuned the
+# radio. A random key cannot be guessed. The cost is that sessions do not
+# survive a restart (everyone signs in again), which is a visible, harmless
+# inconvenience — unlike a signing key that is public by construction.
+#
+# Production setup still generates RADIO_SESSION_SECRET so sessions persist
+# across service restarts.
+_SESSION_SECRET_IS_EPHEMERAL = not os.environ.get("RADIO_SESSION_SECRET")
 _SESSION_SECRET = hashlib.sha256(
     (os.environ.get("RADIO_SESSION_SECRET")
-     or "|".join(f"{r}:{u}" for r, u in _ROLE_USERS.items())
+     or secrets.token_hex(32)
     ).encode()
 ).digest()
 SESSION_TTL = 86400
@@ -420,6 +431,10 @@ _slot_lock = asyncio.Lock() # guards the single-admin slot
 _admin_ws  = None           # the one active admin socket, or None
 _recording = None           # RecordingManager
 _insights  = None           # InsightService
+
+# Recording/TX status is broadcast on change; this is the slow keepalive that
+# still refreshes elapsed/remaining counters when nothing else has moved.
+STATUS_KEEPALIVE_S = 2.0
 
 
 @asynccontextmanager
@@ -1146,12 +1161,17 @@ async def reset_radio(request: Request):
             return e
 
     pre = await asyncio.get_running_loop().run_in_executor(None, _preflight)
-    desired = f"{systemctl_path} restart {RADIO_SERVICE_NAME}"
     listing = "" if isinstance(pre, Exception) else (pre.stdout or "")
-    passwordless = any(
-        "NOPASSWD:" in line and desired in line
-        for line in listing.splitlines()
+    # Match the COMMAND, not the absolute path it was written with. The sudoers
+    # installer resolves systemctl with `command -v` at install time and this
+    # process resolves it with shutil.which at run time; on a host where those
+    # disagree (/bin/systemctl vs /usr/bin/systemctl) a perfectly good rule was
+    # reported as "no matching NOPASSWD sudoers rule".
+    _rule = re.compile(
+        r"NOPASSWD:.*(?:^|/)systemctl\s+restart\s+"
+        + re.escape(RADIO_SERVICE_NAME) + r"(?:\.service)?\s*$"
     )
+    passwordless = any(_rule.search(line.strip()) for line in listing.splitlines())
     if isinstance(pre, Exception) or pre.returncode != 0 or not passwordless:
         reason = (str(pre) if isinstance(pre, Exception)
                   else "no matching NOPASSWD sudoers rule")
@@ -1244,6 +1264,11 @@ async def _broadcaster():
     next_tick  = loop.time()
     last_t     = 0.0
     last_diag  = 0.0   # throttle the heartbeat log to ~once/sec
+    # Change-detection state for the recording/TX status messages (see below).
+    last_recording_json = None
+    last_tx_json        = None
+    last_status_push    = 0.0
+    status_sent_to      = set()
 
     while True:
         # Pace against an absolute deadline.  Sleeping ``interval`` after all
@@ -1273,11 +1298,30 @@ async def _broadcaster():
         # Structured operation stage events for the Operations tab.
         for ev in OPERATIONS.drain_events():
             texts.append(json.dumps({"op": _json_safe(ev)}))
-        texts.append(json.dumps({"recording": _json_safe(_recording.status())}))
+
+        # Recording + TX status are sent ON CHANGE, not on every tick. Re-sending
+        # both unconditionally at BROADCAST_FPS was ~30 identical JSON messages
+        # per second per client — pure overhead on exactly the hotspot/tunnel
+        # links these modes exist for. A slow keepalive still refreshes elapsed
+        # counters, and a newly joined client forces a resend so it never waits
+        # for the banner that says the radio is transmitting.
+        joined = set(_connections) - status_sent_to
+        status_sent_to = set(_connections)
+        recording_json = json.dumps({"recording": _json_safe(_recording.status())})
+        tx_json = json.dumps({"tx": _json_safe(tx.TX.status())})
+        now_mono = loop.time()
+        due = now_mono - last_status_push >= STATUS_KEEPALIVE_S
+        if joined or due or recording_json != last_recording_json:
+            texts.append(recording_json)
+            last_recording_json = recording_json
         # TX state goes to EVERY client, not just the admin driving it. People
         # sharing an instrument are entitled to know it is radiating, and
         # read-only roles need it to raise their standby banner.
-        texts.append(json.dumps({"tx": _json_safe(tx.TX.status())}))
+        if joined or due or tx_json != last_tx_json:
+            texts.append(tx_json)
+            last_tx_json = tx_json
+        if due or joined:
+            last_status_push = now_mono
         for text in texts:
             for ws in list(_connections):
                 try:
@@ -1350,8 +1394,14 @@ async def ws_endpoint(ws: WebSocket):
     # can't both see the slot free. A busy refusal uses a distinct 4001 code (vs
     # 1008 for auth) so the client can tell "another admin connected" from
     # "unauthorized"; the browser's auto-retry then acts as a takeover queue.
+    #
+    # The slot exists to stop two DIFFERENT people fighting over one radio. With
+    # auth disabled there is no second identity for it to arbitrate — everyone is
+    # DEFAULT_ROLE — so enforcing it there just meant a demo could be shown to
+    # exactly one browser, contradicting both the README's "shares one radio
+    # stream with multiple browser clients" and demo mode's whole purpose.
     async with _slot_lock:
-        if role == "admin" and _admin_ws is not None:
+        if role == "admin" and _admin_ws is not None and not AUTH_DISABLED:
             await ws.accept()
             await ws.send_text(json.dumps(
                 {"role": role, "auth_enabled": AUTH_ENABLED, "error": "admin-busy"}
@@ -1361,7 +1411,7 @@ async def ws_endpoint(ws: WebSocket):
             return
         await ws.accept()
         _connections.add(ws)
-        if role == "admin":
+        if role == "admin" and not AUTH_DISABLED:
             _admin_ws = ws
     # Tell the client its role immediately so app.js can enable/lock controls.
     # auth_enabled lets the UI hide the sign-out button in --demo / auth-off mode.
@@ -1596,11 +1646,11 @@ def main():
     else:
         users = ", ".join(f"{user}={role}" for role, user in _ROLE_USERS.items())
         print(f"  auth:     username-only role login ENABLED ({users})")
-        if not os.environ.get("RADIO_SESSION_SECRET"):
+        if _SESSION_SECRET_IS_EPHEMERAL:
             print(
-                "            *** WARNING: RADIO_SESSION_SECRET unset — cookie "
-                "signing key is predictable and sessions may be forgeable. "
-                "Set it for production. ***"
+                "            note: RADIO_SESSION_SECRET unset — using a random "
+                "per-process signing key, so logins do NOT survive a restart. "
+                "Set it to keep sessions across restarts."
             )
 
     # Transmit is the one feature that can get a person fined; say plainly at

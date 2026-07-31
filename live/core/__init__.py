@@ -1,4 +1,4 @@
-"""live/core — shared backend for every NIST-Omran live viewer frontend.
+"""live/core — shared backend for every LINDA live viewer frontend.
 
 Import order matters only in that striqt_compat must load first (it re-execs
 once to fix LD_LIBRARY_PATH on the AIR-T pixi env before scipy/striqt import);

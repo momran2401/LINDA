@@ -2,10 +2,10 @@
  THE striqt/ DIRECTORY IN THIS REPO IS **NOT** THE striqt THAT RUNS ON THE RADIO
 ==============================================================================
 
-setup.sh installs a pinned build:
+install_linda.sh installs a pinned build:
 
     striqt @ git+https://github.com/usnistgov/striqt@2e7696d3cd7c9f710f406b4b83148476ead8c20f
-    (v0.7.0 — "verified on the radio"; STRIQT_COMMIT in setup.sh is the source
+    (v0.7.0 — "verified on the radio"; STRIQT_COMMIT in install_linda.sh is the source
      of truth if this file ever drifts)
 
 The vendored `striqt/` subdirectory is a LATER upstream snapshot with a

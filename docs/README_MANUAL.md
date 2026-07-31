@@ -39,7 +39,7 @@ The main components are:
 - `live/striqt_standalone_terminal.py`: SSH-friendly terminal monitor.
 - `live/striqt_kiosk.py`: launches the web UI on the host display.
 - `live/tools/`: recording transfer and hardware qualification tools.
-- `setup.sh`: system installer. `uninstall_linda.sh`: conservative remover.
+- `install_linda.sh`: system installer. `uninstall_linda.sh`: conservative remover.
 
 ## Requirements and installation
 
@@ -55,7 +55,7 @@ bug report.
 ```sh
 git clone https://github.com/momran2401/LINDA.git
 cd LINDA
-sudo bash setup.sh
+sudo bash install_linda.sh
 ```
 
 Re-running the installer is intended to be safe and changes an existing
@@ -68,7 +68,7 @@ This installs the Python environment only and does not need root privileges or
 radio hardware:
 
 ```sh
-bash setup.sh --deps-only
+bash install_linda.sh --deps-only
 ./.venv/bin/python live/striqt_web_server.py --demo
 ```
 
@@ -84,10 +84,10 @@ the radio's SoapySDR driver. The full installer arranges these on supported
 hosts. The included `striqt/README.md` explains its independent environments
 and CLI tools.
 
-### `setup.sh` reference
+### `install_linda.sh` reference
 
 ```text
-sudo bash setup.sh [OPTIONS]
+sudo bash install_linda.sh [OPTIONS]
 ```
 
 | Option | Meaning |
@@ -111,11 +111,11 @@ sudo bash setup.sh [OPTIONS]
 Examples:
 
 ```sh
-sudo bash setup.sh --yes
-sudo bash setup.sh --demo --mode=web
-bash setup.sh --deps-only
-sudo bash setup.sh --device=driver=plutosdr,serial=XYZ --mode=kiosk
-sudo bash setup.sh --skip-radio-check --yes
+sudo bash install_linda.sh --yes
+sudo bash install_linda.sh --demo --mode=web
+bash install_linda.sh --deps-only
+sudo bash install_linda.sh --device=driver=plutosdr,serial=XYZ --mode=kiosk
+sudo bash install_linda.sh --skip-radio-check --yes
 ```
 
 Do not combine `--deps-only` with expectations of a systemd service: it is for
@@ -123,7 +123,7 @@ the local environment only. For a GPS-less installation, set the installer
 environment variable for that one invocation:
 
 ```sh
-sudo env RADIO_GPS_DEVICE=none bash setup.sh
+sudo env RADIO_GPS_DEVICE=none bash install_linda.sh
 ```
 
 ## Deployment modes
@@ -457,7 +457,7 @@ python3 live/radioctl.py --user admin status
 | Symptom | Checks and resolution |
 | --- | --- |
 | Installer rejects the host | Use a supported Debian/Raspberry Pi OS or Ubuntu release for the full installer. For a different platform, create the demo environment manually. |
-| GPS setup fails because no serial device is found | Re-run the installer with `sudo env RADIO_GPS_DEVICE=none bash setup.sh`. Recordings then have `gps_valid=0`. |
+| GPS setup fails because no serial device is found | Re-run the installer with `sudo env RADIO_GPS_DEVICE=none bash install_linda.sh`. Recordings then have `gps_valid=0`. |
 | Browser says “waiting for first frame” | Follow `journalctl -u radio-web -f`; the operation log identifies the failing stage. Confirm the radio is attached and no other acquisition process owns it. |
 | `--device auto` lists several radios | Specify the selector printed by discovery, such as `--device driver=...,serial=...`. |
 | No radio is discovered | Run `SoapySDRUtil --find`; reconnect/power the radio; then re-run setup so the matching driver is installed. |
@@ -478,7 +478,7 @@ python3 live/radioctl.py --user admin status
 Run every CLI’s authoritative help for the installed revision:
 
 ```sh
-bash setup.sh --help
+bash install_linda.sh --help
 bash uninstall_linda.sh --help
 python3 live/striqt_web_server.py --help
 python3 live/radioctl.py --help

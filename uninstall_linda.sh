@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# LINDA — uninstaller. Removes what setup.sh installed, and nothing else.
+# LINDA — uninstaller. Removes what install_linda.sh installed, nothing else.
 #
 #     sudo bash uninstall_linda.sh              # show the plan, then confirm
 #     sudo bash uninstall_linda.sh --dry-run    # show the plan and stop
@@ -8,6 +8,9 @@
 #
 # Extra removals, each off by default because they can break unrelated things:
 #     --purge-recordings   delete captured data under recordings/  (NO BACKUP)
+#     --yes-delete-recordings
+#                          the unattended form of the recordings confirmation.
+#                          --yes alone does NOT delete recordings.
 #     --purge-desktop      remove Chromium/X/Openbox/LightDM (kiosk mode)
 #     --purge-network      remove NetworkManager and avahi (mDNS)
 #     --purge-groups       drop the user from the plugdev/dialout groups
@@ -15,9 +18,9 @@
 #     --keep-packages      touch no apt packages at all
 #
 # How it decides what to remove:
-#   setup.sh writes /etc/radio-web/installed-packages listing every package
+#   install_linda.sh writes /etc/radio-web/installed-packages listing every package
 #   that was NOT already present before it ran. Those are removed. If that
-#   manifest is missing (installed by an older setup.sh) it falls back to a
+#   manifest is missing (installed by an older release) it falls back to a
 #   conservative list of SDR-only packages and says so.
 #
 #   Packages whose removal could leave the machine unbootable, unreachable or
@@ -40,6 +43,7 @@ ASSUME_YES=0
 DRY_RUN=0
 KEEP_PACKAGES=0
 PURGE_RECORDINGS=0
+YES_DELETE_RECORDINGS=0
 PURGE_DESKTOP=0
 PURGE_NETWORK=0
 PURGE_GROUPS=0
@@ -47,7 +51,7 @@ PURGE_PIP_CACHE=0
 DONE=0
 STARTED_REMOVING=0   # flips once the first destructive step runs
 
-# ── Output + failure trap (installed before any logic, same as setup.sh) ────
+# ── Output + failure trap (installed before any logic, same as install_linda.sh) ────
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 ok()   { printf '\033[1;32m    ✓ %s\033[0m\n' "$*"; }
@@ -76,6 +80,7 @@ for arg in "$@"; do
         --dry-run|-n)       DRY_RUN=1 ;;
         --keep-packages)    KEEP_PACKAGES=1 ;;
         --purge-recordings) PURGE_RECORDINGS=1 ;;
+        --yes-delete-recordings) YES_DELETE_RECORDINGS=1 ;;
         --purge-desktop)    PURGE_DESKTOP=1 ;;
         --purge-network)    PURGE_NETWORK=1 ;;
         --purge-groups)     PURGE_GROUPS=1 ;;
@@ -104,7 +109,7 @@ PROTECTED=(
 DESKTOP_PKGS=(chromium chromium-browser xserver-xorg xinit openbox lightdm dbus-x11)
 NETWORK_PKGS=(network-manager avahi-daemon)
 
-# Used only when setup.sh left no manifest (older installs). Deliberately
+# Used only when the installer left no manifest (older installs). Deliberately
 # limited to packages that exist for software-defined radio and nothing else.
 FALLBACK_PKGS=(
     python3-soapysdr soapysdr-tools libsoapysdr0.8
@@ -230,7 +235,7 @@ if [[ ${#REMOVE_PKGS[@]} -gt 0 ]]; then
     if [[ $MANIFEST_FOUND -eq 1 ]]; then
         info "packages     ${#REMOVE_PKGS[@]} from the install manifest, plus orphaned dependencies:"
     else
-        warn "no install manifest (older setup.sh) — falling back to the known SDR package list"
+        warn "no install manifest (older release) — falling back to the known SDR package list"
         info "packages     ${#REMOVE_PKGS[@]} SDR packages, plus orphaned dependencies:"
     fi
     printf '                 %s\n' "${REMOVE_PKGS[*]}"
@@ -243,7 +248,7 @@ fi
 say "This will KEEP"
 info "the git clone at $REPO_ROOT  (remove it yourself when you are done)"
 info "the machine's hostname and /etc/hosts"
-info "the default systemd target (setup may have set graphical.target for kiosk)"
+info "the default systemd target (install may have set graphical.target for kiosk)"
 if [[ ${#SKIPPED_PKGS[@]} -gt 0 ]]; then
     info "shared/system packages — removing these can cost you the desktop,"
     info "the network or the machine itself:"
@@ -256,13 +261,15 @@ if [[ $REC_COUNT -gt 0 && $PURGE_RECORDINGS -eq 0 ]]; then
     info "             captured data is not deleted by default; use --purge-recordings"
 fi
 
+# A dry run now WALKS the whole script with DRY_RUN honoured by safe_rm/run,
+# instead of exiting here. Exiting after the summary meant every "would
+# remove"/"would run" branch below was unreachable, so the preview silently
+# omitted the per-file Pluto removals, the pip cache, group changes,
+# __pycache__ deletion and the cmdline backup — the steps a preview is most
+# needed for. Confirmations are skipped because nothing will be changed.
 if [[ $DRY_RUN -eq 1 ]]; then
-    say "Dry run — nothing was changed."
-    DONE=1
-    exit 0
-fi
-
-if [[ $ASSUME_YES -eq 0 ]]; then
+    say "Dry run — every action below is a preview; nothing will be changed."
+elif [[ $ASSUME_YES -eq 0 ]]; then
     printf '\n\033[1;33mProceed? type "yes" to continue: \033[0m'
     read -r reply || true
     if [[ "$reply" != "yes" ]]; then
@@ -272,15 +279,26 @@ if [[ $ASSUME_YES -eq 0 ]]; then
     fi
 fi
 
-# A second, separate confirmation for irreplaceable capture data.
-if [[ $PURGE_RECORDINGS -eq 1 && $REC_COUNT -gt 0 && $ASSUME_YES -eq 0 ]]; then
-    printf '\n\033[1;31mDelete %s recording files (%s)? This cannot be undone.\033[0m\n' \
-        "$REC_COUNT" "$REC_SIZE"
-    printf '\033[1;31mType "delete recordings" to confirm: \033[0m'
-    read -r reply2 || true
-    if [[ "$reply2" != "delete recordings" ]]; then
+# A second, separate confirmation for irreplaceable capture data — deliberately
+# NOT satisfied by --yes. One flag whose documented job is skipping a routine
+# prompt must not also green-light destroying research data that has no backup.
+# Unattended runs say so explicitly with --yes-delete-recordings.
+if [[ $PURGE_RECORDINGS -eq 1 && $REC_COUNT -gt 0 && $DRY_RUN -eq 0 \
+      && $YES_DELETE_RECORDINGS -eq 0 ]]; then
+    if [[ -t 0 ]]; then
+        printf '\n\033[1;31mDelete %s recording files (%s)? This cannot be undone.\033[0m\n' \
+            "$REC_COUNT" "$REC_SIZE"
+        printf '\033[1;31mType "delete recordings" to confirm: \033[0m'
+        read -r reply2 || true
+        if [[ "$reply2" != "delete recordings" ]]; then
+            PURGE_RECORDINGS=0
+            warn "recordings will be kept"
+        fi
+    else
+        # No terminal to confirm on, and no explicit flag: keep the data.
         PURGE_RECORDINGS=0
-        warn "recordings will be kept"
+        warn "recordings KEPT: --purge-recordings needs either an interactive"
+        warn "confirmation or --yes-delete-recordings"
     fi
 fi
 
@@ -322,10 +340,17 @@ for d in "$REPO_ROOT"/.venv.backup.*; do
     [[ -e "$d" ]] && safe_rm "$d"
 done
 safe_rm "$REPO_ROOT/setup.log"
-if [[ $DRY_RUN -eq 0 ]]; then
-    find "$REPO_ROOT" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
-    find "$REPO_ROOT" -type d -name '.pytest_cache' -prune -exec rm -rf {} + 2>/dev/null || true
-fi
+for cache_name in __pycache__ .pytest_cache; do
+    if [[ $DRY_RUN -eq 1 ]]; then
+        # Disclose these in the preview: they were silently absent from it.
+        while IFS= read -r cache_dir; do
+            [[ -n "$cache_dir" ]] && info "would remove  $cache_dir"
+        done < <(find "$REPO_ROOT" -type d -name "$cache_name" -prune 2>/dev/null || true)
+    else
+        find "$REPO_ROOT" -type d -name "$cache_name" -prune \
+            -exec rm -rf {} + 2>/dev/null || true
+    fi
+done
 if [[ $PURGE_RECORDINGS -eq 1 ]]; then
     safe_rm "$RECORDINGS_DIR"
 elif [[ $REC_COUNT -gt 0 ]]; then
@@ -384,7 +409,9 @@ safe_rm "${cmdline:-/nonexistent}.nist-omran.bak"
 PLUTO_SRC="/usr/local/src/SoapyPlutoSDR"
 if [[ -d "$PLUTO_SRC" ]]; then
     say "Removing the locally built SoapyPlutoSDR"
-    if [[ -f "$PLUTO_SRC/build/install_manifest.txt" && $DRY_RUN -eq 0 ]]; then
+    # safe_rm honours DRY_RUN itself, so the manifest is now walked in a dry
+    # run too — these per-file removals used to be invisible in the preview.
+    if [[ -f "$PLUTO_SRC/build/install_manifest.txt" ]]; then
         while IFS= read -r installed; do
             safe_rm "$installed"
         done < "$PLUTO_SRC/build/install_manifest.txt"
@@ -422,6 +449,14 @@ fi
 
 # ── Done ────────────────────────────────────────────────────────────────────
 DONE=1
+if [[ $DRY_RUN -eq 1 ]]; then
+    printf '\n\033[1;36m╔══════════════════════════════════════════════════════════════════╗\033[0m\n'
+    printf '\033[1;36m║  Dry run complete — NOTHING was changed                          ║\033[0m\n'
+    printf '\033[1;36m╚══════════════════════════════════════════════════════════════════╝\033[0m\n'
+    echo "    Re-run without --dry-run to perform the actions listed above."
+    echo
+    exit 0
+fi
 printf '\n\033[1;32m╔══════════════════════════════════════════════════════════════════╗\033[0m\n'
 printf '\033[1;32m║  LINDA has been removed                                          ║\033[0m\n'
 printf '\033[1;32m╚══════════════════════════════════════════════════════════════════╝\033[0m\n'

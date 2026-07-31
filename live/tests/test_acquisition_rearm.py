@@ -1,8 +1,22 @@
-"""Same-device rearm lifecycle tests (no hardware required)."""
+"""Same-device rearm lifecycle tests (no radio required — but striqt is).
+
+These build a real SoapyCapture through core.acquisition.make_capture, which
+needs striqt.sensor.specs. On a host without the striqt stack (a laptop) the
+whole module is skipped rather than failing: a red result there is noise that
+hides real regressions.
+"""
+
+import pytest
 
 from core import acquisition, state
 from core.acquisition import Acquirer
 from core.config import SharedConfig
+from core.striqt_compat import _SENSOR_OK
+
+pytestmark = pytest.mark.skipif(
+    not _SENSOR_OK,
+    reason="striqt.sensor is not importable on this host; make_capture cannot "
+           "build a SoapyCapture spec")
 
 
 class FakeSource:

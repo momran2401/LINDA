@@ -907,74 +907,145 @@ class SharedConfig:
                     reconnect.append(key)
                 if reconnect:
                     self._cfg.source_config = source_cfg
+            # Tier-1 disclosure helpers. The analysis block already reports every
+            # adjustment it makes ("knowable constraint → snap and tell"); the
+            # radio-facing fields below now honour the same contract, so a
+            # clamped tune can never be reported as an exact one.
+            def _tell(field, req, used, reason):
+                rounded.append({"field": field, "requested": req,
+                                "used": used, "reason": reason})
+
+            def _reject(field, req, reason):
+                rejected.append({"field": field, "requested": req,
+                                 "reason": reason})
+
             for key, value in update.items():
                 if key not in valid:
                     continue
-                if key == "backend":
-                    value = str(value).strip().lower()
-                    if value not in BACKENDS:
-                        continue
-                elif key in {"lo_null", "host_resample"}:
-                    value = bool(value)
-                elif key == "lo_shift":
-                    # striqt LOShift is Literal['left','right','none'].
-                    value = str(value).strip().lower()
-                    if value not in {"left", "right", "none"}:
-                        continue
-                elif key == "analysis_bandwidth":
-                    try:
+                requested = value
+                # A malformed value is REPORTED, never raised. An exception here
+                # used to escape update() after earlier keys in the same message
+                # had already been written to self._cfg — leaving the config
+                # mutated but never marked dirty, so the radio and the config
+                # disagreed silently until some later change re-armed.
+                try:
+                    if key == "backend":
+                        value = str(value).strip().lower()
+                        if value not in BACKENDS:
+                            _reject(key, requested, "unknown backend (known: "
+                                    + ", ".join(sorted(BACKENDS)) + ")")
+                            continue
+                    elif key in {"lo_null", "host_resample"}:
+                        value = bool(value)
+                    elif key == "lo_shift":
+                        # striqt LOShift is Literal['left','right','none'].
+                        value = str(value).strip().lower()
+                        if value not in {"left", "right", "none"}:
+                            _reject(key, requested,
+                                    "lo_shift must be left, right, or none")
+                            continue
+                    elif key == "analysis_bandwidth":
                         value = float(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if not (math.isinf(value) or value > 0):
-                        continue   # must be a positive bandwidth or inf (no limit)
-                elif key == "backend_sample_rate":
-                    try:
+                        # inf is legal here (no bandwidth limit); NaN never is.
+                        if math.isnan(value) or not (math.isinf(value) or value > 0):
+                            _reject(key, requested,
+                                    "analysis_bandwidth must be a positive Hz "
+                                    "value, or infinite for no limit")
+                            continue
+                    elif key == "backend_sample_rate":
                         value = float(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if value < 0:
-                        continue   # 0 == track sample_rate; otherwise a positive rate
-                elif key in ANALYSIS_CFG_KEYS:
-                    # Already validated by _validate_analysis — only its
-                    # survivors reach this loop (top-level copies are stripped).
-                    pass
-                elif key == "duration":
-                    try:
-                        value = max(0.0, float(value))   # seconds; 0 = rows-driven
-                    except (TypeError, ValueError):
-                        continue
-                elif key in {"ahawi", "ahawi_align"}:
-                    value = bool(value)
-                elif key == "ahawi_capture_ms":
-                    # Requested coherent span; the per-capture plan re-fits it
-                    # to the ring honestly and the frame header discloses the
-                    # executed value.
-                    try:
+                        if not math.isfinite(value) or value < 0:
+                            _reject(key, requested,
+                                    "backend_sample_rate must be 0 (track "
+                                    "sample_rate) or a positive finite rate")
+                            continue
+                    elif key in ANALYSIS_CFG_KEYS:
+                        # Already validated by _validate_analysis — only its
+                        # survivors reach this loop (top-level copies are stripped).
+                        pass
+                    elif key == "duration":
                         value = float(value)
-                    except (TypeError, ValueError):
-                        continue
-                    value = float(max(AHAWI_MIN_CAPTURE_MS,
-                                      min(value, AHAWI_MAX_CAPTURE_MS)))
-                else:
-                    value = int(value) if key in {"nfft", "rows"} else float(value)
+                        if not math.isfinite(value):
+                            _reject(key, requested,
+                                    "duration must be a finite number of seconds")
+                            continue
+                        value = max(0.0, value)   # seconds; 0 = rows-driven
+                    elif key in {"ahawi", "ahawi_align"}:
+                        value = bool(value)
+                    elif key == "ahawi_capture_ms":
+                        # Requested coherent span; the per-capture plan re-fits it
+                        # to the ring honestly and the frame header discloses the
+                        # executed value.
+                        value = float(value)
+                        if not math.isfinite(value):
+                            _reject(key, requested,
+                                    "ahawi_capture_ms must be a finite duration")
+                            continue
+                        used = float(max(AHAWI_MIN_CAPTURE_MS,
+                                         min(value, AHAWI_MAX_CAPTURE_MS)))
+                        if used != value:
+                            _tell(key, value, used,
+                                  f"AHAWI capture length is limited to "
+                                  f"{AHAWI_MIN_CAPTURE_MS:g}–"
+                                  f"{AHAWI_MAX_CAPTURE_MS:g} ms")
+                        value = used
+                    else:
+                        value = int(value) if key in {"nfft", "rows"} else float(value)
+                        # NaN/inf must never reach a clamp below: written as
+                        # max(lo, min(v, hi)), every comparison against NaN is
+                        # false, so the clamp silently returns `lo` — a NaN
+                        # centre used to retune the radio to the bottom of its
+                        # envelope and report it as a clean success.
+                        if isinstance(value, float) and not math.isfinite(value):
+                            _reject(key, requested, f"{key} must be a finite number")
+                            continue
+                except (TypeError, ValueError, OverflowError) as exc:
+                    _reject(key, requested, str(exc) or f"{key} is not a number")
+                    continue
                 # Clamp rows to what the ring can supply for the current backend/
                 # nfft (P1-5). nfft, if changed in this same message, is applied
                 # earlier in the loop, so self._cfg already reflects it here.
                 if key == "rows":
-                    value = int(max(1, min(value, max_live_rows(self._cfg))))
+                    limit = max_live_rows(self._cfg)
+                    used = int(max(1, min(value, limit)))
+                    if used != value:
+                        _tell(key, value, used,
+                              f"rows must be 1–{limit}: the most this backend and "
+                              f"FFT size can draw from the {MAX_TAIL}-sample IQ ring")
+                    value = used
                 elif key == "center":
-                    value = float(max(env["freq_min"], min(value, env["freq_max"])))
+                    used = float(max(env["freq_min"], min(value, env["freq_max"])))
+                    if used != value:
+                        _tell(key, value, used,
+                              f"outside this radio's tuning range "
+                              f"({env['freq_min']/1e6:.6g}–"
+                              f"{env['freq_max']/1e6:.6g} MHz)")
+                    value = used
                 elif key == "sample_rate":
                     value = float(value)
-                    if not (eff_backend == "ssb" and ssb_grid_compatible(value, eff_scs)):
-                        value = float(_snap(value, allowed_rates(env)))
-                    value = float(max(env["rate_min"], min(value, env["rate_max"])))
+                    used = value
+                    if not (eff_backend == "ssb" and ssb_grid_compatible(used, eff_scs)):
+                        used = float(_snap(used, allowed_rates(env)))
+                    used = float(max(env["rate_min"], min(used, env["rate_max"])))
+                    if used != value:
+                        _tell(key, value, used,
+                              "sample rate snaps to the LTE/5G-NR grid ("
+                              + ", ".join(f"{r/1e6:g}" for r in allowed_rates(env))
+                              + " MS/s) within the radio's range")
+                    value = used
                 elif key == "gain":
-                    value = float(max(env["gain_min"], min(value, env["gain_max"])))
+                    used = float(max(env["gain_min"], min(value, env["gain_max"])))
+                    if used != value:
+                        _tell(key, value, used,
+                              f"outside this radio's gain range "
+                              f"({env['gain_min']:g}–{env['gain_max']:g} dB)")
+                    value = used
                 elif key == "nfft":
-                    value = int(_snap(value, NFFT_CHOICES))
-                    value = int(max(128, min(value, 8192)))
+                    used = int(max(128, min(int(_snap(value, NFFT_CHOICES)), 8192)))
+                    if used != value:
+                        _tell(key, value, used, "FFT size snaps to "
+                              + "/".join(str(n) for n in NFFT_CHOICES))
+                    value = used
                 old = getattr(self._cfg, key)
                 if old == value:
                     continue

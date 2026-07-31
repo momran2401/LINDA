@@ -2,10 +2,10 @@
 # ============================================================================
 # LINDA — one-command installer for the live two-channel RF viewer.
 #
-#     sudo bash setup.sh            # detect the radio, ask 2 questions, done
-#     sudo bash setup.sh --yes      # same, but ask nothing (all defaults)
-#     sudo bash setup.sh --demo     # synthetic IQ; no radio required
-#     bash setup.sh --deps-only     # just the Python env, no root, no service
+#     sudo bash install_linda.sh          # detect the radio, ask 2 questions
+#     sudo bash install_linda.sh --yes    # same, but ask nothing (all defaults)
+#     sudo bash install_linda.sh --demo   # synthetic IQ; no radio required
+#     bash install_linda.sh --deps-only   # just the Python env, no root/service
 #
 # Overrides (rarely needed — everything below is auto-detected):
 #     --device=auto|uhd|pluto|rtlsdr|hackrf|airspy|bladerf|limesdr
@@ -32,6 +32,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
+# Every user-facing message names the script by the file it is actually running
+# from. Hard-coding the name is what left the whole script telling people to run
+# "setup.sh" after it was renamed to install_linda.sh — including its own --help
+# and the "run as root" error, neither of which could work.
+SELF="$(basename "${BASH_SOURCE[0]}")"
 ENV_DIR="/etc/radio-web"
 ENV_FILE="$ENV_DIR/radio.env"
 UNIT_FILE="/etc/systemd/system/radio-web.service"
@@ -108,7 +113,7 @@ for arg in "$@"; do
             awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if ($0 !~ /^=+$/) print; next}
                  NR>1 {exit}' "$0"
             SETUP_COMPLETE=1; exit 0 ;;
-        *) die "unknown option: $arg  (run: bash setup.sh --help)" ;;
+        *) die "unknown option: $arg  (run: bash $SELF --help)" ;;
     esac
 done
 
@@ -143,7 +148,7 @@ info "log  $LOG_FILE"
 # ── 2. Preflight ────────────────────────────────────────────────────────────
 preflight() {
     [[ $DEPS_ONLY -eq 1 ]] && return 0
-    [[ $IS_ROOT -eq 1 ]] || die "run as root:  sudo bash setup.sh"
+    [[ $IS_ROOT -eq 1 ]] || die "run as root:  sudo bash $SELF"
     id "$SERVICE_USER" >/dev/null 2>&1 || die "no such user: $SERVICE_USER"
     [[ "$MODE" =~ ^(web|hotspot|ethernet|kiosk|terminal)$ ]] || die "invalid --mode: $MODE"
     [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1024 && PORT <= 65535 )) \
@@ -155,7 +160,7 @@ preflight() {
     case " ${ID:-} ${ID_LIKE:-} " in
         *" debian "*|*" ubuntu "*) ;;
         *) die "automated setup supports Debian-family Linux (found: ${ID:-unknown}).
-       Everything else can still run demo mode:  bash setup.sh --deps-only" ;;
+       Everything else can still run demo mode:  bash $SELF --deps-only" ;;
     esac
     case "$ARCH" in
         x86_64|aarch64|arm64) ;;
@@ -241,6 +246,21 @@ declare -a USB_RADIO_TABLE=(
     "2cf0:|bladerf|soapysdr-module-bladerf|Nuand bladeRF"
 )
 RADIO_PKGS=""
+
+# The driver packages a radio KIND needs, read from the SAME table detection
+# uses so an explicitly named device installs exactly what a detected one does.
+packages_for_kind() {
+    local want="$1" row id kind pkgs label
+    [[ -n "$want" ]] || return 0
+    for row in "${USB_RADIO_TABLE[@]}"; do
+        IFS='|' read -r id kind pkgs label <<<"$row"
+        if [[ "$kind" == "$want" && "$pkgs" != "-" ]]; then
+            printf '%s' "$pkgs"
+            return 0
+        fi
+    done
+    return 0
+}
 
 usb_present() {
     # Belt and braces against the bug above: normalise a bare vendor id to the
@@ -470,8 +490,15 @@ install_radio_driver() {
             return 0
             ;;
     esac
+    # RADIO_PKGS is only set by detect_radio, on a USB match. An explicit
+    # --device=uhd (or the menu choice, or provisioning with
+    # --skip-radio-check before the radio arrives) therefore reached here with
+    # it empty and installed NO driver at all — including uhd-host, without
+    # which install_uhd_images has no uhd_images_downloader and the USRP never
+    # opens. Fall back to the same table detection uses, keyed by kind.
+    [[ -n "$RADIO_PKGS" ]] || RADIO_PKGS="$(packages_for_kind "$RADIO_KIND")"
     [[ -n "$RADIO_PKGS" ]] || return 0
-    say "Installing the $RADIO_LABEL driver"
+    say "Installing the ${RADIO_LABEL:-$RADIO_KIND} driver"
     # shellcheck disable=SC2086
     apt_install $RADIO_PKGS || die "could not install: $RADIO_PKGS"
     ok "driver installed: $RADIO_PKGS"
@@ -624,7 +651,7 @@ install_udev_rules() {
     done
     install -d -m 0755 /etc/udev/rules.d
     cat > /etc/udev/rules.d/70-linda-sdr.rules <<'EOF'
-# Managed by LINDA setup.sh — USB SDRs usable without root.
+# Managed by LINDA install_linda.sh — USB SDRs usable without root.
 SUBSYSTEM=="usb", ATTR{idVendor}=="2500", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="0456", ATTR{idProduct}=="b673", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2832", MODE="0660", GROUP="plugdev", TAG+="uaccess"
@@ -681,13 +708,34 @@ install_gps() {
 # fine. UARTs also need the line speed set first: a tty left at the wrong baud
 # returns silence, not garbage, which is indistinguishable from no receiver.
 gps_probe_ttys() {
-    local candidate baud console
-    # Never claim the kernel console: it is a UART, it is chatty enough to look
-    # alive, and handing it to gpsd breaks the only way into a headless box.
-    console="$(sed -n 's/.*console=\([^, ]*\).*/\1/p' /proc/cmdline 2>/dev/null)"
+    local candidate baud console consoles skip
+    # Never claim a kernel console: it is a UART, it is chatty enough to look
+    # alive, and handing it to gpsd — or merely re-bauding it, which the probe
+    # below does — breaks the only way into a headless box.
+    #
+    # EVERY console= token has to be excluded, not just one. A stock Raspberry
+    # Pi cmdline reads "console=serial0,115200 console=tty1 ...", and a greedy
+    # single-match sed returns only the LAST one (tty1), leaving the real
+    # serial console fair game for the stty below.
+    consoles=()
+    while IFS= read -r console; do
+        console="${console#console=}"
+        console="${console%%,*}"        # drop the ",115200" baud suffix
+        [[ -n "$console" ]] && consoles+=("/dev/$console")
+    done < <(grep -o 'console=[^ ]*' /proc/cmdline 2>/dev/null || true)
     for candidate in /dev/ttyACM* /dev/ttyUSB* /dev/ttyTHS* /dev/ttyAMA*; do
         [[ -c "$candidate" ]] || continue
-        [[ -n "$console" && "$candidate" == "/dev/$console" ]] && continue
+        skip=0
+        for console in ${consoles+"${consoles[@]}"}; do
+            # Compare resolved paths: /dev/serial0 is a symlink to the very
+            # ttyAMA/ttyS device the loop walks.
+            if [[ "$candidate" == "$console" ]] || \
+               [[ "$(readlink -f "$candidate" 2>/dev/null)" == \
+                  "$(readlink -f "$console" 2>/dev/null)" ]]; then
+                skip=1; break
+            fi
+        done
+        [[ $skip -eq 1 ]] && continue
         for baud in 9600 115200 38400; do
             stty -F "$candidate" "$baud" raw -echo >/dev/null 2>&1 || continue
             if gps_tty_speaks "$candidate"; then
@@ -705,7 +753,12 @@ gps_probe_ttys() {
 # The check stays narrow on purpose: Arduinos and FTDI cables share these
 # device names, and claiming one for gpsd is worse than finding nothing.
 gps_tty_speaks() {
-    timeout 4 head -c 4096 "$1" 2>/dev/null \
+    # `head -c 4096` buffers through stdio and is SIGTERMed by timeout with the
+    # data still unflushed, so a real receiver at 300-800 B/s produced nothing
+    # within the window and read as "no receiver". dd writes each block out as
+    # it lands, and the count is small enough to fill quickly: one NMEA epoch
+    # is well over 256 bytes, so a working receiver clears it in about a second.
+    timeout 4 dd if="$1" bs=256 count=4 iflag=nonblock 2>/dev/null \
         | grep -qa -e '\$G[PNLAB]' -e "$(printf '\xb5\x62')"
 }
 
@@ -997,16 +1050,23 @@ write_env_file() {
     detect_tx_support
     info "transmit: $TX_NOTE"
     mkdir -p "$ENV_DIR"
-    local secret
-    if [[ -f "$ENV_FILE" ]] && grep -q RADIO_SESSION_SECRET "$ENV_FILE"; then
-        secret="$(grep '^RADIO_SESSION_SECRET=' "$ENV_FILE" | cut -d'"' -f2)"
+    local secret=""
+    if [[ -f "$ENV_FILE" ]]; then
+        # Extract first, anchored, and tolerate a miss. The old guard grepped
+        # for the NAME unanchored, so a hand-edited file merely MENTIONING
+        # RADIO_SESSION_SECRET in a comment passed it — and the anchored
+        # extraction that followed then found nothing, failing the assignment
+        # and aborting the whole install under `set -e`.
+        secret="$(sed -n 's/^RADIO_SESSION_SECRET="\?\([^"]*\)"\?.*/\1/p' \
+                  "$ENV_FILE" | head -1 || true)"
+    fi
+    if [[ -n "$secret" ]]; then
         info "keeping the existing session-signing secret"
     else
         secret="$(openssl rand -hex 32 2>/dev/null || genpw)"
-        CREDS_NOTE="admin · viewer · intern  (username only, no password)"
     fi
     cat > "$ENV_FILE" <<EOF
-# Generated by LINDA setup.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ).
+# Generated by LINDA $SELF on $(date -u +%Y-%m-%dT%H:%M:%SZ).
 # Edit, then: systemctl restart $SERVICE_NAME.  Keep this file mode 0600.
 RADIO_MODE="$MODE"
 RADIO_PORT="$PORT"
@@ -1296,7 +1356,7 @@ if [[ "$RADIO_CHECK_STATUS" == FAILED* ]]; then
 fi
 if [[ "$DEVICE" == "demo" && "$RADIO_KIND" != "demo" ]]; then
     printf '\n\033[1;33m    No radio was detected, so demo mode was configured.\n'
-    printf '    Plug the radio in and re-run: sudo bash setup.sh\033[0m\n'
+    printf '    Plug the radio in and re-run: sudo bash %s\033[0m\n' "$SELF"
 fi
 [[ -e /var/run/reboot-required ]] && REBOOT_REQUIRED=1
 if [[ $REBOOT_REQUIRED -eq 1 ]]; then

@@ -1,8 +1,8 @@
-# radio-web systemd unit — installed by setup.sh (placeholders are substituted).
+# radio-web systemd unit — installed by install_linda.sh (placeholders are substituted).
 # The service reads all runtime configuration from /etc/radio-web/radio.env
 # (mode, port, role usernames, session secret) — nothing secret lives here.
 [Unit]
-Description=NIST-Omran live radio viewer (@RADIO_MODE@ mode)
+Description=LINDA live radio viewer (@RADIO_MODE@ mode)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0

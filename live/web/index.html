@@ -670,33 +670,35 @@ if (!window.uPlot) {
         grid.className = "freq-grid";
 
         g.items.forEach(function (it) {
-            var tunable = it.mhz >= 300 && it.mhz <= 6000;
             var chip = document.createElement("button");
             chip.type = "button";
-            chip.className = "freq-chip" + (tunable ? "" : " is-disabled");
-            chip.dataset.mhz = String(it.mhz);
+            chip.className = "freq-chip";
+            chip.dataset.mhz   = String(it.mhz);
+            chip.dataset.label = it.label;
             chip.innerHTML =
                 '<span class="fc-name"></span>' +
                 '<span class="fc-mhz"></span>';
             chip.querySelector(".fc-name").textContent = it.label;
-            chip.querySelector(".fc-mhz").textContent  =
-                tunable ? fmtMHz(it.mhz) + " MHz" : "below radio range";
+            chip.querySelector(".fc-mhz").textContent  = fmtMHz(it.mhz) + " MHz";
 
-            if (!tunable) {
-                chip.disabled = true;
-                chip.title = "Outside the radio's 300 MHz – 6 GHz tuning range";
-            } else {
-                chip.addEventListener("click", function () {
-                    if (typeof sendControl === "function") {
-                        sendControl({ center: it.mhz * 1e6 });
-                    }
-                    if (typeof logMsg === "function") {
-                        logMsg("Tuned to " + it.label + " — " + fmtMHz(it.mhz) + " MHz");
-                    }
-                    chips.forEach(function (c) { c.classList.remove("selected"); });
-                    chip.classList.add("selected");
-                });
-            }
+            // Every chip gets a listener, whatever its frequency. Enablement is
+            // decided ONLY by gateStationChips() against the device's real
+            // envelope from /config. Deciding it here against a hard-coded
+            // 300-6000 MHz range meant that on a radio tuning lower (the
+            // generic SoapySDR profile starts at 1 MHz) gateStationChips
+            // re-enabled the sub-300 MHz chips — which then looked live but did
+            // nothing, because only the "tunable" branch ever bound a handler.
+            chip.addEventListener("click", function () {
+                if (chip.disabled) return;
+                if (typeof sendControl === "function") {
+                    sendControl({ center: it.mhz * 1e6 });
+                }
+                if (typeof logMsg === "function") {
+                    logMsg("Tuned to " + it.label + " — " + fmtMHz(it.mhz) + " MHz");
+                }
+                chips.forEach(function (c) { c.classList.remove("selected"); });
+                chip.classList.add("selected");
+            });
             grid.appendChild(chip);
             chips.push(chip);
         });
