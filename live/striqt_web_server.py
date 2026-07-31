@@ -2,9 +2,15 @@
 """
 Web-based live spectrogram + PSD viewer server (frontend).
 
-All radio/DSP/config logic lives in live/core/ — this file is the web-facing
-frontend: authentication, HTTP routes, the WebSocket broadcaster, and startup
-wiring. Any other frontend (terminal, kiosk standalone) drives the same core.
+This is Linda's canonical web UI backend. All radio/DSP/config logic lives in
+live/core/ — this file only wires that logic to the outside world: role-based
+auth (signed session cookie + HTTP Basic), the FastAPI HTTP routes (config,
+presets, GPS, recording, transmit, admin reset), the `/ws` WebSocket that
+streams live frames and control acks, the `/ws/logs` journal tail, and the
+`main()` CLI entry point that resolves the device and starts uvicorn. Any
+other frontend (terminal, kiosk standalone) drives the same live/core/ objects
+through its own thin wrapper; per the repo's architecture rule, a backend bug
+belongs in live/core/, never patched here.
 
 Usage:
     python live/striqt_web_server.py                     # AIR8201B radio
@@ -109,9 +115,19 @@ RADIO_SERVICE_NAME = os.environ.get("RADIO_SERVICE_NAME") or "radio-web"
 
 
 def match_username(user) -> "str | None":
-    """
-    Resolve a username to a role name, or None when it matches no known login.
-    Compare against every row without returning early.
+    """Resolve a plain username to its role, in constant time.
+
+    There are no passwords: the username alone selects the role. Every row in
+    `_ROLE_USERS` is compared with `secrets.compare_digest` and none is
+    skipped early, so the loop's timing does not leak which row (if any)
+    matched.
+
+    Args:
+        user: The username string to resolve.
+
+    Returns:
+        The matching role name (e.g. "admin"), or None if it matches no
+        configured login.
     """
     matched_role = None
     for role, known_user in _ROLE_USERS.items():
@@ -121,13 +137,20 @@ def match_username(user) -> "str | None":
 
 
 def authenticate(auth_header) -> "str | None":
-    """
-    Resolve an HTTP `Authorization` header to a role name, or None when the
-    username matches no known login. The Basic password field is ignored.
-    Returns DEFAULT_ROLE when auth is disabled
-    so --demo / local dev keeps full control.
+    """Resolve an HTTP `Authorization` header to a role name.
 
-    `auth_header` may be a str (Starlette Request) or bytes (raw ASGI scope).
+    Only the `Basic` scheme is accepted; the password field is decoded but
+    intentionally ignored since usernames alone carry the role. When auth is
+    globally disabled (`RADIO_AUTH_DISABLE=1`), always returns `DEFAULT_ROLE`
+    so `--demo` / local dev keeps full control without any header at all.
+
+    Args:
+        auth_header: The header value, as a str (from a Starlette `Request`)
+            or bytes (from a raw ASGI scope).
+
+    Returns:
+        The resolved role name, or None if the header is missing, not Basic,
+        malformed, or names an unknown user.
     """
     if AUTH_DISABLED:
         return DEFAULT_ROLE
@@ -184,10 +207,20 @@ SESSION_TTL = 86400
 
 
 def make_session_token(role: str, ttl_seconds: int = SESSION_TTL) -> str:
-    """
-    Build a signed session token "<role>.<exp>.<hex_hmac>" where exp is an int
-    unix expiry and hex_hmac = HMAC-SHA256(secret, "<role>.<exp>"). The role is
-    covered by the MAC so it cannot be tampered with.
+    """Build a signed session token for the `radio_auth` cookie.
+
+    Token format is `"<role>.<exp>.<hex_hmac>"`, where `exp` is a Unix
+    timestamp and `hex_hmac = HMAC-SHA256(_SESSION_SECRET, "<role>.<exp>")`.
+    Covering the role with the MAC means a client cannot self-elevate by
+    editing the cookie value.
+
+    Args:
+        role: The authenticated role to embed ("admin", "viewer", "interns").
+        ttl_seconds: Seconds until the token expires. Defaults to
+            `SESSION_TTL` (24 hours).
+
+    Returns:
+        The signed token string.
     """
     exp = int(time.time()) + ttl_seconds
     payload = f"{role}.{exp}"
@@ -195,11 +228,17 @@ def make_session_token(role: str, ttl_seconds: int = SESSION_TTL) -> str:
     return f"{payload}.{mac}"
 
 def verify_session_token(token) -> "str | None":
-    """
-    Validate a "<role>.<exp>.<hex_hmac>" session token: recompute the HMAC with a
-    constant-time comparison, confirm the role is known, and confirm the expiry
-    is still in the future. Returns the role on success, else None on any
-    malformed / tampered / expired input.
+    """Validate a `"<role>.<exp>.<hex_hmac>"` session token.
+
+    Recomputes the HMAC with a constant-time comparison, confirms the role is
+    one of the known logins, and confirms the expiry is still in the future.
+
+    Args:
+        token: The raw cookie value to validate.
+
+    Returns:
+        The embedded role on success, or None if the token is missing,
+        malformed, tampered with, names an unknown role, or has expired.
     """
     if not token:
         return None
@@ -229,10 +268,15 @@ def verify_session_token(token) -> "str | None":
 
 
 def _session_cookie_from_scope(scope) -> "str | None":
-    """
-    Parse the request's Cookie header from a raw ASGI scope and return the role
-    when a "radio_auth" cookie is present and passes verify_session_token, else
-    None.
+    """Extract and validate the `radio_auth` cookie from a raw ASGI scope.
+
+    Args:
+        scope: The ASGI connection scope (http or websocket), whose `headers`
+            list is scanned for a `Cookie` header.
+
+    Returns:
+        The role from the cookie's session token when present and valid
+        (see `verify_session_token`), else None.
     """
     headers = dict(scope.get("headers") or [])
     raw_cookie = headers.get(b"cookie")
@@ -247,30 +291,49 @@ def _session_cookie_from_scope(scope) -> "str | None":
 
 
 class BasicAuthMiddleware:
-    """
-    Pure-ASGI middleware that gates EVERY http and websocket request behind a
-    recognized username. Mounted static files and the /ws
-    endpoint are all covered because it wraps the entire app.
+    """Pure-ASGI middleware gating every http and websocket request.
+
+    Wraps the whole FastAPI app, so mounted static files and the `/ws`
+    endpoint are covered along with every route. Accepts either an HTTP Basic
+    `Authorization` header (username only; password ignored — see
+    `authenticate`) or a signed `radio_auth` session cookie (see
+    `_session_cookie_from_scope`), and resolves both to a role stashed on
+    `scope["role"]`/`scope["user"]` for downstream handlers.
 
     On failure:
-      - http      → redirect to the username login form (or 401 for APIs).
-      - websocket → the handshake is rejected (browsers replay the page's
-                    signed login cookie connects; anyone else is refused before
-                    `accept()`).
+      - http      → redirect to the username login form (or a plain 401 for
+                    non-GET/API-ish requests).
+      - websocket → the handshake is rejected with close code 1008 before
+                    `accept()`.
     """
 
     def __init__(self, app):
+        """Store the wrapped ASGI application.
+
+        Args:
+            app: The next ASGI callable in the middleware stack.
+        """
         self.app = app
 
     @staticmethod
     def _set_cookie_send(scope, send, role):
-        """
-        Wrap `send` to append a Set-Cookie header carrying a fresh role-bearing
-        session token on the HTTP response start. Only the success path uses
-        this, so the cookie is never attached to a 401. The `Secure` attribute is
-        omitted over plain HTTP (LAN) so Safari/iOS — which refuse to store a
-        Secure cookie without TLS and won't replay Basic on the WS upgrade — can
-        still reach /ws (LV-R8). HttpOnly and SameSite=Lax are always set.
+        """Wrap an ASGI `send` to attach a fresh session cookie on success.
+
+        Appends a `Set-Cookie` header carrying a new role-bearing session
+        token to the HTTP response start message. Only called on the
+        authenticated path, so the cookie is never attached to a 401. The
+        `Secure` attribute is omitted over plain HTTP (LAN) so Safari/iOS —
+        which refuse to store a `Secure` cookie without TLS and won't replay
+        Basic auth on the WS upgrade — can still reach `/ws`. `HttpOnly` and
+        `SameSite=Lax` are always set.
+
+        Args:
+            scope: The current ASGI scope, used to detect https.
+            send: The ASGI `send` callable to wrap.
+            role: The role to encode into the new session token.
+
+        Returns:
+            An async callable with the same signature as `send`.
         """
         headers_in = dict(scope.get("headers") or [])
         is_https = (
@@ -280,6 +343,7 @@ class BasicAuthMiddleware:
         secure_attr = "Secure; " if is_https else ""
 
         async def wrapped(message):
+            """Forward `message`, injecting the Set-Cookie header on response start."""
             if message["type"] == "http.response.start":
                 cookie = (
                     f"radio_auth={make_session_token(role)}; Path=/; HttpOnly; "
@@ -300,6 +364,22 @@ class BasicAuthMiddleware:
     _PUBLIC_PATHS = frozenset({"/login", "/logout", "/health"})
 
     async def __call__(self, scope, receive, send):
+        """Resolve a role for this connection and dispatch or reject it.
+
+        Order of resolution: auth-disabled bypass, then the always-reachable
+        public paths (`_PUBLIC_PATHS`), then Basic header, then session
+        cookie. HTTP responses on the authenticated path get a refreshed
+        session cookie attached (see `_set_cookie_send`); websocket scopes
+        never get one. Unauthenticated websockets are closed with code 1008;
+        unauthenticated HTML GETs are redirected to `/login`; everything else
+        unauthenticated gets a 401.
+
+        Args:
+            scope: The ASGI connection scope (`scope["type"]` is `"http"`,
+                `"websocket"`, or `"lifespan"`).
+            receive: The ASGI receive callable, passed through unchanged.
+            send: The ASGI send callable, possibly wrapped to attach a cookie.
+        """
         if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
@@ -387,21 +467,37 @@ class BasicAuthMiddleware:
 
 
 class NoCacheMiddleware:
-    """
-    Pure-ASGI middleware that stamps no-store cache headers on every HTTP
-    response so browsers always refetch the page and assets. WebSocket and
-    other scope types pass straight through untouched.
+    """Pure-ASGI middleware that disables HTTP caching on every response.
+
+    Stamps `Cache-Control: no-store`, `Pragma: no-cache`, and `Expires: 0` on
+    every HTTP response so browsers always refetch the page and static
+    assets instead of serving a stale cached copy. WebSocket and other scope
+    types pass straight through untouched.
     """
 
     def __init__(self, app):
+        """Store the wrapped ASGI application.
+
+        Args:
+            app: The next ASGI callable in the middleware stack.
+        """
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        """Pass the request through, rewriting cache headers on the response.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: The ASGI receive callable, passed through unchanged.
+            send: The ASGI send callable, wrapped for http scopes to strip
+                any existing cache headers and add the no-store set.
+        """
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
         async def send_wrapper(message):
+            """Forward `message`, replacing any cache headers on response start."""
             if message["type"] == "http.response.start":
                 headers = [
                     (k, v)
@@ -439,10 +535,28 @@ STATUS_KEEPALIVE_S = 2.0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the acquirer (+ compute) threads and broadcaster; clean up on
-    shutdown. Cancellation is swallowed explicitly: CancelledError is a
-    BaseException, so a bare `except Exception` here used to let Ctrl-C
-    surface as "Application shutdown failed" with a traceback."""
+    """FastAPI lifespan: start acquisition/compute/broadcast, then tear down.
+
+    On startup, starts `_acquirer` (and `_computer`, when the device is not a
+    self-computing `DemoAcquirer`), connects the GPS reader, waits briefly for
+    the first frame, and spawns the `_broadcaster` task. On shutdown, kills
+    any active transmission first (a dying process cannot retract radiated
+    RF, unlike every other shutdown step, which can be retried), then stops
+    recording, GPS, and config threads, cancels the broadcaster, and joins
+    the acquisition/compute threads.
+
+    `asyncio.CancelledError` is swallowed explicitly during the broadcaster
+    join: it is a `BaseException`, so a bare `except Exception` here used to
+    let Ctrl-C surface as "Application shutdown failed" with a traceback.
+
+    Args:
+        app: The FastAPI application instance (required by the lifespan
+            protocol; unused directly here since state lives in module
+            globals set by `main()`).
+
+    Yields:
+        None. Control returns to FastAPI while the app serves requests.
+    """
     _acquirer.start()
     if _computer is not None:
         _computer.start()
@@ -484,6 +598,21 @@ app.add_middleware(NoCacheMiddleware)
 
 
 def _json_safe(obj):
+    """Recursively coerce a value tree into plain JSON-serializable types.
+
+    Handles dicts, lists/tuples, non-finite floats (NaN/inf → None, since
+    JSON has no representation for them), `Fraction` (→ str), and any object
+    exposing a numpy-style `.item()` (→ its Python scalar). Used to sanitize
+    every JSON response and outgoing WS message built from striqt/numpy
+    values.
+
+    Args:
+        obj: Any value, typically a dict/list tree possibly containing numpy
+            scalars, `Fraction`s, or non-finite floats.
+
+    Returns:
+        An equivalent structure containing only JSON-safe types.
+    """
     if isinstance(obj, dict):
         return {str(k): _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -501,6 +630,20 @@ def _json_safe(obj):
 
 
 def capture_editor_schema():
+    """Build the JSON schema of the striqt sweep-spec class for `/schema`.
+
+    Looks up the sweep-spec dataclass for the current device binding (falling
+    back to the air8201b binding for non-AIR-T devices, since the capture
+    editor's fields are shared across radios) and converts it to a JSON
+    schema via striqt's own helper, then runs it through `_json_safe`.
+
+    Returns:
+        A JSON-safe dict: the schema the browser's capture-settings editor
+        is built from.
+
+    Raises:
+        RuntimeError: If no sweep-spec class can be located on the binding.
+    """
     from striqt.sensor import bindings
     from striqt.analysis.specs.helpers import json_schema
 
@@ -517,9 +660,17 @@ def capture_editor_schema():
 
 @app.get("/schema")
 async def schema_endpoint():
-    # striqt may be absent when running --demo on a machine without the SDR
-    # stack; answer with a clean 503 (the client logs it and skips the capture
-    # editor) instead of an unhandled-500 traceback on every page load.
+    """Serve the capture-editor JSON schema (see `capture_editor_schema`).
+
+    striqt may be absent when running `--demo` on a machine without the SDR
+    stack, so failures are answered with a clean 503 (the client logs it and
+    skips the capture editor) instead of an unhandled 500 traceback on every
+    page load.
+
+    Returns:
+        JSONResponse: The schema on success (200), or `{"error": ...}` with
+        status 503 when the schema cannot be built.
+    """
     try:
         return JSONResponse(capture_editor_schema())
     except Exception as exc:
@@ -529,12 +680,21 @@ async def schema_endpoint():
 
 
 def current_config():
-    """
-    JSON view of the live RadioConfig (P2a-5). The browser seeds its forms from
-    this instead of the striqt schema defaults, so a bare Apply re-sends the
-    server's own values — no more silent flips of untouched fields whose schema
-    default differs from the server default (e.g. host_resample true vs false).
-    Also the re-sync source after every settings/analysis ack.
+    """Build a JSON snapshot of the live `SharedConfig` for the browser.
+
+    The browser seeds its settings forms from this instead of the striqt
+    schema defaults, so a bare Apply re-sends the server's own current
+    values — this avoids silently flipping untouched fields whose schema
+    default differs from the server's actual default (e.g. `host_resample`
+    true vs false). Also used as the re-sync source after every
+    settings/analysis ack, and embedded in `/record` and preset-apply
+    responses.
+
+    Returns:
+        A JSON-safe dict with `capture`, `analysis`, `analysis_psd`,
+        `analysis_ssb`, `source`, `device`, `envelope`, `backend`, `rows`,
+        `lo_null`, `ahawi`, and `calibration` keys describing the current
+        radio configuration.
     """
     cfg = _shared.snapshot()
     # The analysis pipelines always execute on the aligned 28-multiple grid, so
@@ -612,16 +772,34 @@ def current_config():
 
 @app.get("/config")
 async def config_endpoint():
+    """Return the current radio/analysis configuration as JSON.
+
+    Returns:
+        JSONResponse: The `current_config()` snapshot, readable by any
+        authenticated role.
+    """
     return JSONResponse(current_config())
 
 
 @app.get("/health")
 async def health_endpoint(request: Request):
-    """
-    Liveness + identity. boot_id changes on every process start, which is the
-    browser's proof that Reset Radio ACTUALLY restarted the service. /health
-    is reachable without auth (monitoring, restart polling from a login page),
-    but anonymous callers only get the minimal liveness triple.
+    """Report liveness and process identity.
+
+    `boot_id` changes on every process start, which is the browser's proof
+    that Reset Radio actually restarted the service (it polls this endpoint
+    until `boot_id` differs from the value it started with). Auth-exempt so
+    monitoring and restart polling from the login page can always reach it,
+    but an anonymous caller (no resolved role, auth enabled) only gets the
+    minimal liveness triple — richer health detail requires being logged in.
+
+    Args:
+        request: The incoming request; `request.scope["role"]` (set by
+            `BasicAuthMiddleware`) gates how much detail is returned.
+
+    Returns:
+        JSONResponse: The full `health.health_snapshot()` plus `service` for
+        an authenticated caller, or `{"status", "boot_id", "uptime_s"}` only
+        for an anonymous one.
     """
     snap = health.health_snapshot()
     snap["service"] = RADIO_SERVICE_NAME
@@ -633,23 +811,55 @@ async def health_endpoint(request: Request):
 
 @app.get("/operations")
 async def operations_endpoint():
-    """Recent verified-operations history (any authenticated role)."""
+    """Return the most recent verified-operations log entries.
+
+    Backs the OPS tab's backfill (live updates arrive separately over `/ws`
+    as `{"op": ...}` messages). Readable by any authenticated role.
+
+    Returns:
+        JSONResponse: `{"operations": [...]}`, the last 50 entries from
+        `OPERATIONS`.
+    """
     return JSONResponse(_json_safe({"operations": OPERATIONS.recent(50)}))
 
 
 @app.get("/insights")
 async def insights_endpoint():
-    """Latest native striqt power, occupancy, cell, and provenance results."""
+    """Return the latest native striqt power/occupancy/cell/provenance results.
+
+    Returns:
+        JSONResponse: The current `InsightService` snapshot.
+    """
     return JSONResponse(_json_safe(_insights.snapshot()))
 
 
 @app.get("/presets")
 async def presets_endpoint():
+    """List the presets exposed to the browser's preset picker.
+
+    Returns:
+        JSONResponse: `{"presets": [...]}` from `public_presets()`.
+    """
     return JSONResponse(_json_safe({"presets": public_presets()}))
 
 
 @app.post("/presets/{preset_id}/apply")
 async def preset_apply_endpoint(preset_id: str, request: Request):
+    """Apply a named preset's control payload to the shared config.
+
+    Admin only, and refused while a recording is in progress (the same
+    controls-lock every config-mutating route enforces).
+
+    Args:
+        preset_id: Key into `PRESETS`.
+        request: The incoming request; only `request.scope["role"]` is read.
+
+    Returns:
+        JSONResponse: `{"preset", "ack", "effective"}` (200) on success;
+        `{"error": ...}` with status 403 (not admin), 409 (recording active),
+        404 (unknown preset id), or 400 (config update rejected the preset's
+        control payload).
+    """
     if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
     if _recording.active():
@@ -668,8 +878,17 @@ async def preset_apply_endpoint(preset_id: str, request: Request):
 
 @app.get("/gps")
 async def gps_status_endpoint():
-    """Current GPS fix. Recordings stamp every capture with this (or with
-    gps_valid=0 when there is no fix) — check it BEFORE a long run."""
+    """Return the live GPS fix and, when invalid, why.
+
+    Recordings stamp every capture with this position (or `gps_valid=0` when
+    there is no fix, never null-island 0.0/0.0) — check this endpoint before
+    starting a long recording run.
+
+    Returns:
+        JSONResponse: `{"gps": ...}` from `gps.status()`, including the fix
+        fields or an explanation (daemon unreachable / no device / no fix
+        yet / stale).
+    """
     return JSONResponse(_json_safe({"gps": gps.status()}))
 
 
@@ -712,8 +931,21 @@ TX_DISCLAIMER = {
 
 @app.get("/tx")
 async def tx_status_endpoint(request: Request):
-    """TX capability + live state. Any authenticated role may READ this — a
-    shared instrument that is radiating should say so to everyone on it."""
+    """Return TX capability, live transmission state, and the legal notice.
+
+    Any authenticated role may read this — a shared instrument that is
+    radiating should say so to everyone connected to it, not just the
+    operator driving it.
+
+    Args:
+        request: The incoming request; `request.scope["role"]` determines
+            `acknowledged` (per-role, see `tx.TX.is_acknowledged`) and
+            `may_transmit`.
+
+    Returns:
+        JSONResponse: `{"tx": {..., "acknowledged", "may_transmit",
+        "disclaimer"}}`.
+    """
     role = request.scope.get("role", DEFAULT_ROLE)
     status = tx.TX.status()
     status["acknowledged"] = tx.TX.is_acknowledged(role)
@@ -724,6 +956,20 @@ async def tx_status_endpoint(request: Request):
 
 @app.post("/tx/acknowledge")
 async def tx_acknowledge_endpoint(request: Request):
+    """Record that the calling admin accepted the transmit legal notice.
+
+    This is the real gate behind the "bad boy" button's disclaimer modal: a
+    modal the browser could delete from the DOM would not be one, so
+    `/tx/start` checks server-side acknowledgment (via `tx.TX.is_acknowledged`)
+    rather than trusting the client. Logs a `validated` operation entry.
+
+    Args:
+        request: The incoming request; only `request.scope["role"]` is read.
+
+    Returns:
+        JSONResponse: `{"tx": {"acknowledged": True}}` (200), or
+        `{"error": ...}` with 403 if the caller is not admin.
+    """
     if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
     role = request.scope.get("role", DEFAULT_ROLE)
@@ -736,6 +982,27 @@ async def tx_acknowledge_endpoint(request: Request):
 
 @app.post("/tx/start")
 async def tx_start_endpoint(request: Request):
+    """Start a transmission with the requested waveform/frequency/gain.
+
+    Admin only. Mutually exclusive with recording — a recording sweep
+    reconfigures the very source object a TX stream would ride on, so both
+    directions are refused with 409. Delegates the actual arm/tune sequence
+    to `tx.TX.start`, which runs in a worker thread since it blocks on driver
+    calls.
+
+    Args:
+        request: The incoming request; the JSON body is the waveform/start
+            payload (`tx.TX.start`'s `payload` argument), and
+            `request.scope["role"]` gates access.
+
+    Returns:
+        JSONResponse: `{"tx": status}` with status 202 once transmission has
+        started; `{"error": ...}` with status 403 (not admin), 409
+        (recording active, or `tx.TX.start` raised `RuntimeError`), 428 (the
+        legal notice has not been acknowledged in this process — see
+        `tx_acknowledge_endpoint`), or 400 (malformed body or `ValueError`
+        from `tx.TX.start`, e.g. an out-of-range frequency).
+    """
     role = request.scope.get("role", DEFAULT_ROLE)
     if role not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
@@ -765,6 +1032,17 @@ async def tx_start_endpoint(request: Request):
 
 @app.post("/tx/stop")
 async def tx_stop_endpoint(request: Request):
+    """Stop any active transmission.
+
+    Admin only.
+
+    Args:
+        request: The incoming request; only `request.scope["role"]` is read.
+
+    Returns:
+        JSONResponse: `{"tx": status}` with status 202, or `{"error": ...}`
+        with 403 if the caller is not admin.
+    """
     if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
     status = await asyncio.to_thread(tx.TX.stop, "stopped by operator")
@@ -773,7 +1051,14 @@ async def tx_stop_endpoint(request: Request):
 
 @app.get("/record")
 async def record_status_endpoint():
-    """Recording state plus a form seed derived from the current live view."""
+    """Return recording state plus a form seed for the Record tab.
+
+    Returns:
+        JSONResponse: `{"recording", "defaults", "gps", "config"}` — current
+        `RecordingManager` status, its default sweep parameters, the live GPS
+        fix, and the current radio config (so the Record form can seed
+        itself from what the live view is already doing).
+    """
     return JSONResponse(_json_safe({
         "recording": _recording.status(),
         "defaults": _recording.defaults(),
@@ -784,6 +1069,22 @@ async def record_status_endpoint():
 
 @app.post("/record")
 async def record_start_endpoint(request: Request):
+    """Start a recording sweep from the JSON body's parameters.
+
+    Admin only. Mutually exclusive with transmitting — a recording sweep
+    reconfigures the same source object a TX stream would ride on, mirroring
+    the guard in `tx_start_endpoint`.
+
+    Args:
+        request: The incoming request; the JSON body is passed to
+            `RecordingManager.start`.
+
+    Returns:
+        JSONResponse: `{"recording": result}` with status 202 once the sweep
+        has started; `{"error": ...}` with status 403 (not admin), 409
+        (already transmitting, or already recording), or 400 (malformed body
+        or a validation error from `RecordingManager.start`).
+    """
     if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
     if tx.TX.active():
@@ -804,6 +1105,17 @@ async def record_start_endpoint(request: Request):
 
 @app.post("/record/stop")
 async def record_stop_endpoint(request: Request):
+    """Stop the active recording sweep, if any.
+
+    Admin only.
+
+    Args:
+        request: The incoming request; only `request.scope["role"]` is read.
+
+    Returns:
+        JSONResponse: `{"recording": status}` with status 202, or
+        `{"error": ...}` with 403 if the caller is not admin.
+    """
     if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
     return JSONResponse({"recording": _json_safe(await _recording.stop())}, status_code=202)
@@ -811,16 +1123,35 @@ async def record_stop_endpoint(request: Request):
 
 @app.get("/recordings")
 async def recordings_endpoint():
-    # Directory walk + stat per archive: off the event loop so a populated
-    # recordings tree can't stall every other client.
+    """List archived recordings for the pull tools and the Recordings tab.
+
+    The directory walk + per-archive stat runs in a worker thread
+    (`asyncio.to_thread`) so a large populated recordings tree cannot stall
+    every other client's event-loop turn.
+
+    Returns:
+        JSONResponse: `{"recordings": [...]}` from `RecordingManager.catalog`.
+    """
     rows = await asyncio.to_thread(_recording.catalog)
     return JSONResponse(_json_safe({"recordings": rows}))
 
 
 @app.get("/recordings/{recording_id:path}/inspect")
 async def recording_inspect_endpoint(recording_id: str):
+    """Verify one archived recording end to end and report its contents.
+
+    Runs `RecordingManager.inspect` (a CRC verification of the whole zip) in
+    a worker thread, since it is a full-archive read.
+
+    Args:
+        recording_id: Catalog id / relative path of the recording.
+
+    Returns:
+        JSONResponse: The inspection result on success, or `{"error": ...}`
+        with status 404 if the id is unknown, the file is missing, or the
+        archive is corrupt.
+    """
     try:
-        # CRC-verifies one archive end to end — always in a worker thread.
         result = await asyncio.to_thread(_recording.inspect, recording_id)
         return JSONResponse(_json_safe(result))
     except (ValueError, FileNotFoundError, OSError, zipfile.BadZipFile) as exc:
@@ -829,6 +1160,18 @@ async def recording_inspect_endpoint(recording_id: str):
 
 @app.get("/recordings/{recording_id:path}/download")
 async def recording_download_endpoint(recording_id: str):
+    """Stream one archived recording's zip file to the caller.
+
+    Backs `tools/pull_recordings.py`'s HTTP pull path (the alternative to
+    the rsync-over-SSH `tools/fetch_recordings.sh`).
+
+    Args:
+        recording_id: Catalog id / relative path of the recording.
+
+    Returns:
+        FileResponse: The zip archive, or a JSONResponse `{"error": ...}`
+        with status 404 if the id cannot be resolved to a file.
+    """
     try:
         path = _recording.resolve_catalog_item(recording_id)
         return FileResponse(path, filename=path.name,
@@ -839,10 +1182,22 @@ async def recording_download_endpoint(recording_id: str):
 
 @app.post("/config")
 async def config_apply_endpoint(request: Request):
-    """
-    HTTP twin of the WebSocket control path (admin only) — same validated
-    SharedConfig.update, same ack (incl. op_id). Exists for scripted clients:
-    live/radioctl.py drives its `set` and `self-test` commands through this.
+    """Apply a control payload to the shared config over plain HTTP.
+
+    HTTP twin of the WebSocket control path (admin only) — the same
+    validated `SharedConfig.update` call, producing the same ack (including
+    `op_id`). Exists for scripted clients: `live/radioctl.py` drives its
+    `set` and `self-test` commands through this rather than opening a
+    WebSocket.
+
+    Args:
+        request: The incoming request; the JSON body is the control payload
+            passed to `SharedConfig.update`.
+
+    Returns:
+        JSONResponse: `{"ack": ack}` on success; `{"error": ...}` with
+        status 403 (not admin), 409 (recording active), or 400 (malformed
+        body or a validation error from `SharedConfig.update`).
     """
     if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
@@ -865,11 +1220,18 @@ async def config_apply_endpoint(request: Request):
 
 @app.websocket("/ws/logs")
 async def logs_ws_endpoint(ws: WebSocket):
-    """
-    Admin-only journal tail for the OPS tab: streams `journalctl -fu
-    <service>` lines as {"journal": ...} text messages. Operation events
-    already arrive on the main /ws socket; this adds the raw service log the
-    user asked for — without ever exposing a shell.
+    """Stream the systemd journal tail for the OPS tab (admin only).
+
+    Follows `journalctl -u <RADIO_SERVICE_NAME> -f` and forwards each line as
+    a `{"journal": "..."}` text message. Structured operation events already
+    arrive on the main `/ws` socket as `{"op": ...}`; this adds the raw
+    service log the user asked to see — a log view, never a shell. When
+    `journalctl` is unavailable, sends one explanatory message and then holds
+    the socket open with periodic pings so the client does not reconnect-spin.
+
+    Args:
+        ws: The WebSocket connection. Closed with code 1008 immediately if
+            `ws.scope["role"]` is not in `WRITE_ROLES`.
     """
     role = ws.scope.get("role", DEFAULT_ROLE)
     if role not in WRITE_ROLES:
@@ -953,8 +1315,19 @@ async def logs_ws_endpoint(ws: WebSocket):
 # /logout just clears the cookie. A Basic header is still accepted for curl/API.
 
 def _login_page(error: str = "") -> str:
-    """Minimal, self-contained dark login form (styled inline because the app's
-    style.css lives behind the auth gate this page is in front of)."""
+    """Render the standalone login page HTML.
+
+    Self-contained (styles inlined) because the app's own `style.css` is
+    served behind the auth gate this page sits in front of. The form posts
+    the username only — there is no password field.
+
+    Args:
+        error: Optional error message to display above the form (e.g.
+            "Unknown username.").
+
+    Returns:
+        A complete HTML document as a string.
+    """
     err_html = (
         f'<p class="err">{error}</p>' if error else ""
     )
@@ -1016,9 +1389,19 @@ def _login_page(error: str = "") -> str:
 
 
 def _cookie_kwargs(request: "Request") -> dict:
-    """Cookie attributes matching BasicAuthMiddleware._set_cookie_send: HttpOnly,
-    SameSite=Lax, and Secure only over HTTPS (omitted on plain-HTTP LAN so
-    Safari/iOS still store it)."""
+    """Build `Response.set_cookie` kwargs for the session cookie.
+
+    Mirrors `BasicAuthMiddleware._set_cookie_send`: `HttpOnly`, `SameSite=Lax`,
+    and `Secure` only over HTTPS (omitted on plain-HTTP LAN so Safari/iOS
+    still store the cookie).
+
+    Args:
+        request: The incoming request, used to detect https via
+            `request.url.scheme` or the `X-Forwarded-Proto` header.
+
+    Returns:
+        A dict of keyword arguments for `Response.set_cookie`.
+    """
     is_https = (
         request.url.scheme == "https"
         or request.headers.get("x-forwarded-proto") == "https"
@@ -1031,10 +1414,18 @@ def _cookie_kwargs(request: "Request") -> dict:
 
 @app.get("/login")
 async def login_form(request: "Request"):
-    # Auth off: nothing to sign into — send them straight to the viewer.
+    """Serve the login form, or bounce straight to the viewer if unneeded.
+
+    Args:
+        request: The incoming request, used to check for an existing valid
+            session cookie.
+
+    Returns:
+        A redirect to `/` when auth is disabled or a valid session cookie is
+        already present; otherwise the rendered login page.
+    """
     if AUTH_DISABLED:
         return RedirectResponse("/", status_code=303)
-    # Already signed in (valid cookie)? Skip the form.
     if _session_cookie_from_scope(request.scope):
         return RedirectResponse("/", status_code=303)
     return HTMLResponse(_login_page())
@@ -1042,11 +1433,25 @@ async def login_form(request: "Request"):
 
 @app.post("/login")
 async def login_submit(request: "Request"):
+    """Handle the login form submission: resolve a role and set the cookie.
+
+    Parses the urlencoded body directly rather than via `request.form()`, to
+    avoid pulling in the `python-multipart` dependency that method requires
+    (the login form only ever posts
+    `application/x-www-form-urlencoded`).
+
+    Args:
+        request: The incoming request; its body is the urlencoded
+            `username` field.
+
+    Returns:
+        A redirect to `/` with a signed `radio_auth` cookie set, on a known
+        username; an 401 re-render of the login page with an error message
+        otherwise. Redirects straight to `/` with no cookie when auth is
+        disabled.
+    """
     if AUTH_DISABLED:
         return RedirectResponse("/", status_code=303)
-    # Parse the urlencoded form body directly (avoids a python-multipart
-    # dependency that request.form() would pull in; the login form posts
-    # application/x-www-form-urlencoded).
     from urllib.parse import parse_qs
 
     raw = (await request.body()).decode("utf-8", "replace")
@@ -1063,33 +1468,54 @@ async def login_submit(request: "Request"):
 
 @app.get("/logout")
 async def logout(request: "Request"):
+    """Clear the session cookie and redirect to the login form.
+
+    Args:
+        request: The incoming request (unused beyond routing).
+
+    Returns:
+        A redirect to `/login` with the `radio_auth` cookie deleted.
+    """
     resp = RedirectResponse("/login", status_code=303)
-    # Clear the session cookie (empty value + immediate expiry).
     resp.delete_cookie("radio_auth", path="/")
     return resp
 
 
 @app.post("/admin/reset-radio")
 async def reset_radio(request: Request):
-    """
-    Admin-only: restart the radio systemd service — as a VERIFIED operation.
+    """Restart the radio's systemd service, as a verified operation.
 
-    The old implementation spawned `sudo -n systemctl restart …` with both
-    pipes on /dev/null and answered 202 unconditionally, which proved only
-    that Popen() worked. Now:
+    Admin only. Where the old implementation spawned
+    `sudo -n systemctl restart …` with both pipes on `/dev/null` and answered
+    202 unconditionally (proving only that `Popen()` succeeded), this:
 
-      1. A matching NOPASSWD sudoers rule uses ``systemctl restart``. When the
-         rule is absent but this process is verifiably inside the requested
-         systemd unit, it exits cleanly and lets ``Restart=always`` replace it.
-         Manually launched processes never take that fallback.
-      2. The 202 response carries an operation id and THIS process's boot_id.
-      3. The browser polls /health until it sees a DIFFERENT boot_id (proof
-         the service really restarted and came back), or times out and says
-         exactly which stage failed.
+      1. Preflights a matching NOPASSWD sudoers rule via `systemctl restart`.
+         When the rule is absent but this process is verifiably inside the
+         requested systemd unit (`_supervised_by_requested_unit`), it falls
+         back to a self-SIGTERM and lets `Restart=always` replace it —
+         manually launched processes never take that fallback.
+      2. Returns the 202 response with an operation id and THIS process's
+         `boot_id`.
+      3. Relies on the browser polling `/health` until it sees a DIFFERENT
+         `boot_id` (proof the service really restarted and came back), or
+         timing out and reporting exactly which stage failed.
 
-    The restart still detaches (start_new_session) because it tears down this
-    very process — final confirmation necessarily happens in the NEW process,
-    via the boot_id change.
+    The restart still detaches (`start_new_session`) because it tears down
+    this very process — final confirmation necessarily happens in the NEW
+    process, via the boot_id change. Any active transmission is stopped
+    first, since a restart would otherwise leave it keyed with nothing left
+    to unkey it.
+
+    Args:
+        request: The incoming request; only `request.scope["role"]` and
+            `request.client` (for the operation log) are read.
+
+    Returns:
+        JSONResponse: `{"message", "op_id", "boot_id"}` with status 202 once
+        the restart is confirmed permitted and under way (either via sudo or
+        the self-restart fallback); `{"error": ..., "op_id"}` with status
+        403 (not admin) or 500 (sudo/systemctl missing, preflight denied, or
+        the restart command failed to spawn or exited non-zero).
     """
     role = request.scope.get("role", DEFAULT_ROLE)
     if role not in WRITE_ROLES:
@@ -1103,7 +1529,13 @@ async def reset_radio(request: Request):
     op_id = OPERATIONS.begin("reset", f"restart service {RADIO_SERVICE_NAME}")
 
     def _supervised_by_requested_unit():
-        """True only when this process is in the requested systemd cgroup."""
+        """Check whether this process's systemd cgroup matches the target unit.
+
+        Returns:
+            True only when `/proc/self/cgroup` shows this process running
+            inside `RADIO_SERVICE_NAME`'s systemd unit; False on any read
+            failure or mismatch.
+        """
         unit = RADIO_SERVICE_NAME
         if not unit.endswith(".service"):
             unit += ".service"
@@ -1115,10 +1547,22 @@ async def reset_radio(request: Request):
                    for line in cgroups.splitlines())
 
     def _supervised_self_restart(reason):
-        # Returning before SIGTERM lets the browser receive the old boot_id.
-        # The exact systemd cgroup check above plus Restart=always then provides
-        # the same supervised restart without requiring a host-specific sudoers
-        # rule.  A manually launched server is never killed by this fallback.
+        """Fall back to a self-SIGTERM restart under systemd's `Restart=always`.
+
+        Used when sudo/systemctl are unavailable or unpermitted but this
+        process is confirmed (`_supervised_by_requested_unit`) to run inside
+        the target systemd unit, so systemd itself can replace it — no
+        host-specific sudoers rule required. A manually launched server is
+        never killed by this path, since the cgroup check would fail for it.
+        Returns before the scheduled SIGTERM fires so the browser still
+        receives this (old) process's `boot_id` in the response.
+
+        Args:
+            reason: Why the sudo path was not used, logged to the operation.
+
+        Returns:
+            JSONResponse: `{"message", "op_id", "boot_id"}` with status 202.
+        """
         OPERATIONS.stage(
             op_id, "validated",
             f"systemd supervises this process; using self-restart fallback ({reason})")
@@ -1147,10 +1591,18 @@ async def reset_radio(request: Request):
     OPERATIONS.stage(op_id, "applying",
                      f"{' '.join(cmd)} (requested by {request.client})")
 
-    # Inspect sudo's complete rule listing. ``sudo -l <command>`` returning 0
-    # only means the command is permitted *with a password*; it does not prove
-    # that ``sudo -n`` can execute it. Require an explicit NOPASSWD entry.
     def _preflight():
+        """Run `sudo -n -l` to list this user's complete sudo rule set.
+
+        `sudo -l <command>` returning 0 only proves the command is permitted
+        *with a password*; it does not prove `sudo -n` (non-interactive) can
+        run it. Listing every rule and pattern-matching for an explicit
+        NOPASSWD entry (below) is the only way to confirm that.
+
+        Returns:
+            The completed `subprocess.CompletedProcess`, or the caught
+            exception instance if the subprocess call itself failed.
+        """
         try:
             return subprocess.run(
                 [sudo_path, "-n", "-l"],
@@ -1207,10 +1659,19 @@ async def reset_radio(request: Request):
         return JSONResponse({"error": f"restart failed: {e}", "op_id": op_id},
                             status_code=500)
 
-    # Give the command a short window to fail fast. If it is still running
-    # after the window, the restart is genuinely in flight (and about to kill
-    # this process) — that is the success path.
     def _probe():
+        """Give the spawned restart command a short window to fail fast.
+
+        If `proc` is still running once the window elapses, the restart is
+        genuinely in flight (and about to kill this very process) — that is
+        the success path. If it already exited, its logged stderr tail is
+        read back for the error response.
+
+        Returns:
+            A `(returncode, stderr_tail)` tuple: `(None, b"")` if the process
+            is still running after the timeout, else `(rc, last ~2000 bytes
+            of the log file)`.
+        """
         try:
             rc = proc.wait(timeout=1.2)
         except subprocess.TimeoutExpired:
@@ -1254,10 +1715,25 @@ async def reset_radio(request: Request):
 
 
 async def _broadcaster():
-    """
-    Polls acquirer.latest() at state.BROADCAST_FPS, serializes the frame once,
-    and fans it out to all connected WebSocket clients. Also fans out server
-    notices and structured operation events. Dropped connections are pruned.
+    """Background task: pace frames, serialize once, fan out to all clients.
+
+    Runs for the lifetime of the app (spawned by `lifespan`). Each tick:
+    drains and sends queued server notices (`SharedConfig.drain_notices`)
+    and structured operation events (`OPERATIONS.drain_events`) as JSON text;
+    sends recording/TX status as JSON text, but only on change, on a slow
+    keepalive interval (`STATUS_KEEPALIVE_S`), or to a newly joined client —
+    resending identical status at the full broadcast rate was pure overhead
+    on the hotspot/tunnel links these modes exist for; then pulls the latest
+    frame via `_acquirer.latest_if_newer` (skipping the multi-MB block copy
+    when nothing changed), serializes it once with `serialize_frame`, and
+    sends it as bytes to every connection. Dead connections found during
+    sending are pruned from `_connections` at the end of the tick.
+
+    Pacing is against an absolute deadline (`next_tick`) rather than a fixed
+    post-work sleep, since the latter folded serialization/send time into the
+    frame period and turned a requested 15 FPS into roughly 13-14 FPS; a
+    stall larger than one interval resets the deadline instead of trying to
+    repay it with a burst of ticks.
     """
     interval   = 1.0 / max(state.BROADCAST_FPS, 1)
     loop       = asyncio.get_running_loop()
@@ -1378,10 +1854,35 @@ async def _broadcaster():
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    """
-    WebSocket endpoint. Receives control messages as text JSON:
+    """Main live-viewer WebSocket: control in, frames + status out.
+
+    One connection per browser tab. Frames themselves are pushed by the
+    shared `_broadcaster` task; this handler only accepts the connection,
+    enforces the single-admin slot, and loops reading control messages sent
+    by the client as text JSON, e.g.:
+
         {"center": Hz, "sample_rate": Hz, "gain": dB, "nfft": int, "rows": int}
-    Sends spectrogram frames as binary (see serialize_frame).
+
+    Only one admin connection may hold the "admin slot" at a time (guarded by
+    `_slot_lock`); a second admin handshake is refused with close code 4001
+    (distinct from 1008/auth-failure so the client can tell "someone else is
+    driving" from "you're not authorized" and retry as a takeover). The slot
+    is not enforced when auth is disabled, since every connection shares
+    `DEFAULT_ROLE` there and enforcing it would limit a demo to one browser.
+
+    Non-admin control messages are acknowledged with `denied: true` and
+    otherwise ignored (defense in depth — the UI already disables controls
+    for read-only roles) so the client keeps receiving frames; likewise
+    while a recording is active. Valid config-changing messages run through
+    `SharedConfig.update` in a worker thread (an analysis apply can block on
+    tier-2 scratch probes) and the resulting ack is sent back describing what
+    was applied, rounded, rejected, or ignored. A 15 s idle timeout triggers
+    a `ping`; two consecutive missed pings drop the connection so a stale
+    slot frees up promptly instead of waiting for a TCP-level timeout.
+
+    Args:
+        ws: The WebSocket connection. Its `scope["role"]` (set by
+            `BasicAuthMiddleware`) determines write access.
     """
     global _admin_ws
     # Role resolved by BasicAuthMiddleware and stashed on the ASGI scope. Falls
@@ -1510,6 +2011,12 @@ if WEB_DIR.exists():
 else:
     @app.get("/")
     async def root():
+        """Fallback root route used only when `live/web/` is missing.
+
+        Returns:
+            dict: An error payload naming the expected directory, in place
+            of the mounted static-file app.
+        """
         return {
             "error": f"Web assets not found at {WEB_DIR}",
             "hint": "Did you create live/web/index.html?",
@@ -1521,6 +2028,22 @@ else:
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point: parse args, wire up the device and core state, serve.
+
+    Resolves the requested device (`--device`/`--demo`/`--ports`/`--channels`)
+    via `core.devices.resolve_device`, configures `core.state` (device label,
+    channel set, backend, FPS), builds the module-level `SharedConfig`,
+    `InsightService`, acquirer (`Acquirer` for real radios, self-computing
+    `DemoAcquirer` for `--demo`), optional `Computer`, `RecordingManager`, and
+    binds `core.tx.TX` to the acquirer's live device handle. Prints a startup
+    banner (mode, backend/fps, boot_id, auth status, transmit capability) and
+    then hands control to `uvicorn.run`, which drives `app` and its
+    `lifespan` context manager for the rest of the process's life.
+
+    Exits the process (via `parser.error` or `sys.exit`) on invalid
+    argument combinations, a missing striqt sensor stack for a non-demo
+    device, or a missing `uvicorn` install.
+    """
     global _acquirer, _computer, _shared, _quantize, _recording, _insights
 
     parser = argparse.ArgumentParser(

@@ -1,4 +1,23 @@
-"""Recording orchestration: release live radio, supervise sweep, resume live."""
+"""Recording orchestration for the web UI's Record tab.
+
+Owns the `RecordingManager`, the backend behind `POST /record/start` and
+friends: it releases the live radio from the running `Acquirer`, supervises a
+striqt sweep (in-process for hardware, via `sweep_runner.run_sweep`; a fake
+in-process loop for demo mode), validates the resulting Zarr-zip archive, and
+hands the radio back to the live viewer.
+
+The live view keeps the source open `gapless=True`, where striqt treats any
+receive overflow as fatal. A recording sweep does analysis/archive work
+*between* captures, so the RX stream necessarily overflows in those gaps —
+`core.shims.finite_capture_mode()` (invoked from `sweep_runner`) swaps the
+source to `gapless=False, receive_retries=2` for the duration of the sweep
+and restores the live spec on exit. Recordings are written under
+`recordings/` (gitignored; pulled off-radio by separate one-way tools, not
+this module) as `<stamp>.partial.zarr.zip` and atomically renamed to
+`<stamp>.zarr.zip` only after their CRC has been verified, so a `.partial`
+file on disk always means a recording still in progress or abandoned
+mid-write.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -24,7 +43,31 @@ DEFAULT_RECORDINGS_DIR = Path(
 
 
 class RecordingManager:
+    """Single-recording-at-a-time supervisor bridging the live viewer and a sweep.
+
+    One instance lives for the life of the web server. It tracks recording
+    state in `self._status` (polled via `status()`/broadcast to the UI),
+    drives the release/record/resume handoff with the shared `Acquirer`, and
+    builds the striqt sweep spec (either a caller-supplied YAML or one
+    synthesized from the shared live config via `_default_spec`). Only one
+    recording may be `active()` at a time; `start()` enforces this under
+    `self._lock`.
+    """
+
     def __init__(self, acquirer, shared, *, demo=False):
+        """Bind the manager to the live acquirer and shared config.
+
+        Args:
+            acquirer: The server's live `Acquirer`, whose radio handle is
+                paused and released for the duration of a recording and
+                resumed afterward.
+            shared: The `SharedConfig` snapshot source used to seed capture
+                defaults (`defaults()`) and the synthesized sweep spec
+                (`_default_spec()`).
+            demo: When True, skip real hardware acquisition and run a fake
+                in-process capture loop (`_run_demo`) that writes a stub
+                archive, so recording can be exercised without a radio.
+        """
         self.acquirer = acquirer
         self.shared = shared
         self.demo = demo
@@ -41,9 +84,22 @@ class RecordingManager:
         self._status = {"state": "idle"}
 
     def status(self):
+        """Return a shallow copy of the current recording status dict.
+
+        Returns:
+            dict: Snapshot of `self._status` (state, op_id, output path,
+            capture/elapsed counters, etc.) safe for the caller to read
+            without racing further mutation.
+        """
         return dict(self._status)
 
     def active(self):
+        """Report whether a recording is currently starting, running, or stopping.
+
+        Returns:
+            bool: True if `self._status["state"]` is one of
+            `{"starting", "recording", "stopping"}`.
+        """
         return self._status.get("state") in {"starting", "recording", "stopping"}
 
     def catalog(self, limit=100, *, verify=False):
@@ -79,6 +135,25 @@ class RecordingManager:
         return rows
 
     def resolve_catalog_item(self, recording_id):
+        """Resolve a catalog-relative recording id to a validated path on disk.
+
+        Guards against path traversal (`../`) by requiring the resolved
+        candidate to sit under `DEFAULT_RECORDINGS_DIR`, and only accepts
+        complete `.zarr.zip` archives (never a `.partial.zarr.zip` still being
+        written).
+
+        Args:
+            recording_id: Path of the recording relative to
+                `DEFAULT_RECORDINGS_DIR`, as returned by `catalog()`.
+
+        Returns:
+            Path: The resolved, existing archive path.
+
+        Raises:
+            ValueError: If the resolved path escapes the catalog root.
+            FileNotFoundError: If the path is not a file or does not end in
+                `.zarr.zip`.
+        """
         root = DEFAULT_RECORDINGS_DIR.resolve()
         candidate = (root / str(recording_id)).resolve()
         if candidate != root and root not in candidate.parents:
@@ -88,6 +163,20 @@ class RecordingManager:
         return candidate
 
     def inspect(self, recording_id):
+        """Return detail for a single recording, including a full CRC check.
+
+        Unlike `catalog()` (which is cheap and skips CRC by default), this
+        always reads the archive end to end via `ZipFile.testzip()` — it is
+        meant for a single-recording detail view, not the list endpoint.
+
+        Args:
+            recording_id: Path of the recording relative to
+                `DEFAULT_RECORDINGS_DIR`.
+
+        Returns:
+            dict: `id`, `bytes`, `valid` (bool CRC result), `entries` (member
+            count), and `members` (up to the first 500 member filenames).
+        """
         path = self.resolve_catalog_item(recording_id)
         with zipfile.ZipFile(path) as archive:
             infos = archive.infolist()
@@ -97,6 +186,14 @@ class RecordingManager:
                     "members": [i.filename for i in infos[:500]]}
 
     def defaults(self):
+        """Build the Record-tab's default form values from the live shared config.
+
+        Returns:
+            dict: `center_frequency`, `sample_rate`, `gain` (Hz/Hz/dB, mirrored
+            from the live config), `capture_duration` (seconds; see NOTE
+            below), `directory` (`DEFAULT_RECORDINGS_DIR`), and
+            `include_raw_iq` (False by default).
+        """
         cfg = self.shared.snapshot()
         # Rolling live view intentionally uses duration=0 (12-row chunks), but
         # the recorder still needs a finite acquisition.  Twenty milliseconds
@@ -113,6 +210,29 @@ class RecordingManager:
         }
 
     async def start(self, request):
+        """Validate a recording request, reserve the output path, and launch it.
+
+        Refuses to start a second recording while one is `active()`. Computes
+        a timestamped output path under `directory`/`radio_id`, refusing to
+        overwrite an existing final or in-progress (`.partial.zarr.zip`)
+        archive, then hands off to `self._run()` as a background asyncio task
+        and returns immediately with the initial status.
+
+        Args:
+            request: Dict of recording options from the client — any of
+                `duration` (seconds, blank/None for unbounded), `directory`,
+                `radio_id`, plus whatever `_default_spec()`/advanced `yaml`
+                consumes.
+
+        Returns:
+            dict: The initial `status()` snapshot (state `"starting"`).
+
+        Raises:
+            RuntimeError: If a recording is already active.
+            ValueError: If `duration` is present and not positive.
+            FileExistsError: If the computed output or working path already
+                exists on disk.
+        """
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
@@ -150,6 +270,18 @@ class RecordingManager:
             return self.status()
 
     async def stop(self):
+        """Request a cooperative stop of the active recording, if any.
+
+        Sets both the asyncio (`self._stop`) and thread (`self._thread_stop`)
+        stop signals so the running task/thread notice on their next
+        cooperative check, and signals `SIGINT` to a live subprocess handle if
+        one is tracked. Does not block for the recording to actually finish —
+        `_run()` observes the flags and settles asynchronously.
+
+        Returns:
+            dict: The current `status()` snapshot (state `"stopping"`, or
+            unchanged if no recording was active).
+        """
         if not self.active():
             return self.status()
         self._status["state"] = "stopping"
@@ -161,12 +293,37 @@ class RecordingManager:
         return self.status()
 
     async def shutdown(self):
+        """Stop any active recording and wait (up to 15s) for it to settle.
+
+        Intended for server shutdown: unlike `stop()`, this blocks until the
+        background `_run()` task finishes or the timeout elapses, swallowing
+        any exception/timeout so shutdown always proceeds.
+        """
         await self.stop()
         if self._task:
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 await asyncio.wait_for(self._task, 15)
 
     def _default_spec(self, request, output):
+        """Synthesize a striqt sweep YAML spec from the request and live config.
+
+        Used when the client does not supply an advanced `yaml` override.
+        Mirrors the live shared config's capture geometry (frequency, rate,
+        gain, spectrogram/PSD windowing) into a `sensor.read_yaml_spec`-
+        compatible document, selecting `sensor_binding`/`array_backend`
+        appropriately for demo vs. hardware mode, and restricts the analysis
+        block to whichever of spectrogram/psd/channel_power the caller
+        requested (defaulting to all three).
+
+        Args:
+            request: The recording request dict (see `start()`); reads
+                `center_frequency`, `sample_rate`, `gain`, `analyses`,
+                `include_raw_iq`, `capture_duration`.
+            output: Destination path written into the spec's `sink.path`.
+
+        Returns:
+            str: A complete YAML sweep spec.
+        """
         cfg = self.shared.snapshot()
         center = float(request.get("center_frequency", cfg.center))
         sample_rate = float(request.get("sample_rate", cfg.sample_rate))
@@ -227,6 +384,28 @@ sink:
 '''
 
     async def _run(self, request, output, working, duration, op_id):
+        """Drive one recording end to end: release, capture, validate, resume.
+
+        Runs as the background task created by `start()`. Sequence: pause and
+        release the live `Acquirer`'s radio handle (fatal if it doesn't
+        release within 15s), let hardware handles settle
+        (`RADIO_RECORDING_SETTLE_SEC`, skipped in demo mode), write the sweep
+        spec to a temp YAML file, run the sweep (`_run_hardware` or
+        `_run_demo`) into the `.partial.zarr.zip` working path, verify the
+        resulting archive is non-empty and CRC-clean, and atomically rename it
+        to the final output path. The live radio is always resumed in the
+        `finally` block regardless of outcome, and the operation is recorded
+        in `OPERATIONS` throughout.
+
+        Args:
+            request: The original recording request dict from `start()`.
+            output: Final archive path (only used after validation).
+            working: `.partial.zarr.zip` path the sweep writes into.
+            duration: Requested capture duration in seconds, or None for
+                unbounded (stopped only via `stop()`).
+            op_id: Operation id from `OPERATIONS.begin()`, staged/finished
+                here to drive the OPS log and UI status.
+        """
         spec_path = None
         terminal = "success"
         detail = "recording completed"
@@ -285,6 +464,24 @@ sink:
             OPERATIONS.finish(op_id, terminal, detail)
 
     async def _run_hardware(self, spec_path, output, duration, op_id):
+        """Run the real sweep in a worker thread and fold its progress into status.
+
+        Delegates to `sweep_runner.run_sweep`, passed the live acquirer's
+        `source` object so the sweep operates in-process on the already-open
+        radio handle (required for AIR-T, which retains FPGA descriptors for
+        the importing process's lifetime — a subprocess cannot acquire it even
+        after `Device.close()`). `run_sweep` itself is blocking, so it is
+        supervised via `asyncio.to_thread` rather than awaited directly. The
+        `progress` callback translates `sweep_runner`'s `"opened"`/`"progress"`
+        events into `self._status` updates and `OPERATIONS` stage entries.
+
+        Args:
+            spec_path: Path to the temp YAML sweep spec written by `_run()`.
+            output: `.partial.zarr.zip` working path passed through to
+                `run_sweep` as its destination.
+            duration: Requested capture duration in seconds, or None.
+            op_id: Operation id for `OPERATIONS.stage()` progress entries.
+        """
         # AIR-T retains FPGA descriptors for the importing process lifetime;
         # a subprocess cannot acquire it even after Device.close(). Supervise
         # the blocking wrapper in a worker thread inside this process instead.
@@ -314,6 +511,23 @@ sink:
         self._status.update(result)
 
     async def _run_demo(self, output, duration, op_id, spec_text):
+        """Fake a recording sweep in demo mode with no hardware or striqt involved.
+
+        Loops incrementing a synthetic capture counter every 0.25s (or the
+        full duration if shorter) until stopped or the requested duration
+        elapses, then writes a minimal stub archive (`demo-recording.json`
+        containing the spec text) to `output` so the rest of `_run()`'s
+        validate/rename pipeline behaves identically to the hardware path.
+
+        Args:
+            output: `.partial.zarr.zip` working path to write the stub
+                archive into.
+            duration: Requested duration in seconds, or None for unbounded
+                (stopped only via `self._stop`).
+            op_id: Operation id for `OPERATIONS.stage()` progress entries.
+            spec_text: The sweep YAML text, embedded in the stub archive for
+                traceability.
+        """
         started = time.monotonic()
         self._status["phase"] = "writing demo captures"
         while not self._stop.is_set() and (duration is None or time.monotonic() - started < duration):

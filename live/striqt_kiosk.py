@@ -7,6 +7,12 @@ viewer's features), standalone mode runs the web server bound to localhost and
 opens the SAME browser UI fullscreen. Pixel-identical to the web version, zero
 duplicated frontend code.
 
+This script owns no radio/DSP logic of its own — all of that lives in
+`live/core/` and is exercised indirectly through the `striqt_web_server.py`
+subprocess it launches. Its only job is process lifecycle: start the server,
+wait for it to report healthy, point a browser at it, and tear both down
+together. `install_linda.sh` launches this module for `RADIO_MODE=kiosk`.
+
 Usage:
     python3 live/striqt_kiosk.py                 # AIR8201B, fullscreen browser
     python3 live/striqt_kiosk.py --demo          # synthetic IQ
@@ -32,13 +38,24 @@ HERE = Path(__file__).resolve().parent
 
 
 def wait_for_health(url, timeout=120.0):
-    """Wait for the server to serve /health.
+    """Poll a `/health` URL until the web server responds 200 OK.
 
     120 s, not 30 s: a first start imports striqt (numba, llvmlite, scipy,
     matplotlib) and then opens the radio, and a USRP alone spends ~8 s loading
     its FPGA image over USB. On a Raspberry Pi the old 30 s budget expired
     while the server was still coming up healthy, so kiosk mode killed a
     working install and systemd recorded it as a failure.
+
+    Prints a progress note to stdout every ~15 s of waiting so a slow boot
+    over SSH/systemd logs doesn't look hung.
+
+    Args:
+        url: Health-check URL to poll (e.g. "http://127.0.0.1:8000/health").
+        timeout: Maximum seconds to wait before giving up.
+
+    Returns:
+        True as soon as a request returns HTTP 200, False if `timeout`
+        elapses first.
     """
     t0 = time.time()
     last_note = 0.0
@@ -57,10 +74,23 @@ def wait_for_health(url, timeout=120.0):
 
 
 def browser_command(url, kiosk=True):
-    """Best available browser, preferring a chromium-family kiosk.
-    RADIO_KIOSK_BROWSER overrides auto-detection. The Chromium profile lives
-    under /tmp because the hardened systemd unit mounts the home directory
-    read-only (ProtectHome) — the default profile path would fail there."""
+    """Build the argv for the best available browser to open `url`.
+
+    Preference order: RADIO_KIOSK_BROWSER (if set) → chromium-browser →
+    chromium → google-chrome → chrome → firefox → xdg-open → open. The
+    Chromium profile lives under /tmp because the hardened systemd unit
+    mounts the home directory read-only (ProtectHome) — the default profile
+    path would fail there.
+
+    Args:
+        url: URL the browser should open.
+        kiosk: If True, add the browser's fullscreen/kiosk flag; if False,
+            open a normal window.
+
+    Returns:
+        Argv list suitable for `subprocess.Popen`, or None if no browser or
+        fallback opener was found on PATH.
+    """
     import os, tempfile
     override = os.environ.get("RADIO_KIOSK_BROWSER")
     names = ([override] if override else []) + [
@@ -88,6 +118,10 @@ def browser_command(url, kiosk=True):
 
 
 def main():
+    """CLI entry point: parse args, start `striqt_web_server.py` as a
+    subprocess, wait for it to become healthy, launch a browser pointed at
+    it, and keep the two processes' lifecycles tied together (whichever
+    exits first takes the other down)."""
     parser = argparse.ArgumentParser(
         description="standalone kiosk viewer (web UI on the local display)")
     parser.add_argument("--device", default=None,

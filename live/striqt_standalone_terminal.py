@@ -6,6 +6,9 @@ Runs the SAME validated backend as the web viewer (SharedConfig freedom-model
 tiers, calibrated/quicklook/psd/ssb compute, device adapters, verified
 operations with hardware readback) and renders an ASCII waterfall + status in
 the terminal. Intended for quick checks over SSH when no display is available.
+Unlike `striqt_kiosk.py`, this frontend does not launch the web server at
+all — it drives `core.acquisition`/`core.config` directly and draws its own
+minimal curses UI in place of the browser UI.
 
 Usage:
     python3 live/striqt_standalone_terminal.py                     # AIR8201B
@@ -52,15 +55,34 @@ BRAND = ".:|:. LINDA  |"
 
 
 class LogBuffer(io.TextIOBase):
-    """Captures everything the core prints (operation stages, radio logs)
-    while curses owns the screen, and serves the tail to the log pane."""
+    """File-like sink that captures everything `core` prints (operation
+    stages, radio logs) while curses owns the screen, and serves the tail to
+    the in-UI log pane. Installed via `contextlib.redirect_stdout`/
+    `redirect_stderr` for the lifetime of the curses session, then flushed to
+    the real terminal on exit.
+    """
 
     def __init__(self, keep=300):
+        """Args:
+            keep: Maximum number of complete lines to retain (older lines
+                are dropped once this bound is exceeded).
+        """
         self.lines = deque(maxlen=keep)
         self._partial = ""
         self._lock = threading.Lock()
 
     def write(self, text):
+        """Buffer `text`, splitting it into complete lines as they arrive.
+
+        Blank lines are dropped; a trailing partial line is held until the
+        next write completes it with a newline.
+
+        Args:
+            text: Chunk of text as passed by the stream being redirected.
+
+        Returns:
+            Number of characters accepted, per the `io` write contract.
+        """
         with self._lock:
             self._partial += text
             while "\n" in self._partial:
@@ -70,16 +92,37 @@ class LogBuffer(io.TextIOBase):
         return len(text)
 
     def flush(self):
+        """No-op: writes are already stored immediately; nothing to flush."""
         pass
 
     def tail(self, n):
+        """Return the last `n` captured lines (or fewer if not that many).
+
+        Args:
+            n: Number of most recent lines to return.
+
+        Returns:
+            List of line strings, oldest first.
+        """
         with self._lock:
             return list(self.lines)[-n:]
 
 
 def downsample_row(row, width):
-    """Max-pool one spectrogram row (dB) to `width` columns — max keeps
-    narrowband signals visible at any terminal width."""
+    """Max-pool one spectrogram row (dB) down (or up) to `width` columns.
+
+    Uses max rather than mean/decimation so a narrowband signal occupying
+    only a few FFT bins stays visible even when many bins are pooled into
+    one terminal column.
+
+    Args:
+        row: 1-D array of per-bin dB values for one time row.
+        width: Target number of output columns.
+
+    Returns:
+        1-D array of length `width` (upsampled via nearest-index selection
+        if `width >= row.shape[0]`, otherwise max-pooled).
+    """
     n = row.shape[0]
     if width >= n:
         idx = np.linspace(0, n - 1, width).astype(int)
@@ -92,7 +135,22 @@ def downsample_row(row, width):
 
 
 def render_block(block, rows_avail, width):
-    """Map a (rows, bins) dB block to a list of ASCII strings."""
+    """Render a (rows, bins) dB spectrogram block as ASCII waterfall lines.
+
+    Color scale is derived per-block from the 5th/99th percentile of finite
+    values (clamped to at least 1 dB of span) and mapped onto the `GRADIENT`
+    character ramp; only the most recent `rows_avail` rows are shown, each
+    downsampled to `width` columns via `downsample_row`.
+
+    Args:
+        block: 2-D array of dB values, shape (rows, bins).
+        rows_avail: Maximum number of terminal rows to emit.
+        width: Target column width for each rendered row.
+
+    Returns:
+        List of strings, one per rendered row (oldest first), or a single
+        "(no data)" placeholder if `block` has no finite values.
+    """
     finite = block[np.isfinite(block)]
     if finite.size == 0:
         return ["(no data)"]
@@ -111,6 +169,22 @@ def render_block(block, rows_avail, width):
 
 
 def cycle(choices, current, key=float):
+    """Return the next value in `choices` after the one closest to `current`.
+
+    Used to step through discrete config grids (sample rate, FFT size) on a
+    keypress without needing the exact current value to already be a member
+    of `choices`.
+
+    Args:
+        choices: Iterable of candidate values (e.g. `RATES_HZ`, `NFFT_CHOICES`).
+        current: The current value to find the nearest neighbor of.
+        key: Callable applied to each candidate and to `current` before
+            comparing (e.g. `int` for FFT sizes).
+
+    Returns:
+        The element of `choices` immediately after the closest match, unless
+        any comparison fails, in which case the first element is returned.
+    """
     vals = list(choices)
     try:
         i = min(range(len(vals)), key=lambda j: abs(key(vals[j]) - key(current)))
@@ -120,6 +194,24 @@ def cycle(choices, current, key=float):
 
 
 def ui_loop(stdscr, shared, acquirer, fps, logbuf):
+    """Curses main loop: handle keypresses, then draw the header/waterfall/
+    log panes once per tick, at a fixed cadence.
+
+    Runs until the user presses `q`/`Q`, at which point it returns and lets
+    `main()` unwind the curses session and stop the acquisition threads.
+    Config changes from keys go through `shared.update()` — the same
+    validated (clamp/snap + op log) path every other frontend uses, so the
+    web UI and this terminal stay consistent if both are ever watching the
+    same radio.
+
+    Args:
+        stdscr: Curses standard screen, as supplied by `curses.wrapper`.
+        shared: `SharedConfig` instance holding the live radio/DSP config.
+        acquirer: Acquirer (or DemoAcquirer) supplying `latest()` frames to
+            render.
+        fps: Target redraw rate in frames per second (floored at 0.5).
+        logbuf: `LogBuffer` whose tail is drawn in the log pane.
+    """
     import curses
 
     curses.curs_set(0)
@@ -220,6 +312,10 @@ def ui_loop(stdscr, shared, acquirer, fps, logbuf):
 
 
 def main():
+    """CLI entry point: resolve the device, build the shared config and
+    acquisition/compute pipeline from `live/core`, then run the curses UI
+    until the user quits, and tear the pipeline back down on the way out.
+    """
     parser = argparse.ArgumentParser(
         description="striqt terminal live monitor (thin frontend over live/core)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

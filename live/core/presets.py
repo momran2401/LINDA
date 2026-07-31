@@ -1,4 +1,10 @@
-"""Versioned, server-owned analysis and recording presets."""
+"""Versioned, server-owned analysis and recording presets.
+
+Each entry in `PRESETS` bundles a backend + nfft + analysis-target
+configuration a user can apply in one step (e.g. from the web UI's preset
+picker) instead of setting individual capture/analysis fields by hand.
+`public_presets()` is the read-only, JSON-friendly view served to clients.
+"""
 
 PRESETS = {
     "spectrum-survey": {
@@ -38,4 +44,10 @@ PRESETS = {
 
 
 def public_presets():
+    """Flatten PRESETS into a list suitable for a JSON API response.
+
+    Returns:
+        list[dict]: One dict per preset, each containing that preset's
+        fields plus an "id" key holding its `PRESETS` dict key.
+    """
     return [{"id": key, **value} for key, value in PRESETS.items()]

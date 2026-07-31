@@ -1,7 +1,19 @@
-"""Low-rate structured measurements alongside the high-rate waterfall.
+"""Low-rate structured measurements computed alongside the high-rate waterfall.
 
-This module only consumes public striqt measurement functions.  It deliberately
-runs on the existing compute worker, never on the DMA drain thread.
+`InsightService` maintains a thread-safe "latest results" snapshot — channel
+power time series/histogram (via striqt's native measurement kernels) and,
+optionally, a 5G PSS/SSS cell-detection candidate search — that clients read
+separately from the per-frame waterfall/PSD data pushed over the WebSocket.
+The two measurement kinds are throttled independently (power at most every
+0.5 s, cell search at most every 2 s): these are meant to update at a
+human-legible rate, not once per acquired frame.
+
+This module only consumes public striqt measurement functions
+(`striqt.analysis.measurements`, reached via `core/striqt_compat.py`) and
+degrades honestly: if `striqt.analysis` failed to import (`_ANALYSIS_OK` is
+False), `InsightService.update()` records a warning instead of raising. It
+deliberately runs on the existing compute worker, never on the DMA drain
+thread, so a slow measurement cannot stall sample acquisition.
 """
 from __future__ import annotations
 
@@ -19,6 +31,25 @@ from .striqt_compat import analysis_specs, striqt_measurements, _ANALYSIS_OK
 
 
 def calibration_status(cfg) -> dict:
+    """Describe whether/how input-power calibration is configured and applied.
+
+    Reads the calibration file path from ``cfg.source_config["calibration"]``
+    and reports its status. Even with a valid file configured, live values
+    are never labeled calibrated: the rolling live path reads the source
+    stream directly and does not construct an AcquiredIQ or call
+    ``striqt.correct_iq`` — only the recording sweep actually applies the
+    calibration.
+
+    Args:
+        cfg: The active radio config, consulted for `source_config`.
+
+    Returns:
+        dict: JSON-serializable status with at least `active`, `configured`,
+        `state`, `units`, `message`. When a calibration value is configured,
+        also includes `path`/`name`, and either `sha256`/`modified_at`/
+        `available` (file read succeeded) or `state="invalid"` with a message
+        (file could not be read).
+    """
     value = (cfg.source_config or {}).get("calibration")
     result = {
         "active": False,
@@ -52,9 +83,28 @@ def calibration_status(cfg) -> dict:
 
 
 class InsightService:
-    """Thread-safe latest-value store for native power/statistical/cell results."""
+    """Thread-safe latest-value store for native power/statistical/cell results.
+
+    Instances hold no per-request state — `update()` is called once per
+    compute cycle with the newly acquired samples, and `snapshot()` is called
+    by request handlers to read back whatever was computed most recently.
+
+    Attributes:
+        _latest: The most recent JSON-serializable result dict, replaced
+            wholesale (never mutated) by `update()`.
+        _cell_enabled: Whether the periodic 5G PSS/SSS candidate search runs.
+        _last_power: Monotonic timestamp of the last power computation, used
+            to throttle `update()` to at most once every 0.5 s.
+        _last_cell: Monotonic timestamp of the last cell-search attempt,
+            throttled to at most once every 2 s.
+        _cell_hits: Consecutive successful-detection count, used to flag a
+            candidate as `persistent` after 3 consecutive hits.
+        _cell_first_seen: Wall-clock time the current hit streak began, or
+            None between streaks.
+    """
 
     def __init__(self):
+        """Initialize an empty snapshot and cell-detection tracking state."""
         self._lock = threading.Lock()
         self._latest = {"schema_version": 1, "updated_at": None}
         self._cell_enabled = False
@@ -64,16 +114,45 @@ class InsightService:
         self._cell_first_seen = None
 
     def configure(self, *, cell_enabled=None):
+        """Update runtime toggles.
+
+        Args:
+            cell_enabled: If not None, enable or disable the periodic 5G
+                PSS/SSS cell-detection candidate search.
+        """
         if cell_enabled is not None:
             self._cell_enabled = bool(cell_enabled)
 
     def snapshot(self):
+        """Return the most recently computed result snapshot.
+
+        Returns:
+            dict: A shallow copy of the latest snapshot (or the initial
+            empty one if `update()` has never run). A shallow copy suffices
+            because `update()` always replaces whole nested result objects
+            rather than mutating them in place — the JSON-compatible content
+            is never mutated after being stored.
+        """
         with self._lock:
-            # JSON-compatible content only; a shallow copy is sufficient because
-            # updates replace complete nested result objects.
             return dict(self._latest)
 
     def update(self, samples, cfg):
+        """Compute and store the latest low-rate measurement snapshot.
+
+        Throttled to run at most once every 0.5 s; calls within that window
+        return immediately without recomputing. Always computes channel
+        power time series/histogram (recording a `warning` or `power_error`
+        key on failure instead of raising); additionally runs the 5G PSS/SSS
+        cell-detection candidate search at most once every 2 s when
+        `_cell_enabled` is set via `configure()` — otherwise, or between
+        search intervals, the previous cell result is carried forward
+        unchanged.
+
+        Args:
+            samples: Acquired IQ array, shape (channels, num_samples).
+            cfg: The active radio config — consulted for sample_rate, center,
+                analysis_bandwidth, ssb_* fields, and calibration status.
+        """
         if time.monotonic() - self._last_power < 0.5:
             return
         self._last_power = time.monotonic()
@@ -181,6 +260,25 @@ class InsightService:
 
     @staticmethod
     def _cell_summary(samples, capture, cfg):
+        """Run a best-effort 5G SSB PSS/SSS correlation search.
+
+        Args:
+            samples: Acquired IQ array, shape (channels, num_samples).
+            capture: A striqt `analysis_specs.Capture` describing
+                sample_rate/duration/analysis_bandwidth for this array.
+            cfg: The active radio config, used for
+                ssb_subcarrier_spacing/ssb_sample_rate/
+                ssb_discovery_periodicity/ssb_frequency_offset.
+
+        Returns:
+            dict: `detected` is True when the PSS peak-to-median ratio is
+            finite and >= 6.0; only then is the SSS correlation also run.
+            `physical_cell_id` is always None — the SSS result gives a
+            candidate peak, but PCI is left unset until axis metadata
+            unambiguously identifies NID1. Any exception during correlation
+            is caught and reported via an `error` key rather than
+            propagated.
+        """
         kwargs = dict(
             subcarrier_spacing=float(cfg.ssb_subcarrier_spacing),
             sample_rate=min(float(cfg.ssb_sample_rate), float(cfg.sample_rate)),

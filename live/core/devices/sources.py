@@ -1,13 +1,21 @@
-"""striqt source classes for non-AIR-T SoapySDR radios.
+"""striqt source classes for non-AIR-T SoapySDR radios (PlutoSDR + generic).
 
-PlutoSource is ported from live/legacy/pluto_standalone.py (P3-1); GenericSoapySource
-extends the same trick to any SoapySDR driver string, best-effort. Both reuse
-the Air8201BSourceSpec CLASS, but not its values: the assumption that "the
-Soapy drivers ignore the AirStack master-clock/time-source fields they don't
-implement" is false. SoapyUHD implements setMasterClockRate and a USRP B2xx
+This is the low-level half of the `core/devices/` adapter layer: `__init__.py`
+picks a profile and an adapter, and the adapter's `create_source()` calls into
+here to actually build a striqt source object for that hardware.
+
+`PlutoSource` is ported from `live/legacy/pluto_standalone.py` (P3-1);
+`GenericSoapySource` extends the same trick to any SoapySDR driver string,
+best-effort. Both subclass striqt's Deepwave `Airstack1Source` to reuse its
+stream/arm/read machinery, and both reuse the `Air8201BSourceSpec` CLASS for
+their spec shape — but never its VALUES: the assumption that "the Soapy
+drivers ignore the AirStack master-clock/time-source fields they don't
+implement" is false. SoapyUHD implements `setMasterClockRate`, and a USRP B2xx
 rejects the AIR-T's 125 MHz outright, so the source never opened. Anything the
 driver genuinely acts on has to be right for the radio in hand — see
-master_clock_rate below. striqt/ itself is never modified.
+`master_clock_rate` in `make_source_spec()` below. `striqt/` itself (the
+vendored, read-only upstream tree) is never modified; these classes live
+entirely in Linda's own code.
 """
 from __future__ import annotations
 
@@ -27,11 +35,25 @@ SPEC_CLASSES = {
 
 
 def make_source_spec(device=None, overrides=None):
-    """
-    Build the striqt source spec for `device` (profile name), applying any
-    applied-source-config `overrides` (the verified-reconnect path). Unknown
-    override keys are dropped against the spec class's declared fields so a
-    stale/foreign key can never crash source construction.
+    """Build the striqt source spec for `device`, ready to hand to `.from_spec()`.
+
+    Starts from a set of safe defaults (see below), applies any
+    applied-source-config `overrides` (the verified-reconnect path in
+    `core/config.py`), then drops any override key the target spec class
+    doesn't declare, so a stale or foreign key can never crash source
+    construction.
+
+    Args:
+        device: Profile name (e.g. "air8201b", "pluto", "soapy"); selects
+            which per-model striqt spec class to build and which profile's
+            `master_clock_rate` to default to. Falls back to
+            `Air8201BSourceSpec` when unrecognized.
+        overrides: Optional dict of spec-field overrides, typically from an
+            applied source-config reconnect.
+
+    Returns:
+        An instance of the resolved spec class (e.g. `Air8201BSourceSpec`),
+        constructed with the merged, field-filtered options.
     """
     spec_cls = SPEC_CLASSES.get(device, Air8201BSourceSpec)
     # Every profile now declares its own master clock; only a radio with no
@@ -58,7 +80,17 @@ def make_source_spec(device=None, overrides=None):
 
 
 def _hardware_key(source, fallback):
-    """Best-effort SoapySDR hardware key, with a stable fallback."""
+    """Best-effort SoapySDR hardware key for a source, with a stable fallback.
+
+    Args:
+        source: A striqt source instance; its underlying SoapySDR device
+            object is looked up via `_device` or `device`.
+        fallback: Value to return if the device is missing or
+            `getHardwareKey()` fails or returns a falsy value.
+
+    Returns:
+        str: The device's hardware key, or `fallback`.
+    """
     dev = getattr(source, "_device", getattr(source, "device", None))
     try:
         key = dev.getHardwareKey()
@@ -89,42 +121,60 @@ if _SENSOR_OK and _SoapySource is not None:
         _soapy_driver = "soapy"
 
         def _connect(self, spec, **kwargs):
+            """Connect via striqt's `_SoapySource`, forcing this class's
+            `_soapy_driver` instead of the AIR-T's "SoapyAIRT"."""
             _SoapySource._connect(self, spec, driver=self._soapy_driver, **kwargs)
 
-        # striqt v0.7.0 reads `source.id` (a cached_property); newer builds call
-        # get_id(). Neither inherited path works here: Airstack1Source resolves
-        # both from the Jetson eth0 MAC, which a Pluto host does not have, and
-        # upstream SoapySource.id has a `raise`/`return` typo. run_sweep looks
-        # the source ID up, so without this a recording dies at startup.
         @property
         def id(self):
+            """str: Stable source identifier, read by striqt v0.7.0 as a
+            cached_property.
+
+            Neither inherited path works here: `Airstack1Source` resolves both
+            `id` and `get_id()` from the Jetson eth0 MAC, which a Pluto/SoapySDR
+            host does not have, and upstream `SoapySource.id` has a
+            `raise`/`return` typo. `run_sweep` looks the source ID up, so
+            without this override a recording dies at startup.
+            """
             return _hardware_key(self, self._soapy_driver)
 
         def get_id(self):
+            """str: Same as `id`, for newer striqt builds that call `get_id()`
+            instead of reading the `id` cached_property."""
             return _hardware_key(self, self._soapy_driver)
 
         def read_peripherals(self):
-            # AirStack-only transceiver temperature sensor.
+            """dict: Empty — the AirStack transceiver temperature sensor this
+            hooks in Deepwave sources doesn't exist on non-AIR-T radios."""
             return {}
 
     class PlutoSource(_NonAirstackSoapySource):
-        """PlutoSDR adapter (ported from live/legacy/pluto_standalone.py, P3-1)."""
+        """PlutoSDR source (ported from live/legacy/pluto_standalone.py, P3-1)."""
 
         _soapy_driver = "plutosdr"
 
     class GenericSoapySource(_NonAirstackSoapySource):
-        """
-        Best-effort adapter for any other SoapySDR radio: same shape as
-        PlutoSource but with the driver string chosen from enumeration. Works
+        """Best-effort source for any other SoapySDR radio.
+
+        Same shape as `PlutoSource` but with `_soapy_driver` chosen from
+        enumeration via `generic_soapy_class()` rather than hardcoded. Works
         wherever the driver tolerates the AirStack spec fields it doesn't
         implement.
         """
 
     def generic_soapy_class(driver):
-        """A GenericSoapySource subclass bound to `driver`.
+        """Build a `GenericSoapySource` subclass bound to a specific driver.
 
-        v0.7.0 builds sources through .from_spec(), which forwards no device
-        kwargs, so the driver string has to live on the class.
+        v0.7.0 builds sources through `.from_spec()`, which forwards no device
+        kwargs, so the driver string has to live on the class rather than
+        being passed at construction time.
+
+        Args:
+            driver: The SoapySDR driver string (e.g. "uhd", "rtlsdr").
+
+        Returns:
+            type: A new `GenericSoapySource` subclass with `_soapy_driver` set
+            to `driver`.
         """
         safe = "".join(ch if ch.isalnum() else "_" for ch in str(driver))
         return type(f"GenericSoapySource_{safe}", (GenericSoapySource,),
@@ -134,5 +184,15 @@ else:
     GenericSoapySource = None
 
     def generic_soapy_class(driver):
+        """Fallback used when striqt's SoapySource base isn't importable.
+
+        Args:
+            driver: Unused; present to match the real `generic_soapy_class()`
+                signature.
+
+        Raises:
+            RuntimeError: Always — no SoapySDR-backed source class can be
+                built in this environment.
+        """
         raise RuntimeError(
             "striqt SoapySource unavailable — cannot drive a SoapySDR device")

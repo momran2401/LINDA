@@ -22,13 +22,39 @@ _shared = None
 
 
 def bind(acquirer, shared):
-    """Called once by the frontend after building the acquisition stack."""
+    """Register the live Acquirer/SharedConfig for health_snapshot() to read.
+
+    Called once by the frontend after building the acquisition stack. Before
+    this is called, health_snapshot() reports only boot/device/status with no
+    radio detail (`_acquirer` is None).
+
+    Args:
+        acquirer: The running `core.acquisition.Acquirer` (or `DemoAcquirer`).
+        shared: The process's `core.config.SharedConfig` instance.
+    """
     global _acquirer, _shared
     _acquirer = acquirer
     _shared = shared
 
 
 def health_snapshot():
+    """Build the current `/health` payload.
+
+    Reports boot id/uptime, the active device/channels, ring-buffer status
+    (via `acquirer.ring_status()` when bound), the age of the most recently
+    delivered frame, and the last terminal entry from
+    `core.operations.OPERATIONS`. Reads only the frame header — never a full
+    frame body — so checking health never copies a multi-MB AHAWI capture
+    just to read its timestamp.
+
+    Status is "ok" once a frame has arrived within the last 5 seconds;
+    otherwise "starting" while no Acquirer is bound or the process is under
+    10 seconds old, and "degraded" beyond that with no fresh frame.
+
+    Returns:
+        dict: JSON-serializable snapshot for the `/health` endpoint and the
+        Operations tab.
+    """
     now = time.time()
     out = {
         "status": "starting",

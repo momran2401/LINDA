@@ -1,8 +1,39 @@
-"""Spectrogram compute backends, grid helpers, and the frame header.
+"""DSP compute backends and the frame-header contract for the live viewer.
 
-Everything DSP: quicklook/calibrated/psd/ssb backends, the aligned-nfft grid,
-row/hop geometry, and build_header (the honest frame-header contract).
-Extracted verbatim from striqt_web_server.py.
+This module is the single place that turns raw IQ samples pulled from the
+ring buffer (`core.acquisition`) into the (channels, rows, bins) float32
+blocks the web UI renders, plus the JSON header that discloses exactly how
+those blocks were produced. It implements four display backends:
+
+- `db_spectrogram` ("quicklook") — a dependency-free Hann/FFT spectrogram
+  that works even when striqt is not importable.
+- `calibrated_spectrogram` — striqt's calibrated STFT, driven by the
+  Analysis param block in `RadioConfig` (window/overlap/fill/integration
+  bandwidth/LO bandstop/stopband trim).
+- `psd_traces` — striqt's power_spectral_density Welch-method statistic
+  traces (rms/mean/percentiles over time, one row per statistic).
+- `ssb_spectrogram` — striqt's symbol-aligned 5G SSB spectrogram, one row
+  per OFDM symbol of each discovered burst set.
+
+`compute_blocks` is the single dispatch point frontends call; it degrades a
+backend honestly (SSB off-grid -> calibrated, striqt unavailable ->
+quicklook) and always reports both the requested and executed backend so the
+client never renders a phantom view. `build_header` assembles the frame
+header (frequency axis, fft_nfft/bin_avg/hop_size disclosure, backend
+identity) that ships alongside every frame — see `core.serialization` for
+how blocks + header become wire bytes.
+
+The module also owns AHAWI mode: a third display mode that grabs ONE
+contiguous multi-segment capture from the ring, analyzes it in a single
+striqt pass (`ahawi_capture`, geometry from `ahawi_plan`), and ships it as one
+frame the client replays segment-by-segment. AHAWI additionally runs the
+full striqt measurement bundle (PSD statistics + channel power time series)
+over the displayed span and can fold segments into phase alignment
+(`ahawi_align_offset`) so a periodic burst (e.g. a 20 ms 5G SSB) holds still
+across segments instead of swimming the way the rolling live view does.
+
+Everything here was extracted verbatim from striqt_web_server.py during the
+2026-07 core/ refactor; see CLAUDE.md for the current architecture map.
 """
 from __future__ import annotations
 
@@ -27,15 +58,35 @@ from .striqt_compat import (
 )
 
 def _snap(value, choices):
+    """Return the entry of `choices` closest to `value`.
+
+    Args:
+        value: Target value to snap.
+        choices: Iterable of candidate values.
+
+    Returns:
+        The element of `choices` with the smallest absolute distance to
+        `value`.
+    """
     return min(choices, key=lambda c: abs(c - value))
 
 
 def allowed_rates(env):
-    """
-    LTE-grid rates within the device capability envelope (P3-3). The grid is
-    domain logic (cellular multiples of 1.92 MHz), not a device property; the
-    envelope only filters it. Falls back to the full grid if the intersection
-    is empty so snapping never faces an empty choice list.
+    """LTE-grid sample rates within a device's capability envelope (P3-3).
+
+    The rate grid itself (`RATES_HZ`, cellular multiples of 1.92 MHz) is
+    domain logic, not a device property; `env` only filters which grid
+    entries a given radio can actually run.
+
+    Args:
+        env: Device capability envelope with `rate_min`/`rate_max` bounds
+            (Hz), as returned by the device adapter layer.
+
+    Returns:
+        Tuple of rates from `RATES_HZ` within `[env["rate_min"],
+        env["rate_max"]]`. Falls back to the full `RATES_HZ` grid if that
+        intersection is empty, so callers snapping to the result never face
+        an empty choice list.
     """
     rates = tuple(r for r in RATES_HZ
                   if env["rate_min"] <= r <= env["rate_max"])
@@ -45,9 +96,24 @@ def allowed_rates(env):
 # ---------------------------------------------------------------------------
 
 def db_spectrogram(samples: np.ndarray, nfft: int, rows: int) -> np.ndarray:
-    """
-    Quicklook: Hann window → FFT → normalized power dB.
-    Returns (channels, rows, nfft) float32, fftshifted, oldest-row-first.
+    """Dependency-free "quicklook" spectrogram: Hann window, FFT, power in dB.
+
+    Non-overlapping rows (hop == nfft), so this is the backend `compute_blocks`
+    falls back to when striqt is not importable — it needs no striqt spec at
+    all, only a reshape and an FFT.
+
+    Args:
+        samples: (channels, n) complex IQ samples.
+        nfft: FFT size; also the hop between rows (no overlap).
+        rows: Number of output rows to produce. `samples` is right-cropped to
+            the most recent `rows * nfft` samples, or zero-padded at the front
+            if shorter.
+
+    Returns:
+        Tuple of (spg, meta): spg is (channels, rows, nfft) float32, dB,
+        fftshifted (bin 0 = -fs/2), oldest row first. meta is
+        {"fft_nfft": nfft, "bin_avg": 1, "hop_size": nfft} — the axis
+        parameters `build_header` needs; quicklook never averages bins.
     """
     samples = np.asarray(samples, dtype=np.complex64)
     needed  = rows * nfft
@@ -63,16 +129,23 @@ def db_spectrogram(samples: np.ndarray, nfft: int, rows: int) -> np.ndarray:
     # Normalize by window power (proper PSD estimate)
     power  = (np.abs(spec) ** 2) / max(float(np.sum(window ** 2)), 1.0)
     spg = (10.0 * np.log10(power + 1e-20)).astype(np.float32)
-    # Quicklook is a plain fftshifted per-bin FFT: fft_nfft = nfft, no averaging,
-    # non-overlapping rows (hop = nfft).
     return spg, {"fft_nfft": int(nfft), "bin_avg": 1, "hop_size": int(nfft)}
 
 
 def analysis_hop(nfft: int, fractional_overlap=DEFAULT_FRACTIONAL_OVERLAP) -> int:
-    """
-    Samples the STFT advances per displayed row: nfft − noverlap, where noverlap
-    is computed exactly as striqt does (`round(fractional_overlap * nfft)` on the
-    Fraction). At the default 13/28 overlap this is the familiar nfft·15/28.
+    """Samples the STFT advances per displayed row.
+
+    Computed as `nfft - noverlap`, where `noverlap` is derived exactly as
+    striqt does internally (`round(fractional_overlap * nfft)` on the exact
+    `Fraction`), so this stays bit-for-bit consistent with striqt's own row
+    geometry. At the default 13/28 overlap this is the familiar `nfft*15/28`.
+
+    Args:
+        nfft: STFT size.
+        fractional_overlap: Overlap fraction (0..1), typically a `Fraction`.
+
+    Returns:
+        Hop size in samples, at least 1.
     """
     nfft = int(nfft)
     noverlap = round(Fraction(fractional_overlap) * nfft)
@@ -80,10 +153,19 @@ def analysis_hop(nfft: int, fractional_overlap=DEFAULT_FRACTIONAL_OVERLAP) -> in
 
 
 def resolve_integration_bandwidth(value, nfft: int, sample_rate: float):
-    """
-    Map the cfg integration_bandwidth ("auto" | None | Hz) to the value striqt
-    receives. "auto" reproduces the pre-P2a behaviour: frequency_resolution ×
-    averaging_factor(nfft), the only choice that tracks nfft changes.
+    """Map a cfg integration_bandwidth setting to the value striqt expects.
+
+    Args:
+        value: `None` (no integration), the literal string `"auto"`, or a
+            bandwidth in Hz.
+        nfft: FFT size, used only when `value == "auto"`.
+        sample_rate: Capture sample rate in Hz, used only when
+            `value == "auto"`.
+
+    Returns:
+        `None` if `value` is `None`; otherwise a bandwidth in Hz. `"auto"`
+        reproduces the pre-P2a behavior of `frequency_resolution *
+        averaging_factor(nfft)` — the one choice that tracks nfft changes.
     """
     if value is None:
         return None
@@ -93,7 +175,20 @@ def resolve_integration_bandwidth(value, nfft: int, sample_rate: float):
 
 
 def make_analysis_spec(cfg: "RadioConfig", nfft: int, sample_rate: float):
-    """Build the striqt Spectrogram spec from cfg's analysis params (P2a-1)."""
+    """Build the striqt `Spectrogram` spec from cfg's analysis param block (P2a-1).
+
+    Args:
+        cfg: `RadioConfig` supplying window/overlap/fill/integration-bandwidth/
+            LO-bandstop/stopband-trim/time-aperture settings.
+        nfft: FFT size to target; `frequency_resolution` is derived from it so
+            striqt's internal `nfft = round(sample_rate / frequency_resolution)`
+            round-trips back to this value.
+        sample_rate: Capture sample rate in Hz.
+
+    Returns:
+        A `striqt.analysis.specs.Spectrogram` instance ready to pass to
+        `evaluate_spectrogram`.
+    """
     frequency_resolution = float(sample_rate) / float(nfft)
     integration = resolve_integration_bandwidth(
         cfg.integration_bandwidth, nfft, sample_rate
@@ -113,8 +208,19 @@ def make_analysis_spec(cfg: "RadioConfig", nfft: int, sample_rate: float):
 
 
 def time_aperture_bins(cfg: "RadioConfig", hop: int) -> int:
-    """STFT rows striqt averages into one output row for cfg.time_aperture
-    (1 = no time averaging). Mirrors striqt's round(time_aperture/hop_period)."""
+    """STFT rows striqt averages into one output row for `cfg.time_aperture`.
+
+    Mirrors striqt's own `round(time_aperture / hop_period)` so the disclosed
+    hop and the actual averaging stay consistent.
+
+    Args:
+        cfg: `RadioConfig`; `time_aperture` of 0/None means no time averaging.
+        hop: STFT hop size in samples (one un-averaged row's advance).
+
+    Returns:
+        Number of STFT rows folded into one output row; 1 when
+        `cfg.time_aperture` is falsy.
+    """
     if not cfg.time_aperture:
         return 1
     return max(1, round(float(cfg.time_aperture) * float(cfg.sample_rate) / max(1, hop)))
@@ -122,13 +228,33 @@ def time_aperture_bins(cfg: "RadioConfig", hop: int) -> int:
 
 def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig",
                            prefer_gpu: bool = False) -> tuple:
-    """
-    striqt-calibrated PSD spectrogram driven by cfg's analysis params (P2a-1) —
-    window, overlap, fill, integration bandwidth, LO bandstop, stopband trim.
-    Returns (blocks, meta) — blocks (channels, rows, bins) float32, meta
-    {fft_nfft, bin_avg, hop_size, freqs_hz_f0, freqs_hz_step, compute_backend}.
-    prefer_gpu offloads the STFT to cupy when present (AHAWI/capture-sized
-    work); the rolling live path keeps its numpy default unchanged.
+    """striqt-calibrated PSD spectrogram driven by cfg's analysis param block (P2a-1).
+
+    Runs striqt's `evaluate_spectrogram` at the configured window, overlap,
+    window fill, integration bandwidth, LO bandstop, and stopband trim; snaps
+    the FFT size to the `aligned_nfft` grid and right-sizes the input to
+    exactly `cfg.rows` STFT rows under the configured overlap (LV-W2) rather
+    than computing extra rows and discarding them. When `cfg.time_aperture`
+    folds multiple STFT rows into one displayed row, the output row count and
+    disclosed hop are widened to match.
+
+    Args:
+        samples: (channels, n) complex IQ samples.
+        cfg: `RadioConfig` supplying `rows`, `sample_rate`, `nfft`, and the
+            analysis param block consumed by `make_analysis_spec`.
+        prefer_gpu: Offload the STFT to cupy when available (AHAWI/capture-
+            sized work); the rolling live path leaves this False and always
+            runs numpy.
+
+    Returns:
+        Tuple of (blocks, meta): blocks is (channels, rows, bins) float32 dB.
+        meta has keys `fft_nfft`, `bin_avg`, `hop_size`, `compute_backend`
+        ("numpy" or "cupy"), and — when striqt's coordinate factory succeeds —
+        `freqs_hz_f0`/`freqs_hz_step` for the exact frequency axis.
+
+    Raises:
+        RuntimeError: If the striqt analysis backend failed to import
+            (`_ANALYSIS_OK` is False).
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"calibrated backend unavailable: {_ANALYSIS_ERR!r}")
@@ -196,9 +322,20 @@ def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig",
 
 
 def make_psd_kwargs(cfg: "RadioConfig", nfft: int, sample_rate: float) -> dict:
-    """Keyword arguments for striqt's power_spectral_density from cfg's PSD
-    param block (P2b-3) — the exact spec the live compute and the tier-2
-    scratch validator both use."""
+    """Keyword arguments for striqt's `power_spectral_density` from cfg's PSD
+    param block (P2b-3) — the exact spec shared by the live compute path and
+    the tier-2 scratch validator, so both agree on what the backend will run.
+
+    Args:
+        cfg: `RadioConfig` supplying the `psd_*` param block (window, overlap,
+            fill, integration bandwidth, LO bandstop, trim, time statistics).
+        nfft: FFT size to target.
+        sample_rate: Capture sample rate in Hz.
+
+    Returns:
+        Dict of kwargs ready to splat into
+        `striqt_measurements.power_spectral_density`.
+    """
     integration = resolve_integration_bandwidth(
         cfg.psd_integration_bandwidth, nfft, sample_rate
     )
@@ -217,12 +354,27 @@ def make_psd_kwargs(cfg: "RadioConfig", nfft: int, sample_rate: float) -> dict:
 
 def psd_traces(samples: np.ndarray, cfg: "RadioConfig",
                prefer_gpu: bool = False) -> tuple:
-    """
-    striqt power_spectral_density backend (P2b-3): Welch-method statistic
-    traces over the frame's time span, one row per configured time_statistic
-    entry. Returns (blocks, meta) — blocks (channels, n_statistics, bins)
-    float32 dB; meta discloses the statistic list (psd_stats) and the true
-    integrated span (time_span_ms) alongside the usual axis params.
+    """striqt `power_spectral_density` backend (P2b-3).
+
+    Runs a Welch-method statistic trace over the frame's whole time span, one
+    output row per entry in `cfg.psd_time_statistic` (e.g. mean/max/rms) —
+    unlike the other backends, rows here are statistics, not time.
+
+    Args:
+        samples: (channels, n) complex IQ samples.
+        cfg: `RadioConfig` supplying `rows`, `sample_rate`, `nfft`, and the
+            `psd_*` param block consumed by `make_psd_kwargs`.
+        prefer_gpu: Offload the Welch computation to cupy when available.
+
+    Returns:
+        Tuple of (blocks, meta): blocks is (channels, n_statistics, bins)
+        float32 dB. meta has `fft_nfft`, `bin_avg`, `hop_size`, `psd_stats`
+        (the statistic names, in row order), `time_span_ms` (the true
+        integrated span), and — when available — `freqs_hz_f0`/`freqs_hz_step`.
+
+    Raises:
+        RuntimeError: If the striqt analysis backend failed to import
+            (`_ANALYSIS_OK` is False).
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"PSD backend unavailable: {_ANALYSIS_ERR!r}")
@@ -280,14 +432,34 @@ def psd_traces(samples: np.ndarray, cfg: "RadioConfig",
 
 
 def ssb_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
-    """
-    True symbol-aligned 5G SSB spectrogram (P2b-5): striqt's
-    cellular_5g_ssb_spectrogram driven by cfg's SSB param block, one row per
-    OFDM symbol of each burst set, flattened (blocks·symbols) to the dashboard
-    row contract. Only reachable on the SSB grid (compute_blocks pre-checks
-    and runs calibrated honestly otherwise); grid errors here propagate to the
-    tier-3 backstop rather than silently substituting another analysis.
-    Returns (blocks, meta).
+    """True symbol-aligned 5G SSB spectrogram (P2b-5).
+
+    Runs striqt's `cellular_5g_ssb_spectrogram`, driven by cfg's SSB param
+    block, one row per OFDM symbol of each discovered burst set, flattened
+    (blocks*symbols) to the dashboard's flat row contract. Only reachable when
+    the capture rate is on the SSB grid — `compute_blocks` pre-checks
+    `ssb_grid_compatible` and runs calibrated honestly otherwise, so a grid
+    mismatch here would be a caller bug; it is allowed to propagate to the
+    tier-3 backstop rather than being silently swallowed into another
+    analysis.
+
+    Args:
+        samples: (channels, n) complex IQ samples.
+        cfg: `RadioConfig` supplying `sample_rate` and the SSB param block
+            consumed by `ssb_geometry`/`make_ssb_kwargs`.
+
+    Returns:
+        Tuple of (blocks, meta): blocks is (channels, rows, bins) float32 dB,
+        one row per kept OFDM symbol. meta has `fft_nfft`, `bin_avg` (always
+        2, striqt integrates adjacent subcarrier-spacing bin pairs),
+        `hop_size`, and — when available — `freqs_hz_f0`/`freqs_hz_step` for
+        the truncated, possibly frequency-offset SSB band.
+
+    Raises:
+        RuntimeError: If the striqt analysis backend failed to import
+            (`_ANALYSIS_OK` is False).
+        ValueError: If `cfg.sample_rate` is not on the SSB grid for
+            `cfg.ssb_subcarrier_spacing` (raised by `ssb_geometry`).
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"SSB backend unavailable: {_ANALYSIS_ERR!r}")
@@ -366,10 +538,27 @@ ALIGNED_NFFTS = (252, 504, 1008, 2016, 4032)   # 28·{9,18,36,72,144}
 
 
 def aligned_nfft(nfft: int) -> int:
+    """Snap a requested FFT size to the nearest entry in `ALIGNED_NFFTS`.
+
+    Args:
+        nfft: Requested FFT size.
+
+    Returns:
+        The closest value in `ALIGNED_NFFTS`.
+    """
     return min(ALIGNED_NFFTS, key=lambda n: abs(n - int(nfft)))
 
 
 def averaging_factor(nfft: int) -> int:
+    """Largest bin-averaging factor (<= `AVG_BIN_GROUPS`) that evenly divides `nfft`.
+
+    Args:
+        nfft: FFT size.
+
+    Returns:
+        The largest integer in `[2, min(AVG_BIN_GROUPS, nfft)]` that divides
+        `nfft` evenly, or 1 if none does.
+    """
     for factor in range(min(AVG_BIN_GROUPS, nfft), 1, -1):
         if nfft % factor == 0:
             return factor
@@ -377,13 +566,22 @@ def averaging_factor(nfft: int) -> int:
 
 
 def calibrated_sample_count(nfft: int, rows: int, hop=None) -> int:
-    """
-    Samples needed to produce exactly `rows` STFT rows under the configured
-    overlap. Each displayed row advances the STFT by `hop` samples (nfft·15/28 at
-    the default 13/28 overlap), so rows·hop + (nfft-hop) samples suffice — instead
-    of the ~1.87× that rows·nfft would compute and then discard (see
-    AUDIT_REPORT.md LV-W2). The count reproduces striqt's own row formula
-    int((nfft/hop)·(N/nfft-1)+1) == rows for any hop that divides its terms.
+    """Samples needed to produce exactly `rows` STFT rows under a given overlap.
+
+    Each displayed row advances the STFT by `hop` samples (`nfft*15/28` at the
+    default 13/28 overlap), so `rows*hop + (nfft-hop)` samples suffice —
+    instead of the ~1.87x that `rows*nfft` would compute and then discard (see
+    AUDIT_REPORT.md LV-W2). The formula reproduces striqt's own row count
+    `int((nfft/hop)*(N/nfft-1)+1) == rows` for any hop that divides its terms.
+
+    Args:
+        nfft: STFT size.
+        rows: Desired number of output rows.
+        hop: Hop size in samples; defaults to the 13/28-overlap hop
+            (`nfft*15/28`) when omitted.
+
+    Returns:
+        Required input sample count.
     """
     nfft = int(nfft)
     if hop is None:
@@ -393,18 +591,36 @@ def calibrated_sample_count(nfft: int, rows: int, hop=None) -> int:
 
 
 def backend_overlap(cfg: RadioConfig):
-    """The fractional_overlap the executing backend's STFT uses (P2b-3): the
-    PSD backend runs its own param block; calibrated/ssb share the spectrogram
-    block."""
+    """The fractional_overlap the executing backend's STFT actually uses (P2b-3).
+
+    The PSD backend runs its own param block (`cfg.psd_fractional_overlap`);
+    calibrated and SSB share the main spectrogram param block
+    (`cfg.fractional_overlap`).
+
+    Args:
+        cfg: `RadioConfig` with `backend` set to the executing backend.
+
+    Returns:
+        The relevant fractional-overlap value from `cfg`.
+    """
     return cfg.psd_fractional_overlap if cfg.backend == "psd" else cfg.fractional_overlap
 
 
 def row_hop(cfg: RadioConfig) -> int:
-    """Samples of signal one display row spans for cfg's backend (P2a-1). For
-    the PSD backend a "row" is one STFT row feeding the statistics, so the
-    duration→rows mapping controls the integrated time span (P2b-3). For the
-    SSB view, symbol_rows display rows come from every discovery period, so
-    the duration→rows mapping picks the burst count (P2b-5)."""
+    """Samples of signal one display row spans for cfg's backend (P2a-1).
+
+    For the PSD backend a "row" is one STFT row feeding the statistics, so the
+    duration->rows mapping controls the integrated time span (P2b-3). For the
+    SSB view, `symbol_rows` display rows come from every discovery period, so
+    the duration->rows mapping instead picks the burst count (P2b-5).
+
+    Args:
+        cfg: `RadioConfig` with `backend`, `sample_rate`, `nfft`, and (for SSB)
+            the SSB param block.
+
+    Returns:
+        Samples of signal spanned by one display row.
+    """
     if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate,
                                                     cfg.ssb_subcarrier_spacing):
         geo = ssb_geometry(cfg)
@@ -416,16 +632,25 @@ def row_hop(cfg: RadioConfig) -> int:
 
 
 def max_live_rows(cfg: RadioConfig) -> int:
-    """
-    Largest number of display rows the IQ ring can actually supply for `cfg`'s
-    backend and FFT size (P1-5). Replaces the old flat 300-row clamp, which pinned
-    every long duration to 300 rows and made the Duration control inert past
-    ~10-20 ms. The bound is honest, not cosmetic: `samples_needed(rows)` must stay
-    within `RING_ROW_FILL·MAX_TAIL` so the Computer's `avail >= need` gate is
-    reached promptly (otherwise a too-large request would starve the display), and
-    never exceed the absolute `MAX_ROWS_ABS` ceiling. A longer duration therefore
-    renders more rows (and, on the calibrated path, costs more FFTs → fps may fall,
-    which is expected and left honest — the cap protects the radio, not the fps).
+    """Largest number of display rows the IQ ring can actually supply (P1-5).
+
+    Replaces the old flat 300-row clamp, which pinned every long duration to
+    300 rows and made the Duration control inert past ~10-20 ms. The bound is
+    honest, not cosmetic: `samples_needed(rows)` must stay within
+    `RING_ROW_FILL * MAX_TAIL` so the Computer's `avail >= need` gate is
+    reached promptly (otherwise a too-large request would starve the
+    display), and it must never exceed the absolute `MAX_ROWS_ABS` ceiling. A
+    longer duration therefore renders more rows (and, on the calibrated path,
+    costs more FFTs, so fps may fall — expected and left honest, since the cap
+    protects the radio, not the fps).
+
+    Args:
+        cfg: `RadioConfig` with `backend`, `sample_rate`, `nfft`, and (for SSB)
+            the SSB param block.
+
+    Returns:
+        Maximum row count for `cfg`'s backend/FFT size, clamped to
+        `[1, MAX_ROWS_ABS]`.
     """
     limit = int(MAX_TAIL * RING_ROW_FILL)
     if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate,
@@ -451,7 +676,35 @@ def fit_display_rows(
     lo_null: bool = True,
     lo_bandstop=SSB_LO_BANDSTOP,
 ) -> np.ndarray:
-    """Crop/pad a striqt spectrogram to the dashboard row contract."""
+    """Crop/pad a striqt spectrogram to the dashboard row contract and null the LO.
+
+    Right-crops or front-pads `spg` to exactly `rows` rows, optionally nulls
+    the LO-leakage region around DC (sized to the actual configured
+    bandstop rather than a fixed bin count), and always scrubs any remaining
+    NaNs so downstream quantization/serialization never sees them.
+
+    Args:
+        spg: (channels, rows_in, bins) spectrogram, any dtype coercible to
+            float32.
+        rows: Target row count.
+        bin_avg: Bins averaged per output column, used to size the LO null in
+            Hz-per-bin terms.
+        fft_nfft: STFT size backing `spg`'s bin axis; required (with
+            `sample_rate`) to size the LO null.
+        sample_rate: Capture sample rate in Hz; required (with `fft_nfft`) to
+            size the LO null.
+        lo_null: Whether to null the LO-leakage region at all (LV-F8); when
+            False the raw DC leak is shown.
+        lo_bandstop: Width in Hz of the LO region to null. `None` (or falsy)
+            disables the null even if `lo_null` is True, since there is
+            nothing to size it to.
+
+    Returns:
+        (channels, rows, bins) float32 array, NaN-free.
+
+    Raises:
+        RuntimeError: If `spg` is not 3-dimensional.
+    """
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim != 3:
         raise RuntimeError(f"spectrogram shape {spg.shape} is not channels x rows x bins")
@@ -489,6 +742,19 @@ def fit_display_rows(
 
 
 def samples_needed(cfg: RadioConfig) -> int:
+    """Input sample count required to produce `cfg.rows` display rows.
+
+    Dispatches per backend: SSB needs whole burst sets (a boundary-aligned
+    span), the calibrated/PSD grid backends need only the overlapped-STFT
+    minimum (LV-W2), and quicklook needs exactly `nfft * rows` (no overlap).
+
+    Args:
+        cfg: `RadioConfig` with `backend`, `sample_rate`, `nfft`, `rows`, and
+            (for SSB) the SSB param block.
+
+    Returns:
+        Required input sample count for `cfg`'s backend.
+    """
     if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate,
                                                     cfg.ssb_subcarrier_spacing):
         # Whole burst sets only (P2b-5): striqt keeps symbol_rows rows per
@@ -511,12 +777,19 @@ def samples_needed(cfg: RadioConfig) -> int:
 
 def ssb_grid_compatible(sample_rate: float,
                         subcarrier_spacing: float = SSB_SUBCARRIER_SPACING) -> bool:
-    """
-    True when the capture rate supports the symbol-aligned SSB view at this
-    subcarrier spacing: the SSB spectrogram runs at frequency_resolution scs/2
-    with window_fill 15/28, so nfft = 2·fs/scs must be an integer AND a
-    multiple of 28 ((1-15/28)·nfft integrality — the audit's "30 kHz grid").
-    Equivalently: fs must be a multiple of 14·scs.
+    """Whether a capture rate supports the symbol-aligned SSB view at this subcarrier spacing.
+
+    The SSB spectrogram runs at `frequency_resolution = scs/2` with
+    `window_fill = 15/28`, so `nfft = 2*fs/scs` must be an integer AND a
+    multiple of 28 (the `(1-15/28)*nfft` integer-zero-fill constraint — the
+    audit's "30 kHz grid"). Equivalently: `fs` must be a multiple of `14*scs`.
+
+    Args:
+        sample_rate: Capture sample rate in Hz.
+        subcarrier_spacing: SSB subcarrier spacing in Hz.
+
+    Returns:
+        True if `sample_rate` is on the SSB grid for `subcarrier_spacing`.
     """
     ratio = 2.0 * float(sample_rate) / float(subcarrier_spacing)
     nfft = round(ratio)
@@ -524,13 +797,22 @@ def ssb_grid_compatible(sample_rate: float,
 
 
 def ssb_compatible_rate(sample_rate: float, subcarrier_spacing: float):
-    """
-    Nearest capture sample rate that satisfies the SSB grid for this
-    subcarrier spacing — the retune target when the SSB view is selected at an
-    incompatible rate (P2b-5). Candidates are multiples of 14·scs, preferring
-    those also on the radio's 1.92 MHz LTE-family grid (most plausibly armable
-    — e.g. 13.44 MS/s = 7·1.92 MHz for all standard SCS), clamped to
-    SSB_MAX_RATE. Returns None when no such rate exists (scs too large).
+    """Nearest capture sample rate that satisfies the SSB grid for this spacing.
+
+    This is the retune target used when the SSB view is selected at an
+    incompatible rate (P2b-5). Candidates are multiples of `14*scs`,
+    preferring those also on the radio's 1.92 MHz LTE-family grid (most
+    plausibly armable — e.g. 13.44 MS/s = 7*1.92 MHz for all standard SCS),
+    clamped to `SSB_MAX_RATE`.
+
+    Args:
+        sample_rate: Current/desired capture sample rate in Hz (nearest
+            multiple of the grid step is chosen).
+        subcarrier_spacing: SSB subcarrier spacing in Hz.
+
+    Returns:
+        The nearest SSB-grid-compatible rate in Hz, or `None` if no such rate
+        exists at or below `SSB_MAX_RATE` (subcarrier spacing too large).
     """
     base = 14.0 * float(subcarrier_spacing)
     if not (base > 0 and math.isfinite(base)) or base > SSB_MAX_RATE:
@@ -549,9 +831,19 @@ def ssb_compatible_rate(sample_rate: float, subcarrier_spacing: float):
 
 
 def make_ssb_kwargs(cfg: "RadioConfig") -> dict:
-    """Keyword arguments for striqt's cellular_5g_ssb_spectrogram from cfg's
-    SSB param block (P2b-5) — shared by the live compute and the tier-2
-    scratch validator."""
+    """Keyword arguments for striqt's `cellular_5g_ssb_spectrogram` from cfg's
+    SSB param block (P2b-5) — shared by the live compute path and the tier-2
+    scratch validator, so both agree on what the backend will run.
+
+    Args:
+        cfg: `RadioConfig` supplying the `ssb_*` param block (subcarrier
+            spacing, output sample rate, discovery periodicity, frequency
+            offset, max block count, window, LO bandstop).
+
+    Returns:
+        Dict of kwargs ready to splat into
+        `striqt_measurements.cellular_5g_ssb_spectrogram`.
+    """
     return dict(
         subcarrier_spacing=float(cfg.ssb_subcarrier_spacing),
         # striqt truncates the frequency axis to this output rate; it can never
@@ -567,16 +859,30 @@ def make_ssb_kwargs(cfg: "RadioConfig") -> dict:
 
 
 def ssb_geometry(cfg: "RadioConfig", sample_rate=None) -> dict:
-    """
-    Row/sample geometry of the symbol-aligned SSB spectrogram (P2b-5). striqt
-    runs the STFT at frequency_resolution scs/2 with a 13/28 overlap, making
-    one row per OFDM symbol; each discovery period contributes the first
-    `symbol_rows` symbols (one burst set, always 2 ms of signal).
-      nfft:           STFT size 2·fs/scs
-      hop:            samples per symbol row (nfft·15/28)
-      symbol_rows:    rows kept per burst set (28·scs/15e3)
-      discovery_rows: rows spanning one discovery period
-    Raises ValueError when the rate/scs combination is off the grid.
+    """Row/sample geometry of the symbol-aligned SSB spectrogram (P2b-5).
+
+    striqt runs the STFT at `frequency_resolution = scs/2` with a 13/28
+    overlap, making one row per OFDM symbol; each discovery period
+    contributes the first `symbol_rows` symbols (one burst set, always 2 ms
+    of signal).
+
+    Args:
+        cfg: `RadioConfig` supplying `ssb_subcarrier_spacing` and
+            `ssb_discovery_periodicity` (and `sample_rate` when the
+            `sample_rate` arg is omitted).
+        sample_rate: Capture sample rate in Hz; defaults to `cfg.sample_rate`.
+
+    Returns:
+        Dict with:
+
+        - `nfft`: STFT size, `2*fs/scs`.
+        - `hop`: Samples per symbol row, `nfft*15/28`.
+        - `symbol_rows`: Rows kept per burst set, `28*scs/15e3`.
+        - `discovery_rows`: Rows spanning one discovery period.
+
+    Raises:
+        ValueError: If the rate/subcarrier-spacing combination is off the
+            SSB grid (see `ssb_grid_compatible`).
     """
     fs  = float(sample_rate if sample_rate is not None else cfg.sample_rate)
     scs = float(cfg.ssb_subcarrier_spacing)
@@ -595,8 +901,18 @@ def ssb_geometry(cfg: "RadioConfig", sample_rate=None) -> dict:
 
 
 def ssb_block_samples(geo: dict, blocks: int) -> int:
-    """Samples that yield exactly `blocks` complete burst sets: (q-1) full
-    discovery periods plus the final burst's symbol rows, plus STFT tail."""
+    """Samples that yield exactly `blocks` complete burst sets.
+
+    Computed as `(blocks-1)` full discovery periods, plus the final burst's
+    kept symbol rows, plus the STFT tail (`nfft - hop`).
+
+    Args:
+        geo: Geometry dict from `ssb_geometry`.
+        blocks: Number of burst sets desired; clamped to at least 1.
+
+    Returns:
+        Required input sample count.
+    """
     q = max(1, int(blocks))
     return int((q - 1) * geo["discovery_rows"] * geo["hop"]
                + geo["symbol_rows"] * geo["hop"]
@@ -604,8 +920,18 @@ def ssb_block_samples(geo: dict, blocks: int) -> int:
 
 
 def ssb_max_blocks(cfg: "RadioConfig", geo: dict) -> int:
-    """Most burst sets one frame can hold: bounded by the ring (same
-    RING_ROW_FILL budget as max_live_rows) and cfg.ssb_max_block_count."""
+    """Most burst sets one frame can hold.
+
+    Bounded by the ring (same `RING_ROW_FILL` budget as `max_live_rows`) and
+    by `cfg.ssb_max_block_count` when set.
+
+    Args:
+        cfg: `RadioConfig`; `ssb_max_block_count` caps the result when truthy.
+        geo: Geometry dict from `ssb_geometry`.
+
+    Returns:
+        Maximum burst-set count, at least 1.
+    """
     limit = int(MAX_TAIL * RING_ROW_FILL)
     per_extra = geo["discovery_rows"] * geo["hop"]
     q = 1 + max(0, (limit - ssb_block_samples(geo, 1)) // max(1, per_extra))
@@ -615,11 +941,26 @@ def ssb_max_blocks(cfg: "RadioConfig", geo: dict) -> int:
 
 
 def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
-    """
-    Dispatch to the configured backend.
-    Returns (blocks, meta): blocks is (channels, rows, bins) float32; meta carries
-    the per-frame axis parameters (fft_nfft, bin_avg) and the executed backend,
-    used by build_header to ship an honest frame header (LV-F1/F2).
+    """Dispatch to the configured backend, degrading honestly when it can't run.
+
+    Two substitutions are possible, both disclosed via `meta["backend"]` /
+    `meta["backend_requested"]` rather than silently rendered as the
+    requested view: SSB falls back to calibrated when the capture rate isn't
+    on the SSB grid (transient during a retune, or an unreachable rate); any
+    striqt-backed backend falls back to quicklook when striqt itself failed
+    to import.
+
+    Args:
+        samples: (channels, n) complex IQ samples.
+        cfg: `RadioConfig` naming the requested `backend` plus that backend's
+            param block.
+
+    Returns:
+        Tuple of (blocks, meta): blocks is (channels, rows, bins) float32.
+        meta carries the per-frame axis parameters (`fft_nfft`, `bin_avg`,
+        etc.) plus `backend` (what actually ran) and `backend_requested`
+        (what was asked for), consumed by `build_header` to ship an honest
+        frame header (LV-F1/F2).
     """
     requested = cfg.backend
     effective = requested
@@ -684,6 +1025,16 @@ _GPU = {"probed": False, "cp": None}
 
 
 def _gpu_module():
+    """Lazily probe for a working cupy install and cache the result.
+
+    The probe runs at most once per process: `cupy.zeros(1)` touches the
+    device so import-time or driver failures surface here rather than mid
+    computation. A failed probe caches `None`, so later calls skip straight
+    to numpy without re-attempting the import.
+
+    Returns:
+        The `cupy` module if import and device touch succeeded, else `None`.
+    """
     if not _GPU["probed"]:
         _GPU["probed"] = True
         try:
@@ -698,8 +1049,20 @@ def _gpu_module():
 def _run_array_fn(fn, samples, prefer_gpu):
     """Run `fn(iq_array) -> array` on the GPU when asked and available.
 
-    Returns (numpy_result, backend_str). fn must accept either array
-    namespace — true for striqt measurements, which follow their input.
+    Any GPU failure at call time falls back to numpy for that call AND
+    disables cupy for the rest of the process (`_GPU["cp"] = None`) — a GPU
+    hiccup must never repeatedly cost the viewer a frame.
+
+    Args:
+        fn: Callable taking one array (numpy or cupy) and returning an array
+            in the same namespace; true for striqt measurements, which
+            follow their input's array module.
+        samples: Input IQ array (numpy).
+        prefer_gpu: Whether to attempt cupy at all for this call.
+
+    Returns:
+        Tuple of (numpy_result, backend_str) where `backend_str` is `"cupy"`
+        or `"numpy"`.
     """
     if prefer_gpu:
         cp = _gpu_module()
@@ -713,22 +1076,45 @@ def _run_array_fn(fn, samples, prefer_gpu):
 
 
 def ahawi_executed_backend(cfg: RadioConfig) -> str:
-    """The backend an AHAWI capture will actually run (honest fallback)."""
+    """The backend an AHAWI capture will actually run (honest fallback).
+
+    Mirrors `compute_blocks`'s striqt-unavailable fallback for the two
+    backends AHAWI wraps: calibrated when requested and striqt is importable,
+    quicklook otherwise.
+
+    Args:
+        cfg: `RadioConfig` with `backend`.
+
+    Returns:
+        `"calibrated"` or `"quicklook"`.
+    """
     if cfg.backend == "calibrated" and _ANALYSIS_OK:
         return "calibrated"
     return "quicklook"
 
 
 def ahawi_plan(cfg: RadioConfig) -> dict:
-    """
-    Segmentation plan for one AHAWI capture. Pure arithmetic, no I/O.
+    """Segmentation plan for one AHAWI capture. Pure arithmetic, no I/O.
 
-    Segment length = cfg.duration (the viewing window; 20 ms when unset).
+    Segment length is `cfg.duration` (the viewing window; 20 ms when unset).
     Rows-per-segment is hop-exact so segment boundaries land on STFT row
-    boundaries; the capture is `segments` windows plus — when alignment is on —
-    one extra segment of slack the align step may trim from the front. All of
-    it must fit the ring with the same honest bound the live view uses
-    (RING_ROW_FILL·MAX_TAIL, MAX_ROWS_ABS).
+    boundaries; the capture is `segments` windows plus — when alignment is
+    on — one extra segment of slack the align step may trim from the front.
+    Everything is clamped to fit the ring under the same honest bound the
+    live view uses (`RING_ROW_FILL * MAX_TAIL`, `MAX_ROWS_ABS`), so an
+    oversized custom duration can never plan a capture the ring could never
+    supply.
+
+    Args:
+        cfg: `RadioConfig` supplying `sample_rate`, `nfft`, `duration`,
+            `fractional_overlap`, `ahawi_align`, and `ahawi_capture_ms`.
+
+    Returns:
+        Dict with `backend`, `nfft`, `hop`, `rows_per_seg`, `segments`,
+        `align` (possibly downgraded to False when segments < 2),
+        `extra_rows`, `total_rows`, `need_samples`, and the disclosed
+        executed spans `segment_ms`/`capture_ms` (which may differ from the
+        requested `ahawi_capture_ms` after clamping).
     """
     executed = ahawi_executed_backend(cfg)
     fs = float(cfg.sample_rate)
@@ -790,8 +1176,18 @@ def ahawi_power_plan(segments: int, seg_samples: int, sample_rate: float):
 
     Aims for ~64 points per segment (0.3 ms resolution at 20 ms segments —
     NR slots are 0.5 ms) but caps the whole series near 2048 points so the
-    header JSON stays small at high segment counts. Returns
-    (detector_period as an exact Fraction, window_samples).
+    header JSON stays small at high segment counts.
+
+    Args:
+        segments: Number of AHAWI segments in the capture.
+        seg_samples: Samples per segment (`rows_per_seg * hop`).
+        sample_rate: Capture sample rate in Hz.
+
+    Returns:
+        Tuple of (detector_period, window_samples): `detector_period` is an
+        exact `Fraction` of seconds per detector sample, suitable for striqt's
+        `detector_period` kwarg; `window_samples` is the same period in
+        samples.
     """
     per_seg = int(min(64, max(16, 2048 // max(1, segments))))
     window = max(1, seg_samples // per_seg)
@@ -801,10 +1197,25 @@ def ahawi_power_plan(segments: int, seg_samples: int, sample_rate: float):
 def channel_power_series(samples: np.ndarray, cfg: "RadioConfig",
                          detector_period: Fraction,
                          prefer_gpu: bool = False) -> tuple:
-    """
-    striqt channel_power_time_series over the given IQ span: per-channel
-    rms/peak power in dB at detector_period resolution. Returns
-    (series (channels, detectors, points) float32, detectors tuple).
+    """striqt `channel_power_time_series` over the given IQ span.
+
+    Computes per-channel rms/peak power in dB at `detector_period`
+    resolution — the series that drives the AHAWI power strip.
+
+    Args:
+        samples: (channels, n) complex IQ samples.
+        cfg: `RadioConfig` supplying `sample_rate` and `analysis_bandwidth`.
+        detector_period: Detector sample period as an exact `Fraction` of
+            seconds (from `ahawi_power_plan`).
+        prefer_gpu: Offload the computation to cupy when available.
+
+    Returns:
+        Tuple of (series, detectors): series is (channels, detectors, points)
+        float32 dB; detectors is `("rms", "peak")`.
+
+    Raises:
+        RuntimeError: If the striqt analysis backend failed to import
+            (`_ANALYSIS_OK` is False).
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"channel power unavailable: {_ANALYSIS_ERR!r}")
@@ -825,23 +1236,33 @@ def channel_power_series(samples: np.ndarray, cfg: "RadioConfig",
 
 
 def ahawi_align_offset(blocks: np.ndarray, rows_per_seg: int, segments: int):
-    """
-    Burst-phase alignment: fold per-row power modulo the segment length and
-    find the periodic burst so it can sit at the same row in every segment.
+    """Burst-phase alignment for AHAWI: find the row offset that lines up a periodic burst.
 
-    The fold runs on RESIDUAL power — each bin's stationary level (median over
-    time) is subtracted first. Constant carriers (CW tones, an occupied
+    Folds per-row power modulo the segment length and locates the periodic
+    burst so it can be shifted to sit at the same row in every segment.
+
+    The fold runs on RESIDUAL power — each bin's stationary level (median
+    over time) is subtracted first. Constant carriers (CW tones, an occupied
     channel) otherwise raise every row's mean power and bury a genuine burst
     below any contrast gate: the demo's default tones left the old
     mean-over-bins metric at ~3.3 dB against a 3.0 dB gate, i.e. aligned by
     luck. In the residual domain only time-VARYING energy survives, so a real
     burst clears the gate by orders of magnitude and pure noise folds flat.
 
-    Returns (offset_rows, aligned, contrast_db). offset_rows ∈ [0, rows_per_seg)
-    is how many rows to trim from the capture's front; aligned=False (offset 0)
-    when the folded residual has no convincing periodic burst — alignment then
-    would just add caprice. contrast_db is always reported so an unaligned
-    verdict is diagnosable in the frame header instead of a mystery.
+    Args:
+        blocks: (channels, rows, bins) dB spectrogram; only the first
+            `rows_per_seg * segments` rows are used.
+        rows_per_seg: Rows per AHAWI segment.
+        segments: Number of segments in the capture.
+
+    Returns:
+        Tuple of (offset_rows, aligned, contrast_db). `offset_rows` is in
+        `[0, rows_per_seg)` and is how many rows to trim from the capture's
+        front. `aligned` is False (offset forced to 0) when there are too few
+        segments/rows to fold, or when the folded residual has no convincing
+        periodic burst — aligning then would just add caprice. `contrast_db`
+        is always reported (even when unaligned) so the verdict is
+        diagnosable from the frame header instead of a mystery.
     """
     if segments < 2 or rows_per_seg < 4:
         return 0, False, 0.0
@@ -877,20 +1298,29 @@ def ahawi_align_offset(blocks: np.ndarray, rows_per_seg: int, segments: int):
 
 
 def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
-    """
-    Analyze one coherent AHAWI capture the way striqt is meant to be used:
+    """Analyze one coherent AHAWI capture the way striqt is meant to be used.
 
-      1. full-span spectrogram (striqt calibrated when available),
-      2. burst alignment + trim to exactly segments·rows_per_seg rows,
-      3. the striqt measurement BUNDLE over the trimmed (displayed) span —
+    Three steps:
+
+      1. Full-span spectrogram (striqt calibrated when available).
+      2. Burst alignment + trim to exactly `segments * rows_per_seg` rows.
+      3. The striqt measurement BUNDLE over the trimmed (displayed) span —
          power_spectral_density statistics and channel_power_time_series —
          mirroring what the recorder computes per capture.
 
-    Returns (blocks, meta) in the normal compute_blocks contract, with
-    meta["ahawi"] carrying replay geometry, the bundle results, the list of
-    measurements that actually ran, and the compute backend (cupy/numpy).
-    Bundle failures never kill the capture — the measurement just drops off
-    the disclosed list (and logs why).
+    Args:
+        samples: (channels, n) complex IQ samples spanning the whole
+            coherent capture (`plan["need_samples"]` or more).
+        cfg: `RadioConfig` for the requested backend and its param block.
+        plan: Geometry dict from `ahawi_plan`.
+
+    Returns:
+        Tuple of (blocks, meta) in the normal `compute_blocks` contract, with
+        `meta["ahawi"]` additionally carrying replay geometry, the bundle
+        results, the list of measurements that actually ran, and the compute
+        backend (cupy/numpy). Bundle failures never kill the capture — a
+        failing measurement just drops off the disclosed `measurements` list
+        (and logs why) instead of raising.
     """
     started = time.perf_counter()
     total_rows = plan["total_rows"]
@@ -984,11 +1414,33 @@ def ahawi_capture(samples: np.ndarray, cfg: RadioConfig, plan: dict):
 
 
 def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False) -> dict:
-    """
-    Assemble the frame header from cfg + the per-frame backend meta. Ships the
-    TRUE frequency axis (freqs_hz_f0/freqs_hz_step) and the executed backend so
-    the client never has to guess it (LV-F1/F2). fft_nfft/bin_avg disclose the
-    real FFT size and bin-averaging behind the reported `nfft` bin count.
+    """Assemble the frame header from cfg plus the per-frame backend meta.
+
+    Ships the TRUE frequency axis (`freqs_hz_f0`/`freqs_hz_step`) and the
+    executed backend so the client never has to guess it (LV-F1/F2);
+    `fft_nfft`/`bin_avg` disclose the real FFT size and bin-averaging behind
+    the reported `nfft` bin count. This is the frame-header contract every
+    live frontend relies on — see `core.serialization` for how it's packed
+    onto the wire alongside `blocks`.
+
+    Args:
+        cfg: `RadioConfig` for the frame (center, sample_rate, gain, backend).
+        blocks: List of per-channel (rows, bins) arrays; only `blocks[0]`'s
+            shape is inspected (all channels share shape).
+        meta: Backend meta dict from `compute_blocks`/`ahawi_capture` (keys
+            like `backend`, `backend_requested`, `fft_nfft`, `bin_avg`,
+            `hop_size`, `freqs_hz_f0`/`freqs_hz_step`, `psd_stats`,
+            `time_span_ms`, `ahawi`).
+        demo: Whether this frame came from the demo (no-hardware) source;
+            when True, adds `header["demo"] = True`.
+
+    Returns:
+        Header dict with `center`, `fs`, `gain`, `nfft`, `rows`, `shape`,
+        `channels`, `device`, `backend`, `fft_nfft`, `bin_avg`,
+        `freqs_hz_f0`, `freqs_hz_step`, `hop_size`, `time`, plus the additive
+        keys `psd_stats`/`time_span_ms` (PSD backend), `ahawi` (AHAWI
+        capture), and `backend_requested` (only when it differs from the
+        executed backend).
     """
     first = np.asarray(blocks[0], dtype=np.float32)
     rows, bins = first.shape

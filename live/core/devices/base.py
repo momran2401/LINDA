@@ -1,19 +1,25 @@
-"""Device adapter contract.
+"""Device adapter contract shared by every radio family Linda can drive.
 
-One adapter per supported radio family. The contract gives every frontend the
-same handles for:
+`DeviceAdapter` is the base class that `core/devices/__init__.py` registers
+one subclass of per supported radio family (Deepwave AIR-T models, PlutoSDR,
+generic SoapySDR, demo). It gives every frontend the same handles regardless
+of which radio is actually attached:
 
-  - create_source()          open a striqt source for this device
-  - describe_capabilities()  identity, channels, envelope, readback support
-  - read_back(source, cfg)   query the LIVE driver for the actually-applied
+  - create_source()          Open a striqt source for this device.
+  - describe_capabilities()  Identity, channels, envelope, readback support.
+  - read_back(source, cfg)   Query the LIVE driver for the actually-applied
                              center/sample_rate/gain (None per field when the
-                             driver can't answer)
-  - verify(cfg, actuals)     compare requested vs read-back values with
-                             adapter-specific tolerances
+                             driver can't answer).
+  - hardware_expectations()  What striqt actually programmed into the driver,
+                             accounting for its own LO-shift/backend-rate
+                             tricks.
+  - verify(cfg, actuals)     Compare requested vs read-back values with
+                             adapter-specific tolerances.
 
-Readback is the heart of the verified-settings pipeline (operations.py): a
-config change is only reported as VERIFIED when the driver's own answer
-matches the request within tolerance.
+Readback is the heart of the verified-settings pipeline (`core/operations.py`):
+a config change is only reported as VERIFIED when the driver's own answer
+matches the request within tolerance, rather than trusting that a call which
+didn't raise actually took effect.
 """
 from __future__ import annotations
 
@@ -28,7 +34,10 @@ except Exception:
 
 
 class DeviceAdapter:
-    """Base adapter. Subclasses set `name` and override create_source()."""
+    """Base adapter contract. Subclasses set `name` and override
+    `create_source()`; most also inherit `read_back()`/`verify()` as-is and
+    only need to override tolerances or `supports_readback` when a family
+    behaves differently."""
 
     name = None                 # profile key in constants.DEVICE_PROFILES
     # Verification tolerances. Frequency tolerance is the max of the absolute
@@ -43,33 +52,55 @@ class DeviceAdapter:
     supports_readback = True
 
     def __init__(self, info=None):
-        # `info` is the SoapySDR enumeration dict when discovery picked this
-        # device (may carry serial/label); None for explicit selection.
+        """Construct the adapter.
+
+        Args:
+            info: The SoapySDR enumeration dict when discovery picked this
+                device (may carry `serial`/`label`/driver-probed facts like
+                `_num_channels`); None for an explicitly-selected profile with
+                no enumeration performed.
+        """
         self.info = dict(info) if info else {}
 
     # -- identity ----------------------------------------------------------
 
     @property
     def profile(self):
+        """dict: This adapter's entry in `constants.DEVICE_PROFILES`."""
         return DEVICE_PROFILES[self.name]
 
     @property
     def label(self):
+        """str: Human-readable device label, with serial suffix if known."""
         base = self.profile["label"]
         serial = self.info.get("serial")
         return f"{base} ({serial})" if serial else base
 
     def tx_channels(self):
-        """TX channel count learned at enumeration, or None if never probed.
+        """Return the TX channel count learned at enumeration, if any.
 
-        Only an early hint so the UI can hide transmit on a receive-only radio
-        before the source is even open; core.tx re-probes the live device for
-        the authoritative answer and the ranges that go with it.
+        This is only an early hint so the UI can hide the transmit control on
+        a receive-only radio before the source is even open; `core.tx`
+        re-probes the live device for the authoritative answer and the gain
+        ranges that go with it.
+
+        Returns:
+            int | None: The probed TX channel count, or None if this adapter
+            was never enumerated (`discover()`/`_probe_device_facts`) and so
+            never learned one.
         """
         n = self.info.get("_num_tx_channels")
         return int(n) if n is not None else None
 
     def describe_capabilities(self):
+        """Summarize this device's identity and capabilities for the frontend.
+
+        Returns:
+            dict: Static/near-static capability info — name, label, serial,
+            driver, active channels, TX channel count, sample-rate/frequency
+            envelope, whether the envelope is a live device query, whether
+            readback is supported, and the verification tolerances.
+        """
         prof = self.profile
         return {
             "name":              self.name,
@@ -92,16 +123,34 @@ class DeviceAdapter:
     # -- lifecycle ---------------------------------------------------------
 
     def create_source(self):
+        """Open and return a striqt source for this device.
+
+        Subclasses override this; the base implementation always raises.
+
+        Raises:
+            NotImplementedError: Always, in the base class.
+        """
         raise NotImplementedError
 
     # -- readback ----------------------------------------------------------
 
     def read_back(self, source, cfg):
-        """
-        Query the live driver for the actually-applied tuning. Returns
-        {"center": Hz|None, "sample_rate": Hz|None, "gain": [dB|None, ...]}
-        — None per field when the driver has no answer. Never raises: a
-        readback failure is data ("readback_unsupported"), not an error.
+        """Query the live driver for the actually-applied tuning.
+
+        Never raises: a readback failure is reported as data
+        ("readback_unsupported" per field), not an exception, since demo
+        devices and some drivers simply cannot answer.
+
+        Args:
+            source: The opened striqt source to query.
+            cfg: The current `RadioConfig`/`SharedConfig`, used to size the
+                per-channel gain list against `state.CHANNELS`.
+
+        Returns:
+            dict: {"center": Hz | None, "sample_rate": Hz | None,
+            "gain": [dB | None, ...]} — None per field (or per channel) when
+            this adapter doesn't support readback, `get_device()` yields no
+            SoapySDR device, or the individual getter call raises.
         """
         if not self.supports_readback:
             return {"center": None, "sample_rate": None,
@@ -132,15 +181,27 @@ class DeviceAdapter:
     # -- verification ------------------------------------------------------
 
     def hardware_expectations(self, source, capture, cfg):
-        """
-        The values striqt is expected to have PROGRAMMED into the driver —
-        which legitimately differ from the user-facing capture values: a
-        non-"none" lo_shift intentionally offsets the hardware LO, and
-        backend_sample_rate/host_resample run the SDR at a different rate
-        than the delivered capture rate. Comparing raw driver getters against
-        cfg would falsely fail both valid cases. Asks striqt's own resampler
-        design when discoverable; falls back to the declared backend rate.
-        Returns {"center": Hz, "sample_rate": Hz}.
+        """Compute the values striqt is expected to have PROGRAMMED into the
+        driver, which legitimately differ from the user-facing capture values.
+
+        A non-"none" `lo_shift` intentionally offsets the hardware LO, and
+        `backend_sample_rate`/host resampling can run the SDR at a different
+        rate than the delivered capture rate. Comparing raw driver readback
+        against `cfg` directly would falsely report both valid cases as a
+        mismatch, so this asks striqt's own resampler design when discoverable
+        (`source.get_resampler()` or `source.backend.get_resampler()`) and
+        falls back to the declared `cfg.backend_sample_rate` otherwise.
+
+        Args:
+            source: The opened striqt source.
+            capture: The capture spec passed to striqt's resampler-design
+                lookup.
+            cfg: The current `RadioConfig`/`SharedConfig` holding the
+                user-facing `center`/`sample_rate`/`backend_sample_rate`.
+
+        Returns:
+            dict: {"center": Hz, "sample_rate": Hz} — the values `verify()`
+            should compare driver readback against.
         """
         center = float(cfg.center)
         rate = float(cfg.sample_rate)
@@ -160,15 +221,27 @@ class DeviceAdapter:
         return {"center": center, "sample_rate": rate}
 
     def verify(self, cfg, actuals, expected=None):
-        """
-        Compare the requested cfg against driver readback. Returns a list of
-        per-field verdict dicts:
-          {"field", "requested", "actual", "state"}
-        where state ∈ {"verified", "mismatch", "readback_unsupported"}.
-        Gain is judged per channel against the striqt calibrated-gain
-        convention caveat: some drivers report a composite gain that differs
-        from the requested calibrated value by a fixed offset, so a gain
-        mismatch is a warning-grade signal, not proof of failure.
+        """Compare the requested cfg against driver readback, field by field.
+
+        Center frequency and sample rate are judged against `expected`
+        (from `hardware_expectations()`) when given, else against `cfg`
+        directly; gain is always judged per channel against `cfg.gain`. Some
+        drivers report a composite gain that differs from the requested
+        calibrated value by a fixed offset, so a gain mismatch is treated as a
+        warning-grade signal here, not proof of failure.
+
+        Args:
+            cfg: The current `RadioConfig`/`SharedConfig` holding the
+                requested `center`/`sample_rate`/`gain`.
+            actuals: The dict returned by `read_back()`.
+            expected: Optional dict from `hardware_expectations()`, giving the
+                center/sample_rate striqt was actually expected to program
+                (accounting for lo_shift/backend_sample_rate).
+
+        Returns:
+            list[dict]: One verdict per field/channel:
+            {"field": str, "requested": float | None, "actual": float | None,
+            "state": "verified" | "mismatch" | "readback_unsupported"}.
         """
         verdicts = []
         expected = dict(expected or {})
@@ -176,6 +249,7 @@ class DeviceAdapter:
         exp_rate = float(expected.get("sample_rate", cfg.sample_rate))
 
         def judge(field, requested, actual, tol):
+            """Build one verdict dict for a single field's readback."""
             if actual is None:
                 return {"field": field, "requested": requested,
                         "actual": None, "state": "readback_unsupported"}
