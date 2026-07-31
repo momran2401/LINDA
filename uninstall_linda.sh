@@ -172,6 +172,7 @@ printf '\033[1;36m╚═══════════════════�
 PORT=""
 RECORDINGS_DIR=""
 SERVICE_USER=""
+UHD_IMAGES_DIR=""
 if [[ -f "$UNIT_FILE" ]]; then
     d="$(awk -F= '/^WorkingDirectory=/{print $2; exit}' "$UNIT_FILE" 2>/dev/null || true)"
     [[ -n "$d" && -d "$d" ]] && REPO_ROOT="$d"
@@ -183,6 +184,10 @@ if [[ -f "$ENV_FILE" ]]; then
     # `set -e` would abort the uninstall before it removed anything.
     PORT="$(sed -n 's/^RADIO_PORT="\?\([0-9]*\)"\?.*/\1/p' "$ENV_FILE" | head -1 || true)"
     RECORDINGS_DIR="$(sed -n 's/^RADIO_RECORDINGS_DIR="\?\([^"]*\)"\?.*/\1/p' "$ENV_FILE" | head -1 || true)"
+    # UHD firmware/FPGA images the installer DOWNLOADED (install_uhd_images).
+    # dpkg does not own them, so purging uhd-host leaves ~100 MB behind — the
+    # env file is the only record of where they landed.
+    UHD_IMAGES_DIR="$(sed -n 's/^UHD_IMAGES_DIR="\?\([^"]*\)"\?.*/\1/p' "$ENV_FILE" | head -1 || true)"
 fi
 [[ -n "$SERVICE_USER" ]] || SERVICE_USER="${SUDO_USER:-root}"
 [[ -n "$RECORDINGS_DIR" ]] || RECORDINGS_DIR="$REPO_ROOT/recordings"
@@ -230,6 +235,8 @@ info "python env   $REPO_ROOT/.venv  (+ any .venv.backup.*)"
 info "kiosk        /etc/lightdm/lightdm.conf.d/50-radio-kiosk.conf"
 info "network      NetworkManager profiles radio-hotspot / radio-ethernet"
 info "kernel arg   usbcore.usbfs_memory_mb from cmdline.txt"
+info "pluto driver /usr/local/src/SoapyPlutoSDR + the files it installed"
+[[ -n "$UHD_IMAGES_DIR" ]] && info "uhd images   $UHD_IMAGES_DIR (downloaded by the installer)"
 [[ -n "$PORT" ]] && info "firewall     ufw rule for ${PORT}/tcp (if present)"
 if [[ ${#REMOVE_PKGS[@]} -gt 0 ]]; then
     if [[ $MANIFEST_FOUND -eq 1 ]]; then
@@ -406,6 +413,21 @@ safe_rm "${cmdline:-/nonexistent}.linda.bak"
 safe_rm "${cmdline:-/nonexistent}.nist-omran.bak"
 
 # ── 7. Locally built drivers ────────────────────────────────────────────────
+# UHD images the installer downloaded. Only a path the ENV FILE named is
+# touched, and only when it looks like a UHD images tree under a system share
+# — never a bare /usr/share. --keep-packages spares them, on the reasoning
+# that someone keeping the drivers wants the firmware those drivers need.
+if [[ $KEEP_PACKAGES -eq 0 && -n "$UHD_IMAGES_DIR" && -d "$UHD_IMAGES_DIR" ]]; then
+    case "$UHD_IMAGES_DIR" in
+        */uhd/images|*/uhd/*/images|*/images)
+            say "Removing downloaded UHD firmware/FPGA images"
+            safe_rm "$UHD_IMAGES_DIR"
+            ok "UHD images removed" ;;
+        *)
+            warn "leaving UHD_IMAGES_DIR=$UHD_IMAGES_DIR (not a recognised images tree)" ;;
+    esac
+fi
+
 PLUTO_SRC="/usr/local/src/SoapyPlutoSDR"
 if [[ -d "$PLUTO_SRC" ]]; then
     say "Removing the locally built SoapyPlutoSDR"

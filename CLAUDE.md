@@ -188,6 +188,15 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   unreachable / no device attached / no fix yet / stale. The reader starts with
   the server, not on first request. `RADIO_GPS=0` disables the integration;
   `RADIO_GPS_HOST`/`RADIO_GPS_PORT` relocate gpsd.
+- **GPS is OFF by default in `install_linda.sh`** (`WANT_GPS`, resolved from
+  `--gps`/`--no-gps`, then `RADIO_GPS`, then whether `RADIO_GPS_DEVICE` names a
+  port). The installer writes `RADIO_GPS=0` into `radio.env`, so `core/gps.py`
+  never opens a socket and recordings honestly store `gps_valid=0`. Off by
+  default because it is the only optional subsystem that costs apt work, a
+  serial probe that re-bauds every candidate tty, and a gpsd unit enabled for
+  hardware nobody attached. Opt in with `sudo bash install_linda.sh --gps`
+  (note `sudo env RADIO_GPS=1 …` for the variable form — plain `sudo VAR=…`
+  drops it).
 - `install_linda.sh install_gps()` provisions gpsd on a FRESH host: installs it, probes
   for a port actually emitting satellite data, binds it in `/etc/default/gpsd`
   so it survives reboot, and warns without failing setup when there is no
@@ -375,6 +384,28 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   summarized, never counted against the radio — a radio declining 122.88 MS/s
   is behaving correctly, not failing).
 
+## Re-running the installer (radio swaps)
+
+`install_linda.sh` is idempotent and derives the device FRESH every run — it
+never reads the previous `RADIO_DEVICE` back — so unplugging one radio, plugging
+another and re-running is the supported way to switch. Three things make that
+actually work, and each was a bug before:
+
+- `stop_existing_service` runs **before** `detect_radio`, not after. A radio
+  another process holds open does not appear in SoapySDR's enumeration *at
+  all*, and on a re-run the previously-installed service is still running.
+- `install_python` **skips the pip transaction** when its marker matches and
+  the venv still imports. That transaction is `pip install --upgrade` against
+  a git URL, so it hits the network every run and `die`s without one — which
+  made re-running impossible on the offline hotspot/ethernet boxes this
+  project exists to serve.
+- `install_pluto_driver` returns early when SoapySDR already lists `plutosdr`.
+  It otherwise wipes and re-clones from GitHub every single run.
+
+The udev rules are written for every supported vendor ID at once, so no rule
+change is needed on a swap. An unrecognised radio resolves to `demo` and the
+install still completes.
+
 ## Verified operations / Reset Radio
 
 - Config changes are only trusted after driver readback + a fresh frame; the
@@ -453,14 +484,23 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   block makes the page SCROLL, which makes `#dashboard` content-height — and
   a flex-basis of 0 in a content-height container resolves to nothing, so
   both graph rows collapsed (measured: 2px waterfall pane, 8px PSD row).
-  Phones therefore get explicit `min-height` cards, `grid-template-areas`
-  reordered to put graphs BEFORE the control rail, and no nested scroll
-  region. Card heights are budgeted so the WHOLE UI fits about two phone
-  screens (~1.9 at 375×812) — this is a demo surface meant to show a graph is
-  live, not to be measured off. Instrument-grade panes push it to three
-  screens and nothing is gained; anyone who wants a close look taps a pane
-  header for focus mode (78vh), which is the right way to read one graph on a
-  phone anyway. The block restates `grid-template-columns: 1fr` rather than
+  Phones therefore get real PIXEL heights (`.wf-wrap` 130px, `#psd-container`
+  152px — not a `vh` fraction, which just re-introduces a dependency on a
+  viewport that varies by 200px across phones), the two spectrograms SIDE BY
+  SIDE, `grid-template-areas` reordered to put graphs BEFORE the control rail,
+  the band monitor lifted under the graphs (`order: -1` in the flex rail), the
+  six inspector tabs as one static grid row (`.rail-strip` hidden — the rail
+  JS only toggles classes, so `.open` simply goes inert), DISPLAY as a
+  2-column control grid, and no nested scroll region. That budgets the WHOLE
+  UI to ~1.35 screens (measured 1137px at 390×844). It is a demo surface meant
+  to show a graph is live, not to be measured off; a close look is one tap on
+  a pane header (focus mode, 74vh).
+  Two things need JS, not CSS: `psdAxes()` drops the rotated y-axis LABEL
+  under 720px (it is longer than the 152px axis it sits on, so it renders
+  clipped at both ends, and its 54+14px gutter is 17% of the screen — the
+  units are still in the PSD key row), and the header's 22-field applied-config
+  block is clamped to one line with a chevron and made tap-to-expand, so it is
+  folded rather than dropped. The block restates `grid-template-columns: 1fr` rather than
   inheriting it, because it also matches a LANDSCAPE phone (812×375) where
   the older 720px block does not run — without it every area sat in the
   288px rail column. Matched on size only, never `pointer: coarse`: that
