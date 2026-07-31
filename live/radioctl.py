@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-radioctl — SSH-friendly client for the running radio-web backend.
+radioctl — SSH-friendly command-line client for a RUNNING radio-web backend.
 
-Talks HTTP to the same server the browser uses, so every change goes through
-the identical validated + hardware-verified pipeline (operation IDs, driver
-readback, fresh-frame confirmation).
+This is not part of the server; it is a standalone operator tool (stdlib
+`urllib` only) meant to be copied to, or run over SSH against, a Linda
+instance that is already up. It talks the identical HTTP surface the browser
+uses (`/health`, `/config`, `/operations`, `/gps`, `/tx/*`), so every change
+goes through the same validated + hardware-verified pipeline in
+`live/core/` (operation IDs, driver readback, fresh-frame confirmation) that
+the web UI does — there is no separate, weaker code path for the CLI.
 
 Examples:
     python3 live/radioctl.py status
@@ -35,7 +39,22 @@ WARN_STATES = {"unverified"}
 
 
 class Client:
+    """Minimal HTTP client for the radio-web backend's JSON API.
+
+    Built on the standard-library `urllib` only, so it runs anywhere Python 3
+    runs with no dependencies to install. Authentication is username-only:
+    the username selects the caller's role (admin/viewer/interns) via HTTP
+    Basic auth with an empty password field; there is no real password.
+    """
+
     def __init__(self, base, user=None):
+        """Args:
+            base: Base URL of the radio-web server, e.g.
+                "http://127.0.0.1:8000". A trailing slash is stripped.
+            user: Username selecting the caller's role. Omit (or leave None)
+                against a server running with RADIO_AUTH_DISABLE=1, which
+                accepts unauthenticated requests.
+        """
         self.base = base.rstrip("/")
         self.auth = None
         if user:
@@ -43,6 +62,14 @@ class Client:
             self.auth = "Basic " + base64.b64encode(raw).decode("ascii")
 
     def _headers(self, extra=None):
+        """Build request headers, adding Authorization when a user was set.
+
+        Args:
+            extra: Additional headers to merge in, e.g. Content-Type.
+
+        Returns:
+            dict: Headers ready to pass to `urllib.request.Request`.
+        """
         headers = dict(extra or {})
         if self.auth:
             headers["Authorization"] = self.auth
@@ -50,11 +77,25 @@ class Client:
 
     @staticmethod
     def _decode(response):
-        """Parse a JSON response body — and name the ACTUAL problem when the
-        body is not JSON. An unauthenticated GET is 303-redirected to the
-        /login page, urllib follows it, and json.load then fails with
-        "Expecting value: line 1 column 1" — which reads as a dead server when
-        the real story is a missing username."""
+        """Parse a JSON response body, naming the ACTUAL problem when it isn't JSON.
+
+        An unauthenticated GET is 303-redirected to the /login page, urllib
+        follows it, and json.load then fails with "Expecting value: line 1
+        column 1" — which reads as a dead server when the real story is a
+        missing username. This checks for that specific case (HTML body)
+        before falling back to a generic "not JSON" error.
+
+        Args:
+            response: An open urllib response object.
+
+        Returns:
+            The parsed JSON value.
+
+        Raises:
+            RuntimeError: If the body is not valid JSON — with a message
+                distinguishing "you need --user" from "this isn't a
+                radio-web server at all".
+        """
         body = response.read()
         try:
             return json.loads(body)
@@ -70,11 +111,28 @@ class Client:
                 "server?")
 
     def get(self, path):
+        """Issue an authenticated GET and return the decoded JSON body.
+
+        Args:
+            path: Server path beginning with "/", e.g. "/health".
+
+        Returns:
+            The parsed JSON response.
+        """
         req = urllib.request.Request(self.base + path, headers=self._headers())
         with urllib.request.urlopen(req, timeout=6) as response:
             return self._decode(response)
 
     def post(self, path, payload):
+        """Issue an authenticated POST with a JSON body and return the decoded JSON reply.
+
+        Args:
+            path: Server path beginning with "/", e.g. "/config".
+            payload: JSON-serializable request body.
+
+        Returns:
+            The parsed JSON response.
+        """
         req = urllib.request.Request(
             self.base + path, data=json.dumps(payload).encode("utf-8"),
             headers=self._headers({"Content-Type": "application/json"}),
@@ -85,6 +143,18 @@ class Client:
 
 
 def print_status(client):
+    """Print a one-shot snapshot of device, health, capture, and analysis state.
+
+    Backs the `status` subcommand and is polled by `watch` (which clears the
+    screen and calls this repeatedly). Reads `/health` and `/config` and
+    prints device identity + channel count, service/radio health and ring
+    fill, last-frame age, capture settings (center/rate/gain/nfft), the
+    analysis backend, any active source override, and the most recent
+    operation's outcome.
+
+    Args:
+        client: Connected Client instance.
+    """
     health = client.get("/health")
     config = client.get("/config")
     cap = config["capture"]
@@ -111,7 +181,20 @@ def print_status(client):
 
 
 def wait_operation(client, op_id, timeout=30.0):
-    """Poll /operations until op_id reaches a terminal state; return the op."""
+    """Poll /operations until the given operation leaves the "running" state.
+
+    Args:
+        client: Connected Client instance.
+        op_id: Operation id, as returned in a prior POST /config ack.
+        timeout: Seconds to wait before giving up.
+
+    Returns:
+        dict: The operation record once its state is no longer "running".
+
+    Raises:
+        RuntimeError: If the operation is still running when the timeout
+            elapses.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         for op in client.get("/operations")["operations"]:
@@ -123,8 +206,18 @@ def wait_operation(client, op_id, timeout=30.0):
 
 
 def stream_logs(client, interval=1.0):
-    """Incrementally print operation stages as they happen."""
-    seen = {}   # op_id -> stages printed
+    """Tail the operations log, printing only stages not yet shown.
+
+    Polls /operations forever (the `logs` subcommand loop; stop with
+    Ctrl-C). Tracks how many stages of each operation have already been
+    printed so repeated polls only emit new stages, giving a live tail
+    without a websocket connection.
+
+    Args:
+        client: Connected Client instance.
+        interval: Seconds to sleep between polls.
+    """
+    seen = {}   # op_id -> count of stages already printed
     while True:
         for op in client.get("/operations")["operations"]:
             start = seen.get(op["id"], 0)
@@ -137,6 +230,26 @@ def stream_logs(client, interval=1.0):
 
 
 def apply_and_wait(client, name, payload, timeout=30.0):
+    """POST a config change, wait for its operation to finish, and print PASS/WARN/FAIL.
+
+    Used both by the interactive `set` subcommand and by `self_test`'s
+    per-setting exercises.
+
+    Args:
+        client: Connected Client instance.
+        name: Human-readable label for this change, used only in the
+            printed TEST/PASS/WARN/FAIL lines.
+        payload: Request body for POST /config.
+        timeout: Seconds to wait for the operation to reach a terminal state.
+
+    Returns:
+        str: The operation's terminal verdict (e.g. "success", "verified",
+        "unverified"), or "success" when the value produced no net change.
+
+    Raises:
+        RuntimeError: If the server rejects the payload, or the operation
+            finishes in a state outside PASS_STATES/WARN_STATES (FAIL).
+    """
     print("TEST {:22} {}".format(name, json.dumps(payload, sort_keys=True)))
     result = client.post("/config", payload)
     ack = result.get("ack", {})
@@ -157,11 +270,25 @@ def apply_and_wait(client, name, payload, timeout=30.0):
 
 
 def self_test(client, timeout=30.0):
-    """
-    Exercise every portable live control through the verified pipeline, then
-    restore the starting recipe. Source/clock settings are deliberately
-    excluded — there is no universally safe alternate value without knowing
-    what is physically cabled; they still verify when changed explicitly.
+    """Exercise every portable live control through the server's verified pipeline, then restore it.
+
+    Reads the current /config, builds an alternate value for each portable
+    setting (center frequency, sample rate, gain, FFT size, frame rows,
+    LO-null toggle, and analysis backend if not already quicklook), applies
+    each in turn via `apply_and_wait`, and finally restores the original
+    capture/rows/backend/lo_null values regardless of whether any case
+    failed. Source/clock settings are deliberately excluded — there is no
+    universally safe alternate value without knowing what is physically
+    cabled to this radio; they still verify individually when changed
+    explicitly via `set`.
+
+    Args:
+        client: Connected Client instance.
+        timeout: Seconds to wait for each individual operation.
+
+    Returns:
+        int: 0 if every case (and the restore) passed or warned; 1 if any
+        case failed, with failures printed to stderr.
     """
     config = client.get("/config")
     cap, env = config["capture"], config["envelope"]
@@ -228,10 +355,20 @@ def self_test(client, timeout=30.0):
 
 
 def print_gps(client):
-    """Show the fix recordings will stamp on every capture.
+    """Print the GPS fix that a recording started now would stamp on every capture.
 
-    Exit status is the useful part for scripts: 0 only when a recording
-    started now would carry real coordinates.
+    Backs the `gps` subcommand. Reports one of a real fix, GPS disabled
+    (RADIO_GPS=0), or one of several no-fix reasons (gpsd unreachable, no
+    receiver, no fix yet, stale fix) — recordings still proceed without a
+    fix, they just record gps_valid=0 and NaN coordinates, never 0.0/0.0.
+
+    Args:
+        client: Connected Client instance.
+
+    Returns:
+        int: 0 only when a recording started now would carry a real fix
+        (a usable exit code for scripts); 1 for "no fix"/"disabled"; 2 if
+        the /gps request itself failed.
     """
     try:
         gps = client.get("/gps")["gps"]
@@ -273,11 +410,21 @@ def print_gps(client):
 
 
 def print_tx(client):
-    """Show whether this radio is transmitting, and what it can transmit.
+    """Print whether this radio is transmitting, and what it is capable of transmitting.
 
-    Exit 0 only when a carrier is actually up, so a script can gate on it —
-    and so `radioctl tx status` is a usable "is the PA keyed?" check from a
-    terminal with no browser anywhere near it.
+    Backs the `tx status` subcommand. Reports availability and capabilities
+    (channel count, frequency/gain envelope) from `/tx`, then — if a
+    transmission is active — the waveform, carrier frequency/gain/rate,
+    channel, elapsed/remaining time, samples written, and underflow count.
+
+    Args:
+        client: Connected Client instance.
+
+    Returns:
+        int: 0 only when a carrier is actually up, so a script can gate on
+        it (and so `radioctl tx status` works as an "is the PA keyed?"
+        check with no browser involved); 1 if unavailable or idle; 2 if
+        the /tx request itself failed.
     """
     try:
         status = client.get("/tx")["tx"]
@@ -316,6 +463,24 @@ def print_tx(client):
 
 
 def tx_start(client, args):
+    """Build a TX start payload from CLI args, acknowledge the legal notice, and start transmitting.
+
+    Backs the `tx start` subcommand. Refuses locally (without contacting the
+    server) unless `--i-have-a-license` was passed, since the point of the
+    gate is to stop an accidental transmission rather than merely log
+    consent after the fact — the server enforces the same gate independently
+    via `POST /tx/acknowledge` before `/tx/start` (428 otherwise).
+
+    Args:
+        client: Connected Client instance.
+        args: Parsed argparse namespace for the `tx start` subcommand
+            (waveform, freq_mhz, offset_khz, channel, gain, amplitude,
+            seconds, i_have_a_license).
+
+    Returns:
+        int: 0 once the server confirms the transmission started; 2 if
+        `--i-have-a-license` was not passed.
+    """
     payload = {
         "waveform": args.waveform,
         "frequency_hz": args.freq_mhz * 1e6,
@@ -350,6 +515,16 @@ def tx_start(client, args):
 
 
 def main():
+    """Parse CLI arguments and dispatch to the requested subcommand.
+
+    Defines the `status`, `watch`, `logs`, `self-test`, `gps`, `tx`
+    (status/start/stop), and `set` subcommands and routes to their
+    respective handlers.
+
+    Returns:
+        int: Process exit code — 0 on success; each subcommand defines its
+        own non-zero cases (see the individual handler docstrings).
+    """
     parser = argparse.ArgumentParser(
         description="control/inspect the running radio-web backend")
     parser.add_argument("--url", default="http://127.0.0.1:8000")

@@ -1,8 +1,14 @@
-"""Shared constants and device profile data.
+"""Shared constants and device profile data for every LINDA core module.
 
-Pure data — no imports from other core modules, so anything can import this
-without cycles. DEVICE_PROFILES is consumed by core.devices (which wraps each
-profile in an adapter) and by SharedConfig (capability envelopes).
+Pure data — no imports from other core modules, so anything in `core/` can
+import this without creating a cycle. Holds the per-device capability tables
+(`DEVICE_PROFILES`), the sample-rate/FFT-size grids that incoming control
+values are snapped to (`RATES_HZ`, `NFFT_CHOICES`, `ALIGNED_NFFTS`), ring
+buffer sizing (`MAX_TAIL`, `READ_SIZE`), and the default acquisition/analysis
+parameters (AHAWI timing, demo tone/burst plans, striqt spectrogram recipe
+defaults). `DEVICE_PROFILES` is consumed by `core.devices` (which wraps each
+profile in an adapter) and by `SharedConfig` (tier-1 clamp/capability
+envelopes).
 """
 from __future__ import annotations
 

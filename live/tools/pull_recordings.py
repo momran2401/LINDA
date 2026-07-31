@@ -60,7 +60,22 @@ class _NoAuthRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class RadioClient:
+    """Thin stdlib-only HTTP client for the radio-web `/recordings` API.
+
+    Mirrors radioctl.py's auth model (username-only Basic auth, no
+    password) but additionally installs `_NoAuthRedirect` so a missing or
+    wrong username surfaces as an explicit auth error instead of silently
+    downloading the HTML login page as if it were a recording.
+    """
+
     def __init__(self, base, user=None, timeout=30.0):
+        """Args:
+            base: Base URL of the radio-web server, e.g.
+                "http://127.0.0.1:8000" or a `run_web.sh --tunnel` URL.
+            user: Username selecting the caller's role. Omit against a
+                server running with RADIO_AUTH_DISABLE=1.
+            timeout: Per-request timeout in seconds.
+        """
         self.base = base.rstrip("/")
         self.timeout = timeout
         self.auth = None
@@ -70,11 +85,31 @@ class RadioClient:
         self._opener = urllib.request.build_opener(_NoAuthRedirect)
 
     def _open(self, path):
+        """Open an authenticated GET request against the server.
+
+        Args:
+            path: Server path beginning with "/".
+
+        Returns:
+            The open response object (a context manager).
+        """
         headers = {"Authorization": self.auth} if self.auth else {}
         request = urllib.request.Request(self.base + path, headers=headers)
         return self._opener.open(request, timeout=self.timeout)
 
     def catalog(self):
+        """Fetch the server's list of recordings (complete and in-progress).
+
+        Returns:
+            list[dict]: Each entry has at least "id", "state"
+            ("complete"/"partial"), and "bytes".
+
+        Raises:
+            RuntimeError: If the response body isn't the expected JSON
+            shape (e.g. because auth failed and this is the login page,
+            though `_NoAuthRedirect` normally turns that into an HTTPError
+            first).
+        """
         with self._open("/recordings") as response:
             payload = response.read()
         try:
@@ -85,14 +120,32 @@ class RadioClient:
                 "server?".format(self.base))
 
     def open_download(self, recording_id):
-        # Each path segment is quoted separately: ids look like
-        # "air8201b/20260728T101500Z.zarr.zip" and the slash is structural.
+        """Open a streaming download of one recording's archive.
+
+        Args:
+            recording_id: Catalog id, e.g.
+                "air8201b/20260728T101500Z.zarr.zip". Each path segment is
+                quoted separately since the slash is structural, not part
+                of a single segment to escape.
+
+        Returns:
+            The open response object (a context manager) to stream-copy
+            from.
+        """
         quoted = "/".join(urllib.parse.quote(part, safe="")
                           for part in str(recording_id).split("/"))
         return self._open("/recordings/{}/download".format(quoted))
 
 
 def human_bytes(count):
+    """Format a byte count as a human-readable string (e.g. "12.3 MiB").
+
+    Args:
+        count: Byte count; None is treated as 0.
+
+    Returns:
+        str: Value scaled to B/KiB/MiB/GiB with one decimal place.
+    """
     value = float(count or 0)
     for unit in ("B", "KiB", "MiB", "GiB"):
         if value < 1024 or unit == "GiB":
@@ -101,12 +154,21 @@ def human_bytes(count):
 
 
 def already_have(destination, expected_bytes):
-    """True when a previous run finished this exact recording.
+    """Check whether a previous run already finished downloading this exact recording.
 
-    Size is the whole check: recordings are immutable once complete (the server
-    writes to a .partial name and renames on success), so a local file of the
-    right size is the right file. A short file is a torn download and gets
-    replaced.
+    Size is the whole check: recordings are immutable once complete (the
+    server writes to a `.partial` name and renames on success), so a local
+    file of the right size is the right file. A short file is a torn
+    download and gets replaced.
+
+    Args:
+        destination: Local path the recording would be saved at.
+        expected_bytes: Size reported by the server's catalog, or None if
+            unknown (in which case mere existence is treated as complete).
+
+    Returns:
+        bool: True if `destination` exists and (when known) matches
+        `expected_bytes`.
     """
     if not destination.is_file():
         return False
@@ -116,7 +178,16 @@ def already_have(destination, expected_bytes):
 
 
 def verify_archive(path):
-    """CRC-check a downloaded archive; returns None when it is intact."""
+    """CRC-check a downloaded zip archive for corruption.
+
+    Args:
+        path: Path to the local .zarr.zip file.
+
+    Returns:
+        str or None: None when the archive is intact; otherwise a
+        human-readable description of the problem (bad CRC member, or the
+        underlying OSError/BadZipFile message).
+    """
     try:
         with zipfile.ZipFile(path) as archive:
             bad = archive.testzip()
@@ -126,7 +197,25 @@ def verify_archive(path):
 
 
 def download_one(client, item, dest_root, verify=True, quiet=False):
-    """Fetch one recording. Returns "downloaded" | "skipped" | "failed"."""
+    """Fetch a single recording into `dest_root`, skipping it if already present.
+
+    Downloads to a `.part` sibling file and only renames it into place once
+    the transfer is complete and (optionally) CRC-verified, so an
+    interrupted transfer can never be mistaken for a finished recording by
+    a later run.
+
+    Args:
+        client: Connected RadioClient instance.
+        item: One catalog entry from `RadioClient.catalog()` (needs "id"
+            and, optionally, "bytes").
+        dest_root: Local directory to mirror recordings into.
+        verify: Whether to CRC-check the archive after downloading.
+        quiet: Suppress the per-file progress line.
+
+    Returns:
+        str: "downloaded", "skipped" (already had a complete copy), or
+        "failed" (network error, size mismatch, or failed CRC check).
+    """
     recording_id = item["id"]
     destination = dest_root / recording_id
     expected = item.get("bytes")
@@ -170,10 +259,23 @@ def download_one(client, item, dest_root, verify=True, quiet=False):
 
 
 def fetch_complete(client, dest_root, verify=True, quiet=False):
-    """One pass over the catalog. Returns (downloaded, skipped, failed)."""
+    """Run one pass over the server's catalog, downloading every complete recording not already local.
+
+    A recording still being written is listed with state "partial"; it
+    becomes "complete" only after the server has validated and renamed it,
+    so partials are skipped here rather than downloaded mid-write.
+
+    Args:
+        client: Connected RadioClient instance.
+        dest_root: Local directory to mirror recordings into.
+        verify: Whether to CRC-check each downloaded archive.
+        quiet: Suppress per-file progress lines.
+
+    Returns:
+        tuple[int, int, int]: (downloaded, skipped, failed) counts for
+        this pass.
+    """
     catalog = client.catalog()
-    # A recording still being written is listed as "partial"; it becomes
-    # "complete" only after the server has validated and renamed it.
     ready = [item for item in catalog if item.get("state") == "complete"]
 
     counts = {"downloaded": 0, "skipped": 0, "failed": 0}
@@ -183,6 +285,13 @@ def fetch_complete(client, dest_root, verify=True, quiet=False):
 
 
 def print_catalog(client):
+    """Print every recording on the radio (any state) with size and state.
+
+    Backs the `--list` flag.
+
+    Args:
+        client: Connected RadioClient instance.
+    """
     catalog = client.catalog()
     if not catalog:
         print("No recordings on the radio.")
@@ -198,6 +307,20 @@ NEEDS_AUTH_HINT = ("pass --user with a username the radio knows "
 
 
 def describe_connection_error(exc, url):
+    """Turn a raw urllib/RuntimeError exception into an actionable message.
+
+    Distinguishes auth failures (401/403, or a redirect to /login) from a
+    plain 404 or an unreachable host, so a user sees "pass --user" rather
+    than a bare HTTP status code.
+
+    Args:
+        exc: The caught exception (HTTPError, URLError, OSError, or
+            RuntimeError).
+        url: The URL that was being contacted, for the error message.
+
+    Returns:
+        str: Human-readable description of the failure.
+    """
     if isinstance(exc, urllib.error.HTTPError):
         if exc.code in (401, 403):
             return "{} {} — {}".format(exc.code, exc.reason, NEEDS_AUTH_HINT)
@@ -215,6 +338,19 @@ def describe_connection_error(exc, url):
 
 
 def main():
+    """Parse CLI arguments and run one pass or a continuous watch loop over the radio's recordings.
+
+    Contacts the server first (catalog or list) before touching the local
+    filesystem, so a bad --url or missing --user fails cleanly instead of
+    creating an empty --dest directory. In one-shot mode, downloads every
+    complete recording not already present and exits; in --watch mode, polls
+    forever (Ctrl-C to stop), tolerating transient connection errors after
+    the first successful contact.
+
+    Returns:
+        int: 0 on success; 1 if any download failed in one-shot mode; 2 if
+        the initial contact with the server failed.
+    """
     parser = argparse.ArgumentParser(
         description="Copy finished recordings off the radio onto this machine.")
     parser.add_argument("--url", default=os.environ.get("RADIO_PULL_URL", DEFAULT_URL),

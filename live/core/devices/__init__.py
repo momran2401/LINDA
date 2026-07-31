@@ -1,11 +1,20 @@
-"""Device adapters, discovery, and selection.
+"""Device discovery and the adapter registry for every radio Linda can drive.
+
+This is the top of the `core/devices/` adapter layer described in the repo's
+architecture notes: it maps a `--device` selector (or live SoapySDR
+enumeration) to one `DeviceAdapter` subclass (see `base.py`) per supported
+radio family, and hands frontends a single `make_source()` entry point that
+hides which family is actually plugged in. Deepwave AIR-T models are the
+primary target; PlutoSDR and generic SoapySDR devices are supported via
+`sources.py`; `demo` provides a hardware-free adapter for the synthetic
+pipeline.
 
 Public surface:
-  discover()               enumerate SoapySDR, return recognized radios
+  discover()               Enumerate SoapySDR, return recognized radios.
   resolve_device(selector) "auto" | profile name | "driver=...[,serial=...]"
-                           → (profile_name, adapter). Configures nothing.
-  get_adapter()/set_adapter()  the active adapter for this process
-  make_source()            open a striqt source via the active adapter
+                           -> (profile_name, adapter). Configures nothing.
+  get_adapter()/set_adapter()  The active adapter for this process.
+  make_source()            Open a striqt source via the active adapter.
 """
 from __future__ import annotations
 
@@ -27,9 +36,20 @@ DEEPWAVE_MODELS = ("air7101b", "air7201b", "air8201b")
 
 
 def identify_deepwave(info):
-    """Resolve a SoapyAIRT enumeration row to a known Deepwave model by
-    scanning every value for a model string (AIR8201B / AIR-7201B / AIR 7101B
-    …). Historical deployments identify only as SoapyAIRT → AIR8201B."""
+    """Resolve a SoapyAIRT enumeration row to a specific Deepwave model.
+
+    Scans every value in the enumeration dict for a model string (AIR8201B /
+    AIR-7201B / AIR 7101B / ...), ignoring punctuation and case. Historical
+    deployments identify only as generic "SoapyAIRT" with no model string
+    anywhere in the row, so those fall back to AIR8201B.
+
+    Args:
+        info: SoapySDR enumeration dict (or mapping-like) for one device row.
+
+    Returns:
+        str: One of `DEEPWAVE_MODELS`, defaulting to "air8201b" when no model
+        string is found.
+    """
     text = " ".join(str(v) for v in dict(info or {}).values()).lower()
     compact = "".join(ch for ch in text if ch.isalnum())
     for model in DEEPWAVE_MODELS:
@@ -43,26 +63,51 @@ class DeepwaveAdapter(DeviceAdapter):
     name = "air8201b"
 
     def create_source(self, source_config=None):
+        """Open a striqt Airstack1 source for this Deepwave model.
+
+        Args:
+            source_config: Optional source-spec field overrides (e.g. from a
+                verified reconnect). Passed through to `make_source_spec()`.
+
+        Returns:
+            An opened `Airstack1Source` instance.
+        """
         return Airstack1Source.from_spec(
             make_source_spec(self.name, source_config))
 
 
 class Air8201BAdapter(DeepwaveAdapter):
+    """Deepwave AIR8201B adapter."""
     name = "air8201b"
 
 
 class Air7101BAdapter(DeepwaveAdapter):
+    """Deepwave AIR-7101B adapter."""
     name = "air7101b"
 
 
 class Air7201BAdapter(DeepwaveAdapter):
+    """Deepwave AIR-7201B adapter."""
     name = "air7201b"
 
 
 class PlutoAdapter(DeviceAdapter):
+    """Analog Devices PlutoSDR adapter (SoapySDR "plutosdr" driver)."""
     name = "pluto"
 
     def create_source(self, source_config=None):
+        """Open a striqt source for a PlutoSDR.
+
+        Args:
+            source_config: Optional source-spec field overrides.
+
+        Returns:
+            An opened `PlutoSource` instance.
+
+        Raises:
+            RuntimeError: If striqt's SoapySource base is unavailable, so no
+                Pluto-capable source class exists to construct.
+        """
         if PlutoSource is None:
             raise RuntimeError("striqt SoapySource unavailable — cannot drive a PlutoSDR")
         # from_spec() connects AND configures in one step on the installed
@@ -71,9 +116,26 @@ class PlutoAdapter(DeviceAdapter):
 
 
 class GenericSoapyAdapter(DeviceAdapter):
+    """Best-effort adapter for any other SoapySDR-enumerable radio."""
     name = "soapy"
 
     def create_source(self, source_config=None):
+        """Open a striqt source for a generic (non-Deepwave, non-Pluto) radio.
+
+        Args:
+            source_config: Optional source-spec field overrides; an explicit
+                `master_clock_rate` here wins over the enumeration-probed
+                value below.
+
+        Returns:
+            An opened source instance from a `driver`-bound
+            `GenericSoapySource` subclass.
+
+        Raises:
+            RuntimeError: If striqt's SoapySource base is unavailable, or if
+                this adapter was built without a driver string (i.e. not via
+                `--device auto` enumeration).
+        """
         if GenericSoapySource is None:
             raise RuntimeError("striqt SoapySource unavailable — cannot drive a SoapySDR device")
         driver = self.info.get("driver")
@@ -91,10 +153,22 @@ class GenericSoapyAdapter(DeviceAdapter):
 
 
 class DemoAdapter(DeviceAdapter):
+    """Hardware-free adapter backing the synthetic `--demo` pipeline.
+
+    Never opens a real source; `DemoAcquirer` (in `core/acquisition.py`)
+    synthesizes IQ instead. `supports_readback = False` so capability
+    reporting and verification honestly show "readback_unsupported" rather
+    than faking driver agreement.
+    """
     name = "demo"
     supports_readback = False
 
     def create_source(self, source_config=None):
+        """Always raise: the demo device has no real striqt source to open.
+
+        Raises:
+            RuntimeError: Always.
+        """
         raise RuntimeError("demo device has no hardware source")
 
 
@@ -111,13 +185,26 @@ _active_adapter = None
 
 
 def set_adapter(adapter: DeviceAdapter):
+    """Install `adapter` as the active adapter for this process.
+
+    Args:
+        adapter: The `DeviceAdapter` instance to make active.
+    """
     global _active_adapter
     _active_adapter = adapter
 
 
 def get_adapter() -> DeviceAdapter:
-    """The active adapter; lazily built from state.DEVICE when the frontend
-    skipped explicit resolution (keeps old call sites working)."""
+    """Return the active adapter, building it lazily if needed.
+
+    If no adapter was explicitly set via `set_adapter()`, or the cached one no
+    longer matches `state.DEVICE`, a fresh instance of the registered class is
+    built from `state.DEVICE`. This keeps older call sites that never called
+    `resolve_device()`/`set_adapter()` explicitly working.
+
+    Returns:
+        DeviceAdapter: The current process-wide active adapter.
+    """
     global _active_adapter
     if _active_adapter is None or _active_adapter.name != state.DEVICE:
         _active_adapter = ADAPTER_CLASSES[state.DEVICE]()
@@ -125,16 +212,36 @@ def get_adapter() -> DeviceAdapter:
 
 
 def make_source(source_config=None):
+    """Open a striqt source via the currently active adapter.
+
+    Args:
+        source_config: Optional source-spec field overrides, forwarded to the
+            adapter's `create_source()`.
+
+    Returns:
+        The opened striqt source instance.
+    """
     return get_adapter().create_source(source_config)
 
 
 def probe_channels(profile_name, adapter=None):
-    """
-    Best-effort RX channel discovery for a real device selected WITHOUT going
-    through enumeration (e.g. --device air8201b). Briefly enumerates, matches
-    the profile's driver family (and Deepwave model, when identifiable), and
-    asks the one matching device for getNumChannels. Returns a port tuple or
-    None (profile channels stay in force).
+    """Best-effort RX channel discovery for an explicitly-selected device.
+
+    Used when a real device was selected WITHOUT going through enumeration
+    (e.g. `--device air8201b` rather than `--device auto`). Briefly
+    enumerates, matches the profile's driver family (and Deepwave model, when
+    identifiable), and asks the one matching device for `getNumChannels`.
+
+    Args:
+        profile_name: The resolved profile name (e.g. "air8201b", "pluto").
+        adapter: The adapter instance for this profile, if already resolved;
+            if it already carries a probed `_num_channels`, enumeration is
+            skipped entirely.
+
+    Returns:
+        tuple[int, ...] | None: The discovered RX port indices, or None if
+        discovery was inconclusive (the profile's default channels stay in
+        force).
     """
     if profile_name in ("demo",):
         return None
@@ -166,12 +273,23 @@ def probe_channels(profile_name, adapter=None):
 # ---------------------------------------------------------------------------
 
 def discover():
-    """
-    Enumerate SoapySDR devices. Returns a list of dicts:
-      {"device": profile_name, "driver": str, "label": str, "serial": str|None,
-       "info": {...}, "num_channels": int|None}
-    Unrecognized drivers map to the generic "soapy" profile. Raises RuntimeError
-    when SoapySDR itself is unavailable.
+    """Enumerate every SoapySDR-visible device and classify it into a profile.
+
+    SoapyAIRT rows are refined to a specific Deepwave model via
+    `identify_deepwave()`; any other recognized driver maps through
+    `DRIVER_TO_DEVICE`; anything else falls back to the generic "soapy"
+    profile. Each matching device is also briefly opened (`_probe_device_facts`)
+    to learn its real RX/TX channel counts and master clock rate.
+
+    Returns:
+        list[dict]: One dict per enumerated device:
+            {"device": profile_name, "driver": str, "label": str,
+             "serial": str | None, "info": dict, "num_channels": int | None,
+             "num_tx_channels": int | None, "master_clock_rate": float | None}.
+
+    Raises:
+        RuntimeError: If the SoapySDR module cannot be imported, or if
+            `SoapySDR.Device.enumerate()` itself fails.
     """
     try:
         import SoapySDR
@@ -209,11 +327,19 @@ def discover():
 
 
 def _probe_master_clock(dev):
-    """Largest master clock rate the driver admits to, or None.
+    """Find the largest master clock rate an open SoapySDR device admits to.
 
-    getMasterClockRates() may yield floats or SoapySDR Range objects depending
-    on the driver, so both shapes are accepted. Falls back to whatever rate the
-    device has already selected for itself, which is always legal.
+    `getMasterClockRates()` may yield plain floats or SoapySDR Range objects
+    depending on the driver, so both shapes are accepted. Falls back to
+    whatever rate the device has already selected for itself, which is always
+    legal for that device.
+
+    Args:
+        dev: An already-opened `SoapySDR.Device` instance.
+
+    Returns:
+        float | None: The largest admissible master clock rate in Hz, or None
+        if the driver offers nothing usable.
     """
     best = None
     try:
@@ -237,16 +363,31 @@ def _probe_master_clock(dev):
 
 
 def _probe_device_facts(SoapySDR, info):
-    """Briefly open the device to ask what it actually is.
+    """Briefly open one enumerated device to ask what it actually is.
 
-    Returns {"num_channels": int|None, "master_clock_rate": float|None}. Every
-    field is best-effort: a busy device or a driver quirk yields None and the
+    Opens and immediately closes (`SoapySDR.Device.unmake`) the device to read
+    its real RX/TX channel counts and its master clock rate, before any
+    profile-based defaults are trusted. Every field is best-effort: a busy
+    device or a driver quirk yields None for that field and the caller's
     profile defaults stay in force.
 
     The master clock matters because striqt applies it verbatim
-    (sources/soapy.py: setMasterClockRate) and LINDA used to hand every radio
-    the AIR-T's 125 MHz, which a USRP B2xx rejects outright. Asking the driver
-    is the only answer that generalises past the radios we have profiles for.
+    (`sources/soapy.py`: `setMasterClockRate`), and LINDA used to hand every
+    radio the AIR-T's 125 MHz (`MASTER_CLOCK_RATE`), which a USRP B2xx rejects
+    outright and refuses to open at all. Asking the driver here is the only
+    answer that generalizes past the radios Linda has dedicated profiles for.
+    The TX channel count is probed here too so the UI can decide, before any
+    source is even opened, whether to offer transmit at all — an RTL-SDR must
+    never be shown a TX button that only fails once clicked.
+
+    Args:
+        SoapySDR: The imported SoapySDR module (passed in so callers only
+            import it once).
+        info: The SoapySDR enumeration dict for this device.
+
+    Returns:
+        dict: {"num_channels": int | None, "num_tx_channels": int | None,
+        "master_clock_rate": float | None}.
     """
     facts = {"num_channels": None, "num_tx_channels": None,
              "master_clock_rate": None}
@@ -265,10 +406,6 @@ def _probe_device_facts(SoapySDR, info):
             facts["num_channels"] = int(dev.getNumChannels(rx_dir))
         except Exception:
             pass
-        # TX channel count decides whether transmit mode exists at all for this
-        # radio. Asked here, at enumeration, so the answer is known before the
-        # source is open — an RTL-SDR must never be offered a TX button that
-        # only fails once it is clicked.
         try:
             facts["num_tx_channels"] = int(dev.getNumChannels(tx_dir))
         except Exception:
@@ -286,7 +423,16 @@ def _probe_device_facts(SoapySDR, info):
 
 
 def _parse_selector(selector: str):
-    """Parse "driver=plutosdr,serial=104473..." into a dict, else None."""
+    """Parse a "key=value[,key=value...]" selector string into a dict.
+
+    Args:
+        selector: e.g. "driver=plutosdr,serial=104473...".
+
+    Returns:
+        dict[str, str] | None: The parsed key/value pairs, or None if
+        `selector` contains no "=" (i.e. it isn't this kind of selector) or no
+        valid pair was found.
+    """
     if "=" not in selector:
         return None
     out = {}
@@ -298,15 +444,33 @@ def _parse_selector(selector: str):
 
 
 def resolve_device(selector: str):
-    """
-    Resolve a --device selector to (profile_name, adapter).
+    """Resolve a `--device` selector to a `(profile_name, adapter)` pair.
 
-      "air8201b" | "pluto" | "demo" | "soapy"   explicit profile
-      "auto"                                    enumerate; exactly one radio
-      "driver=X[,serial=Y]"                     match one enumerated radio
+    Accepted forms:
+      "air8201b" | "air7201b" | "air7101b" | "pluto" | "soapy" | "demo"
+          Explicit profile — no enumeration needed.
+      "auto"
+          Enumerate; succeeds only if exactly one radio is found.
+      "driver=X[,serial=Y]"
+          Enumerate and match against exactly one radio.
 
-    Exits with a clear device list when auto/selector matching is ambiguous,
-    mirroring the old _resolve_auto_device behaviour.
+    Configures nothing on the device itself — this only decides which
+    adapter class governs it and seeds any enumeration-probed facts
+    (`_num_channels`, `_num_tx_channels`, `_master_clock_rate`) onto it.
+
+    Args:
+        selector: The raw `--device` value.
+
+    Returns:
+        tuple[str, DeviceAdapter]: The resolved profile name and a
+        constructed adapter instance for it.
+
+    Raises:
+        SystemExit: Via `sys.exit(1)`, after printing a diagnostic to stderr,
+            when SoapySDR is unavailable, or when enumeration matches zero or
+            more than one radio (mirroring the old `_resolve_auto_device`
+            behavior of failing loudly with a device list rather than
+            guessing).
     """
     selector = str(selector).strip()
     if selector in ADAPTER_CLASSES:

@@ -24,6 +24,12 @@ UI uses (SharedConfig.update), then requires:
 
 Exit code 0 only when no test point FAILED or MISMATCHED. "unverified" points
 are warnings (driver can't answer), not failures.
+
+Unlike radioctl.py (which drives a server over HTTP), this tool imports
+`live/core/` directly and drives `SharedConfig`/`Acquirer`/`Computer` in
+the same process, so it needs exclusive ownership of the radio — it cannot
+run alongside radio-web on hardware (e.g. an AIR-T) that only lets one
+process hold its FPGA descriptors at a time.
 """
 
 import argparse
@@ -44,6 +50,16 @@ from core.striqt_compat import _SENSOR_OK                      # noqa: E402
 
 
 def wait_for(predicate, timeout, poll=0.1):
+    """Poll a zero-arg predicate until it returns a truthy value or the timeout elapses.
+
+    Args:
+        predicate: Zero-argument callable, polled repeatedly.
+        timeout: Seconds to keep polling before giving up.
+        poll: Seconds to sleep between polls.
+
+    Returns:
+        The first truthy value returned by `predicate`, or None on timeout.
+    """
     t0 = time.time()
     while time.time() - t0 < timeout:
         v = predicate()
@@ -54,7 +70,27 @@ def wait_for(predicate, timeout, poll=0.1):
 
 
 def run_point(shared, acquirer, field, value, header_key, timeout):
-    """Apply one setting; return (state, detail)."""
+    """Apply one setting through SharedConfig.update and confirm it end-to-end.
+
+    Applies the change, waits for its operation to leave "running", then
+    waits for a fresh frame whose header field `header_key` echoes the
+    applied value — proving the setting didn't just validate but actually
+    reached the data path.
+
+    Args:
+        shared: The SharedConfig instance driving this radio.
+        acquirer: The Acquirer (or DemoAcquirer) supplying frames.
+        field: SharedConfig field name to change (e.g. "center", "gain").
+        value: New value for that field.
+        header_key: Frame-header key expected to echo `value` once applied.
+        timeout: Seconds to wait for the operation and for the echoing frame.
+
+    Returns:
+        tuple[str, str]: (state, detail) — state is the operation's
+        terminal state ("success"/"verified"/"unverified"/"mismatch"/
+        "failed"), or "failed" if it never reached one; detail is a
+        human-readable explanation.
+    """
     ack = shared.update({field: value})
     if ack["rejected"]:
         return "failed", f"rejected: {ack['rejected']}"
@@ -81,15 +117,32 @@ def run_point(shared, acquirer, field, value, header_key, timeout):
 
 
 def qualify_tx(acquirer, shared, args, is_demo):
-    """Closed-loop TX qualification: transmit, then look for it on RX.
+    """Closed-loop TX qualification: transmit, then look for the carrier on RX.
 
-    This is the only test in this file that RADIATES, which is why it is opt-in
-    and why it refuses to pick a frequency for you. What it proves, in order:
-    the driver accepts the tuning and reads it back; the writer thread actually
-    streams; and — the part no readback can tell you — the carrier shows up in
-    the receiver at the offset it was commanded to, through an antenna or a
-    loopback cable. A radio that reports a perfect readback while emitting
-    nothing passes every other check in this file and fails this one.
+    This is the only test in this file that RADIATES, which is why it is
+    opt-in (`--tx`) and why it refuses to pick a frequency for the caller.
+    What it proves, in order: the driver accepts the tuning and reads it
+    back; the writer thread actually streams at close to full duty cycle;
+    and — the part no readback alone can tell you — the carrier shows up in
+    the receiver at the commanded offset, through an antenna or a loopback
+    cable. A radio that reports a perfect readback while emitting nothing
+    passes every other check in this file and fails only this one.
+
+    Args:
+        acquirer: The live Acquirer (or DemoAcquirer) to bind the TX
+            controller to and to read the closed-loop RX frame from.
+        shared: The SharedConfig instance, used to retune the receiver onto
+            the TX frequency before checking for it.
+        args: Parsed CLI namespace; uses `tx_freq_mhz`, `tx_seconds`, and
+            `timeout`.
+        is_demo: True when running against the synthetic demo source rather
+            than real hardware.
+
+    Returns:
+        list[tuple[str, str, str]]: (label, verdict, detail) rows — verdicts
+        are one of "success"/"verified"/"unverified"/"mismatch"/"failed" —
+        covering transmit path availability, transmit readback, streaming
+        duty cycle, whether the carrier was seen on RX, and clean shutdown.
     """
     from core import tx as txmod          # local: TX is optional at import time
 
@@ -229,6 +282,19 @@ def qualify_tx(acquirer, shared, args, is_demo):
 
 
 def main():
+    """Run the full on-radio qualification sweep and report a pass/fail summary.
+
+    Resolves and opens the requested device, waits for a first frame, then
+    walks through center-frequency, sample-rate, and gain test points (plus
+    an optional TX closed-loop point) via `run_point`/`qualify_tx`, restores
+    the defaults, confirms streaming survives the whole sequence, and prints
+    a summary table.
+
+    Exit codes: 0 if every point verified; 1 if any point mismatched or
+    failed; 2 if every point applied but real hardware left some points
+    unverified (no readback support) — demo mode never returns 2, since it
+    has no readback by design.
+    """
     parser = argparse.ArgumentParser(description="on-radio settings qualification")
     parser.add_argument("--device", default="air8201b")
     parser.add_argument("--demo", action="store_true",

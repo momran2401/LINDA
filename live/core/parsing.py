@@ -1,8 +1,35 @@
 """Freedom-model input parsing and tier-2 scratch validators.
 
-Structure-only parsers (they never judge legality) plus the striqt scratch
-validators that judge a proposed config by running the real analysis pipeline
-on a tiny synthetic buffer. Extracted verbatim from striqt_web_server.py.
+Part of the shared `live/core/` package: this module backs the "freedom
+model" that lets DAN mode accept arbitrary analysis-panel input without a
+built-in guardrail. It supplies two kinds of helpers that `core.config`'s
+`SharedConfig._validate_analysis` composes into its three-tier legality
+check:
+
+  * Structure-only parsers (`_parse_window`, `_parse_fraction`,
+    `_parse_optional_hz`, `_parse_time_statistic`, `_parse_optional_seconds`)
+    that normalize wire values into the shapes striqt expects. They never
+    judge legality — only whether the input has the right shape — so tier 1
+    (knowable clamp/snap rules) and tier 2 can each apply their own rules to
+    a well-formed value.
+  * Tier-2 "scratch" validators (`scratch_validate_spectrogram`,
+    `scratch_validate_psd`, `scratch_validate_ssb`, and the dispatcher
+    `scratch_validate_analysis`) that judge a proposed `RadioConfig` the only
+    way that is always right: by handing it to the real striqt analysis
+    functions against a tiny synthetic buffer, never the live ring or
+    acquirer.
+
+`ANALYSIS_TARGETS` is the freedom-model's per-analysis registry (which wire
+fields map to which `RadioConfig` attributes, and the tier-2 application
+order); `ANALYSIS_CFG_KEYS` and `ANALYSIS_DEFAULTS` are derived from it.
+Extracted verbatim from striqt_web_server.py during the 2026-07 refactor.
+
+Note: this module drives striqt's `analysis_specs`/`striqt_shared`/
+`striqt_measurements` entry points via `core.striqt_compat`. Per the repo's
+top-level CLAUDE.md, the vendored `striqt/` tree in this repo is a later
+snapshot than what actually runs on the radio (pinned v0.7.0, commit
+2e7696d) — the behavior documented here is the observed behavior of the
+pinned build, not necessarily the vendored source.
 """
 from __future__ import annotations
 
@@ -142,9 +169,25 @@ ANALYSIS_DEFAULTS = {
 
 
 def _parse_window(value):
-    """Normalize a window spec to what scipy get_window accepts: a name string
-    or a (name, float parameter) tuple. Accepts "kaiser, 11.88" shorthand and
-    the JSON list form ["kaiser", 11.88]. Raises ValueError on bad structure."""
+    """Normalize a window spec to what scipy's ``get_window`` accepts.
+
+    Accepts a bare name string, the "name, param" shorthand (e.g.
+    "kaiser, 11.88"), or the JSON list form ``["kaiser", 11.88]``. This is
+    structure-only normalization — it does not check that the window name
+    itself is valid; that is left to striqt (tier 2).
+
+    Args:
+        value: A window name string, a "name,param" string, or a 2-element
+            (name, param) list/tuple.
+
+    Returns:
+        Either a plain name string, or a ``(name, float)`` tuple for
+        parametrized windows.
+
+    Raises:
+        ValueError: If `value` is empty, or does not match one of the
+            accepted structures, or a supplied parameter is not a number.
+    """
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -166,7 +209,19 @@ def _parse_window(value):
 
 
 def _parse_fraction(value) -> Fraction:
-    """Parse "13/28", a float, or an int into a Fraction. Raises ValueError."""
+    """Parse a fractional-overlap style value into an exact `Fraction`.
+
+    Args:
+        value: A ratio string (e.g. "13/28"), a decimal string/float (e.g.
+            0.464), or an int.
+
+    Returns:
+        The parsed value as a `fractions.Fraction`.
+
+    Raises:
+        ValueError: If `value` cannot be parsed as a fraction (including a
+            "n/0" style division by zero).
+    """
     if isinstance(value, str):
         value = value.strip()
     try:
@@ -176,8 +231,24 @@ def _parse_fraction(value) -> Fraction:
 
 
 def _parse_optional_hz(value, *, auto_ok: bool = False):
-    """Parse a nullable Hz field: None/""/"none"/"off"/0 → None; "auto" → "auto"
-    (when allowed); otherwise a float Hz value. Raises ValueError."""
+    """Parse a nullable frequency/bandwidth field expressed in Hz.
+
+    Args:
+        value: The raw wire value. `None`, `""`, `"none"`, `"null"`, `"off"`,
+            or the number `0` are all treated as "not set". The string
+            `"auto"` is accepted only when `auto_ok` is True. Anything else
+            must be convertible to `float`.
+        auto_ok: Whether the literal string "auto" is a valid result for
+            this field (e.g. lo_bandstop's "auto" mode).
+
+    Returns:
+        `None` if the value means "not set", the string `"auto"` if that was
+        given and allowed, otherwise a `float` Hz value.
+
+    Raises:
+        ValueError: If `value` is not one of the accepted null/auto tokens
+            and cannot be converted to `float`.
+    """
     if value is None:
         return None
     if isinstance(value, str):
@@ -198,11 +269,27 @@ def _parse_optional_hz(value, *, auto_ok: bool = False):
 
 
 def _parse_time_statistic(value):
-    """Parse the PSD time_statistic surface: a list (or comma string) of named
-    statistics ('mean', 'max', …) and/or quantiles in [0, 1], e.g.
-    "mean, 0.5, 0.95, max". Returns a de-duplicated tuple of str/float.
-    Structure and quantile range are judged here (knowable); unknown statistic
-    NAMES are left for striqt itself to judge in tier 2. Raises ValueError."""
+    """Parse the PSD `time_statistic` surface into a validated tuple.
+
+    Accepts a comma-separated string or a list/tuple of named statistics
+    (e.g. "mean", "max") and/or quantiles in [0, 1], e.g.
+    "mean, 0.5, 0.95, max". Structure and quantile *range* are judged here
+    (they are knowable without striqt); unknown statistic *names* are left
+    for striqt itself to reject in tier 2.
+
+    Args:
+        value: A comma-separated string, or a list/tuple whose entries are
+            each a statistic-name string or a numeric quantile.
+
+    Returns:
+        A de-duplicated tuple of `str` (statistic names, lowercased) and/or
+        `float` (quantiles), preserving first-seen order.
+
+    Raises:
+        ValueError: If `value` has the wrong container type, an entry is
+            neither a string nor a number, a quantile falls outside
+            [0, 1], or the result would be empty.
+    """
     if isinstance(value, str):
         tokens = [t.strip() for t in value.split(",")]
     elif isinstance(value, (list, tuple)):
@@ -240,8 +327,21 @@ def _parse_time_statistic(value):
 
 
 def _parse_optional_seconds(value):
-    """Parse a nullable seconds field: None/""/"none"/"off"/0 → None; otherwise
-    a positive, finite float in seconds. Raises ValueError."""
+    """Parse a nullable duration field expressed in seconds (e.g. time_aperture).
+
+    Args:
+        value: The raw wire value. `None`, `""`, `"none"`, `"null"`, `"off"`,
+            or the number `0` are all treated as "not set". Anything else
+            must be convertible to a positive, finite `float`.
+
+    Returns:
+        `None` if the value means "not set", otherwise a positive, finite
+        `float` number of seconds.
+
+    Raises:
+        ValueError: If `value` cannot be converted to `float`, or converts
+            to a non-positive or non-finite number.
+    """
     if value is None:
         return None
     if isinstance(value, str):
@@ -261,13 +361,22 @@ def _parse_optional_seconds(value):
 
 
 def scratch_validate_spectrogram(cfg: "RadioConfig"):
-    """
-    Tier 2 of the freedom model: judge a proposed analysis config the only way
-    that is always right — by asking striqt. Builds the exact Spectrogram spec
-    the live Computer would run and evaluates it on a tiny synthetic buffer
-    (2 STFT rows of zeros, single channel) WITHOUT touching the live ring or
-    acquirer. Returns the striqt error text when the config is illegal, or None
-    when it is safe to swap into the live stream.
+    """Tier-2 judge for the "spectrogram" analysis target.
+
+    Judges a proposed analysis config the only way that is always right — by
+    asking striqt. Builds the exact Spectrogram spec the live Computer would
+    run and evaluates it on a tiny synthetic buffer (zeros, single channel,
+    enough rows for one averaged output row if `cfg.time_aperture` is set)
+    WITHOUT touching the live ring or acquirer.
+
+    Args:
+        cfg: The candidate `RadioConfig`, already past tier-1 clamp/snap.
+
+    Returns:
+        `None` if striqt is unavailable (nothing to judge) or the config
+        evaluated cleanly (safe to swap into the live stream); otherwise the
+        striqt error text (or exception type name if the error has no
+        message) describing why the config is illegal.
     """
     if not _ANALYSIS_OK:
         return None   # nothing to judge without striqt (quicklook-only install)
@@ -300,12 +409,19 @@ def scratch_validate_spectrogram(cfg: "RadioConfig"):
 
 
 def scratch_validate_psd(cfg: "RadioConfig"):
-    """
-    Tier-2 judge for the PSD target (P2b-3): run striqt's real
-    power_spectral_density on a tiny synthetic buffer (2 STFT rows, single
-    channel) with the exact kwargs the live compute would use. Returns the
-    striqt error text on an illegal config (e.g. an unknown statistic name),
-    or None when it is safe to go live.
+    """Tier-2 judge for the "psd" analysis target (power_spectral_density).
+
+    Runs striqt's real `power_spectral_density` on a tiny synthetic buffer
+    (2 STFT rows, single channel, zeros) with the exact kwargs the live
+    compute would use, WITHOUT touching the live ring or acquirer.
+
+    Args:
+        cfg: The candidate `RadioConfig`, already past tier-1 clamp/snap.
+
+    Returns:
+        `None` if striqt is unavailable or the config evaluated cleanly
+        (safe to go live); otherwise the striqt error text (e.g. for an
+        unknown statistic name) describing why the config is illegal.
     """
     if not _ANALYSIS_OK:
         return None
@@ -332,13 +448,24 @@ def scratch_validate_psd(cfg: "RadioConfig"):
 
 
 def scratch_validate_ssb(cfg: "RadioConfig"):
-    """
-    Tier-2 judge for the SSB target (P2b-5): run striqt's real
-    cellular_5g_ssb_spectrogram on a one-burst-set synthetic buffer with the
-    exact kwargs the live compute would use. cfg.sample_rate must already be
-    on the SSB grid for cfg's subcarrier spacing (the tier-1 branch retunes
-    the effective rate before probing). Returns the striqt error text when a
-    param combination is illegal, or None when it is safe to go live.
+    """Tier-2 judge for the "ssb" analysis target (cellular_5g_ssb_spectrogram).
+
+    Runs striqt's real `cellular_5g_ssb_spectrogram` on a one-burst-set
+    synthetic buffer (zeros) with the exact kwargs the live compute would
+    use, WITHOUT touching the live ring or acquirer. Requires
+    `cfg.sample_rate` to already be on the SSB grid for `cfg`'s subcarrier
+    spacing — the tier-1 branch retunes the effective rate before this is
+    called.
+
+    Args:
+        cfg: The candidate `RadioConfig`, already past tier-1 clamp/snap
+            (including the SSB-grid rate retune).
+
+    Returns:
+        `None` if striqt is unavailable or the config evaluated cleanly
+        (safe to go live); otherwise the striqt error text describing why
+        the config is illegal (including an off-grid rejection from
+        `ssb_geometry`).
     """
     if not _ANALYSIS_OK:
         return None
@@ -374,6 +501,23 @@ SCRATCH_VALIDATORS = {
 
 
 def scratch_validate_analysis(cfg: "RadioConfig", target: str = "spectrogram"):
+    """Dispatch to the tier-2 scratch validator for the given analysis target.
+
+    This is the single entry point `SharedConfig._validate_analysis` calls
+    for tier 2 of the freedom model; it looks up the target's validator in
+    `SCRATCH_VALIDATORS` and delegates to it.
+
+    Args:
+        cfg: The candidate `RadioConfig`, already past tier-1 clamp/snap.
+        target: One of the keys in `ANALYSIS_TARGETS`/`SCRATCH_VALIDATORS`
+            (e.g. "spectrogram", "psd", "ssb"). Defaults to "spectrogram"
+            for the unchanged P2a wire format.
+
+    Returns:
+        `None` if `target` is unknown or the underlying validator found the
+        config legal (or striqt is unavailable); otherwise the striqt error
+        text explaining why the config is illegal.
+    """
     fn = SCRATCH_VALIDATORS.get(target)
     return fn(cfg) if fn else None
 

@@ -1,9 +1,23 @@
-"""striqt import compatibility layer.
+"""striqt import compatibility layer — the single gateway `live/core` uses to reach striqt.
 
-Runs the pixi libstdc++ re-exec guard BEFORE any striqt/scipy import, then
-imports the striqt sensor + analysis stacks defensively. Every other core
-module gets its striqt symbols (and the _SENSOR_OK/_ANALYSIS_OK flags) from
-here, so a missing hardware stack degrades exactly one way, everywhere.
+`core/__init__.py` imports this module first, guaranteeing all three of its
+effects happen before any other core module touches striqt or scipy:
+
+1. On the AIR-T's pixi environment, re-execs the current process once with a
+   newer libstdc++ on ``LD_LIBRARY_PATH`` (:func:`_ensure_pixi_runtime_libs`),
+   before scipy's/striqt's compiled waveform extensions are ever imported.
+2. Imports the striqt sensor and analysis stacks defensively. Every other core
+   module gets its striqt symbols, plus the ``_SENSOR_OK``/``_ANALYSIS_OK``
+   flags, from here — so a missing hardware or analysis dependency degrades
+   exactly one way (these two flags), everywhere, instead of raising at
+   arbitrary import sites.
+3. Applies two runtime monkeypatches that fix bugs in the striqt v0.7.0 build
+   actually installed on the radio (pinned commit ``2e7696d`` — NOT the same
+   API as the `striqt/` tree vendored in this repo). Both patches only affect
+   non-Deepwave SoapySDR radios and are no-ops against a striqt build that has
+   already fixed the underlying issue upstream: see
+   :func:`_patch_soapy_arginfo_subscript` and
+   :func:`_patch_soapy_hardware_time_optional`.
 """
 from __future__ import annotations
 
@@ -12,9 +26,20 @@ import sys
 from pathlib import Path
 
 def _ensure_pixi_runtime_libs():
-    """
-    The AIR-T pixi env ships a newer libstdc++ needed by scipy/striqt waveform
-    extensions. Re-exec once with that lib dir in LD_LIBRARY_PATH when needed.
+    """Re-exec the process once with the pixi env's libstdc++ on LD_LIBRARY_PATH.
+
+    The AIR-T pixi env ships a newer libstdc++ than the one the dynamic linker
+    would otherwise find, and scipy's/striqt's compiled waveform extensions
+    need it. If the required lib is present and not already on
+    ``LD_LIBRARY_PATH``, this adds it and calls ``os.execv`` to restart the
+    current process with the same argv, exactly once (guarded by the
+    ``RADIO_WEB_LD_REEXEC`` env var so the re-exec doesn't loop). No-ops on
+    non-POSIX platforms, under pytest, or when the lib dir/file isn't found.
+
+    Returns:
+        None. Either returns normally (nothing needed changing, or this is a
+        no-op environment) or never returns because the process was replaced
+        via ``os.execv``.
     """
     if os.name != "posix":
         return
@@ -122,6 +147,11 @@ def _patch_soapy_arginfo_subscript():
     item instead of spinning.
 
     Remove this once the installed striqt drops the stray index.
+
+    Returns:
+        None. No-ops silently if SoapySDR is unavailable, ``ArgInfo`` already
+        supports subscripting (already patched, or a fixed striqt), or the
+        attribute assignment itself fails.
     """
     try:
         import SoapySDR
@@ -131,6 +161,7 @@ def _patch_soapy_arginfo_subscript():
     if arg_info is None or hasattr(arg_info, '__getitem__'):
         return
     def _getitem(self, index):
+        """Return ``self`` for index 0/-1; raise IndexError otherwise (see enclosing docstring)."""
         if index in (0, -1):
             return self
         raise IndexError(index)
@@ -173,6 +204,11 @@ def _patch_soapy_hardware_time_optional():
     Only the 'host'/'internal' path is relaxed. 'external'/'gps' still raise:
     quietly skipping a PPS discipline the operator asked for would be a lie
     about the timing of the data, which is worse than refusing to run.
+
+    Returns:
+        None. No-ops if ``striqt.sensor`` isn't importable, the patch was
+        already applied (``_linda_optional_hw_time`` flag), or
+        ``HardwareTimeSync.to_host_os`` doesn't exist to patch.
     """
     try:
         from striqt.sensor.lib.sources.soapy import HardwareTimeSync
@@ -185,6 +221,7 @@ def _patch_soapy_hardware_time_optional():
         return
 
     def to_host_os(self, device):
+        """Return None instead of raising when `device` has no hardware clock (see enclosing docstring)."""
         try:
             has_time = device.hasHardwareTime()
         except Exception:

@@ -1,8 +1,30 @@
-"""RadioConfig + SharedConfig: the thread-safe control brain.
+"""The data/validation layer underneath Linda's verified-config pipeline.
 
-Extracted verbatim from striqt_web_server.py; device-dependent globals are
-read through core.state at call time so main() can configure them once at
-startup.
+This module owns the two objects that every control message passes through
+before it can touch the radio:
+
+- :class:`RadioConfig` — the flat, serializable snapshot of every knob the
+  live capture and analysis pipelines read (radio tuning, capture geometry,
+  striqt spectrogram/PSD/SSB analysis params, AHAWI capture settings, and the
+  applied source-spec overrides used by the verified-reconnect path).
+- :class:`SharedConfig` — the thread-safe holder of the live
+  ``RadioConfig``, plus the three-tier validation pipeline a config update
+  runs through: tier 1 (knowable clamp/snap rules — round the value and say
+  so), tier 2 (an off-line striqt scratch probe on the compute thread, since
+  only striqt can judge some parameter combinations), and tier 3 (a runtime
+  backstop that reverts analysis params if a config that passed tiers 1–2
+  still throws when it actually computes a frame). ``update()`` returns an
+  ack dict (``applied``/``ignored``/``reconnect``/``rounded``/``rejected`` +
+  ``op_id``); ``take_dirty()`` hands the Acquirer a snapshot plus enough
+  metadata (``op_id``, ``reconnect``, ``changed_fields``) to apply it to
+  hardware and drive the verified-operations log in ``core/operations.py``.
+
+Device-dependent globals (the active profile, spec backend, etc.) are read
+through ``core.state`` at call time, not imported as constants, so
+``main()`` can configure the device once at startup and every consumer here
+sees the live values.
+
+Extracted verbatim from the original single-file ``striqt_web_server.py``.
 """
 from __future__ import annotations
 
@@ -41,6 +63,36 @@ from .operations import OPERATIONS, fmt_value
 
 @dataclass
 class RadioConfig:
+    """Flat, serializable snapshot of every configurable knob in Linda.
+
+    Covers radio tuning (``center``/``sample_rate``/``gain``), live capture
+    geometry (``nfft``/``rows``/``backend``/``duration``), the capture knobs
+    surfaced by the schema editor (``analysis_bandwidth``/``lo_shift``/
+    ``host_resample``/``backend_sample_rate``), applied source-spec overrides
+    (``source_config``, used by the verified-reconnect path), the three
+    striqt analysis blocks (spectrogram, PSD, SSB — each an independent set
+    of fields so tuning one view never disturbs another), and the AHAWI
+    coherent-capture settings.
+
+    Two ownership rules that matter more than any single field:
+
+    - ``duration`` vs ``rows``: when ``duration > 0`` it OWNS ``rows``, which
+      are re-derived hop-aware (``duration * sample_rate / row_hop``) on
+      every change to nfft/backend/overlap/sample_rate. ``duration == 0`` is
+      the legacy rows-driven mode; an explicit top-level ``{"rows": N}``
+      control reclaims ownership by zeroing ``duration`` (see
+      :meth:`SharedConfig.update`).
+    - ``source_config``: only reachable through :meth:`SharedConfig.update`'s
+      ``source`` block. It is merged over the adapter's default source spec
+      at device open; an explicit JSON ``null`` for a key clears that
+      override back to the adapter default.
+
+    All non-scalar fields (``window``, ``fractional_overlap`` as a
+    ``Fraction``, etc.) hold immutable values, so :meth:`snapshot` can copy
+    them by reference; only values that have already passed the freedom
+    model in :meth:`SharedConfig.update` may be written here.
+    """
+
     center:      float = DEFAULT_CENTER
     sample_rate: float = DEFAULT_SAMPLE_RATE
     gain:        float = DEFAULT_GAIN
@@ -119,6 +171,17 @@ class RadioConfig:
     ahawi_align:      bool  = True
 
     def snapshot(self):
+        """Return an independent deep-enough copy of this config.
+
+        Every field is coerced to its declared type (``float``/``int``/
+        ``bool``/``str``) or copied (``dict``/``tuple``) so the returned
+        instance shares no mutable state with ``self`` — safe to hand to a
+        compute/hardware thread while the original keeps being edited under
+        ``SharedConfig._lock``.
+
+        Returns:
+            A new ``RadioConfig`` with the same field values.
+        """
         return RadioConfig(
             center=float(self.center),
             sample_rate=float(self.sample_rate),
@@ -161,7 +224,51 @@ class RadioConfig:
 
 
 class SharedConfig:
+    """Thread-safe holder of the live :class:`RadioConfig` and its validation pipeline.
+
+    One instance is shared between the WS/HTTP control handlers (writers,
+    via :meth:`update`) and the acquisition/compute threads (readers, via
+    :meth:`snapshot` and consumers, via :meth:`take_dirty`). All mutable
+    state is guarded by ``self._lock``; the tier-2 scratch-probe handoff
+    (``_probe_*``) uses a second, dedicated lock/event pair because that
+    validation must run specifically on the compute thread (see
+    :meth:`probe_analysis`).
+
+    Attributes:
+        _cfg: The live ``RadioConfig``, seeded from the active device
+            profile's defaults.
+        _envelope: Tier-1 clamp bounds (rate/freq/gain min-max). Starts as
+            the profile fallback; the Acquirer merges the live device's
+            queried ranges over it after open (see :meth:`set_envelope`).
+        _dirty: Set when a config write changes at least one field;
+            cleared by :meth:`take_dirty`, which the Acquirer polls to
+            know a re-arm is due.
+        _last_good_analysis: The analysis-block field values from the last
+            config that demonstrably computed a frame — the tier-3 revert
+            target (see :meth:`revert_analysis`).
+        _notices: Queued human-readable strings for viewers (rounding /
+            revert / restore explanations), drained by :meth:`drain_notices`.
+        _probe_lock, _probe_req, _probe_res, _probe_seq, _probe_done:
+            Single-slot mailbox used to run tier-2 striqt scratch validation
+            on the compute thread, which owns striqt's persistent
+            ``get_window`` cache handle (see :meth:`probe_analysis` and
+            :meth:`service_probe`).
+        _pending_op: The op id awaiting hardware apply + readback, handed to
+            the Acquirer by :meth:`take_dirty`.
+        _reconnect: Set when a source-spec change requires closing and
+            reopening the device rather than a live re-arm.
+        _changed_fields: Exact field names changed by the last write, so the
+            hardware thread can skip re-arming for compute/display-only
+            changes.
+    """
+
     def __init__(self):
+        """Seed a new config from the active device profile's defaults.
+
+        Reads ``state.DEVICE``/``state.SPEC_BACKEND`` at construction time
+        (not import time), so the caller must have already run
+        ``state.configure_device()`` before creating a ``SharedConfig``.
+        """
         self._lock  = threading.Lock()
         # Seed the radio knobs from the active device profile (P3-1). For
         # air8201b/demo the profile defaults equal the DEFAULT_* constants,
@@ -205,14 +312,31 @@ class SharedConfig:
         self._changed_fields = set()
 
     def snapshot(self):
+        """Return a thread-safe, independent copy of the live config.
+
+        Returns:
+            A ``RadioConfig`` (see :meth:`RadioConfig.snapshot`) safe to read
+            or mutate without affecting the live config or racing a writer.
+        """
         with self._lock:
             return self._cfg.snapshot()
 
     # --- Capability envelope (P3-3) -------------------------------------------
 
     def set_envelope(self, env: dict):
-        """Merge queried device bounds over the profile fallback. Partial
-        dicts are fine — unanswered keys keep their fallback values."""
+        """Merge queried device bounds over the profile fallback.
+
+        Called by the Acquirer once a device with ``query_envelope`` opens,
+        so tier-1 clamps in :meth:`update` judge requests against the real
+        hardware's rate/frequency/gain ranges instead of the static profile
+        default.
+
+        Args:
+            env: Partial mapping of envelope keys (e.g. ``rate_min``,
+                ``freq_max``, ``gain_min``) to queried bounds. Unknown keys
+                and ``None`` values are dropped; missing keys keep their
+                existing (profile-fallback) value.
+        """
         clean = {}
         for key, value in (env or {}).items():
             if key not in self._envelope or value is None:
@@ -228,26 +352,51 @@ class SharedConfig:
         print(f"[device] capability envelope updated: {clean}")
 
     def envelope(self):
+        """Return a copy of the current tier-1 capability envelope.
+
+        Returns:
+            dict mapping envelope keys (``rate_min``/``rate_max``/
+            ``freq_min``/``freq_max``/``gain_min``/``gain_max``) to their
+            current bound.
+        """
         with self._lock:
             return dict(self._envelope)
 
     # --- Compute backstop (P2a-3) ---------------------------------------------
 
     def note_good_analysis(self, cfg: "RadioConfig"):
-        """Remember the analysis params that just computed a frame successfully —
-        the revert target if a later config slips past validation and throws."""
+        """Record the analysis params of a config that just computed a frame.
+
+        This is the tier-3 backstop's revert target: if a later config
+        passes tiers 1–2 but still throws when it actually computes a
+        frame, :meth:`revert_analysis` falls back to these values.
+
+        Args:
+            cfg: The ``RadioConfig`` that just produced a frame
+                successfully.
+        """
         good = {k: getattr(cfg, k) for k in ANALYSIS_CFG_KEYS}
         with self._lock:
             self._last_good_analysis = good
 
     def revert_analysis(self, reason: str):
-        """
-        Backstop (belt and suspenders): the compute path caught an exception even
-        though tiers 1–2 should have prevented it. Revert the analysis params to
-        the last-good set (or the shipped defaults), keep streaming, and queue a
-        notice for the viewers. Returns the sorted reverted field names, or None
-        when the current params already match every revert target — i.e. the
-        error is not analysis-induced and reverting would change nothing.
+        """Tier-3 backstop: revert analysis params after a compute-path exception.
+
+        Belt and suspenders — the compute path caught an exception even
+        though tiers 1-2 (see :meth:`probe_analysis`) should have prevented
+        it. Reverts the analysis fields to the last-good set recorded by
+        :meth:`note_good_analysis`, falling back to ``ANALYSIS_DEFAULTS`` if
+        there is none, so the stream keeps running, then queues a notice for
+        the viewers via :meth:`push_notice`.
+
+        Args:
+            reason: Human-readable description of the exception, folded into
+                the queued notice.
+
+        Returns:
+            Sorted list of reverted field names, or ``None`` if the current
+            params already match every revert target — i.e. the error was
+            not analysis-induced and reverting would change nothing.
         """
         with self._lock:
             current = {k: getattr(self._cfg, k) for k in ANALYSIS_CFG_KEYS}
@@ -275,14 +424,30 @@ class SharedConfig:
         return changed
 
     def probe_analysis(self, trial_cfg: "RadioConfig", target: str = "spectrogram"):
-        """
-        Tier-2 scratch validation, executed on the compute thread. striqt's
-        get_window carries a persistent on-disk cache whose handle is bound to
-        the thread that first used it (dbm.sqlite3 refuses cross-thread use);
-        the compute thread is that owner, so verdicts from anywhere else could
-        report a spurious threading error instead of the real one. Falls back
-        to an inline judgement if no compute thread services the request in
-        time (startup) — the tier-3 backstop still protects the stream.
+        """Run tier-2 scratch validation of a trial config on the compute thread.
+
+        striqt's ``get_window`` carries a persistent on-disk cache whose
+        handle is bound to the thread that first used it (``dbm.sqlite3``
+        refuses cross-thread use); the compute thread is that owner, so a
+        verdict produced anywhere else could report a spurious threading
+        error instead of the real one. This method posts the request through
+        the single-slot mailbox (``_probe_req``/``_probe_res``) that
+        :meth:`service_probe` drains on the compute thread, and blocks up to
+        2 seconds for the reply.
+
+        Args:
+            trial_cfg: Candidate ``RadioConfig`` to validate — not applied to
+                the live config regardless of the verdict.
+            target: Analysis target name (``"spectrogram"``, ``"psd"``, or
+                ``"ssb"``).
+
+        Returns:
+            ``None`` if the trial config is valid (or striqt is unavailable,
+            i.e. ``_ANALYSIS_OK`` is false), else an error string. Falls back
+            to an inline (non-compute-thread) judgement via
+            ``scratch_validate_analysis`` if no compute thread services the
+            request in time (e.g. at startup) — the tier-3 backstop still
+            protects the stream if that inline judgement is wrong.
         """
         if not _ANALYSIS_OK:
             return None
@@ -299,7 +464,12 @@ class SharedConfig:
             return scratch_validate_analysis(trial_cfg, target)
 
     def service_probe(self):
-        """Called by the compute thread every loop: run a pending tier-2 probe."""
+        """Service one pending tier-2 probe request, if any.
+
+        Must be called by the compute thread every loop iteration — it is
+        the only thread allowed to touch striqt's ``get_window`` cache
+        handle. No-ops when :meth:`probe_analysis` has no request queued.
+        """
         job = self._probe_req
         if job is None:
             return
@@ -309,20 +479,44 @@ class SharedConfig:
         self._probe_done.set()
 
     def push_notice(self, message: str):
+        """Queue a human-readable notice for viewers, keeping only the newest 20.
+
+        Args:
+            message: Notice text (e.g. a rounding/revert/restore explanation).
+        """
         with self._lock:
             self._notices.append(str(message))
             del self._notices[:-20]   # keep only the newest if no viewer drains
 
     def drain_notices(self):
+        """Atomically pop and return all queued notices.
+
+        Returns:
+            The list of notice strings queued since the last drain (may be
+            empty). The internal queue is reset to empty.
+        """
         with self._lock:
             notices, self._notices = self._notices, []
             return notices
 
     def _effective_radio(self, update: dict):
-        """
-        Effective radio params for THIS message (LV-R9b): validation must see
-        the nfft/sample_rate/backend the message itself is applying (already
-        mapped to the top level by the capture branch), not the stale cfg.
+        """Build a snapshot reflecting THIS message's radio-facing changes.
+
+        Analysis validation (tier 1) must judge fields like
+        ``frequency_resolution`` against the ``nfft``/``sample_rate``/
+        ``backend`` the message itself is applying — already mapped to the
+        top level by the capture branch in :meth:`update` — not the stale
+        live config (LV-R9b). Applies the same clamp/snap rules
+        :meth:`update` uses for those three fields, silently ignoring
+        malformed values (they are validated for real later, in
+        :meth:`update`'s main loop).
+
+        Args:
+            update: The raw control-message dict for this call.
+
+        Returns:
+            A ``RadioConfig`` snapshot with ``sample_rate``/``nfft``/
+            ``backend`` advanced to what this message would apply.
         """
         eff = self.snapshot()
         env = self.envelope()
@@ -345,26 +539,55 @@ class SharedConfig:
 
     def _tier1_freq_fields(self, req, eff, *, cfg_prefix, ack_prefix,
                            on_calibrated_grid, rounded, rejected):
-        """
-        Tier-1 snap rules (knowable constraints → round and tell) for the
-        FrequencyAnalysisSpecBase fields shared by the spectrogram and PSD
-        analyses: window / frequency_resolution / fractional_overlap /
-        window_fill / integration_bandwidth / lo_bandstop / trim_stopband.
-        `cfg_prefix` maps the message field onto the target's RadioConfig
-        attribute (e.g. "psd_" + "window"); `ack_prefix` labels the ack entries.
-        Returns (accepted, ack_field, requested_map) keyed by RadioConfig key.
+        """Apply tier-1 snap rules for the fields shared by spectrogram/PSD analyses.
+
+        Tier 1 covers knowable constraints (a rule that can be checked and
+        corrected without asking striqt) for the ``FrequencyAnalysisSpecBase``
+        fields common to both targets: ``window``, ``frequency_resolution``,
+        ``fractional_overlap``, ``window_fill``, ``integration_bandwidth``,
+        ``lo_bandstop``, ``trim_stopband``. Out-of-range or off-grid values
+        are snapped and appended to ``rounded``; malformed values are
+        appended to ``rejected``. Never mutates ``self._cfg`` — callers merge
+        the returned ``accepted`` values in later, after tier 2.
+
+        Args:
+            req: The target's own sub-dict from the ``analysis`` block (e.g.
+                ``update["analysis"]`` for spectrogram, or its ``psd`` view).
+            eff: Effective radio snapshot from :meth:`_effective_radio`, used
+                to compute the sample-rate-dependent grids these fields snap
+                to.
+            cfg_prefix: Prefix mapping a message field onto the target's
+                ``RadioConfig`` attribute name (e.g. ``"psd_"`` + ``"window"``
+                -> ``psd_window``; empty for spectrogram).
+            ack_prefix: Prefix for the field name reported in ack entries
+                (e.g. ``"psd."``; empty for spectrogram).
+            on_calibrated_grid: Whether this target executes on the aligned
+                28-multiple FFT grid (:func:`aligned_nfft`), which changes
+                the denominator used for fraction snapping.
+            rounded: List to append ``{field, requested, used, reason}``
+                entries to, mutated in place.
+            rejected: List to append ``{field, requested, reason}`` entries
+                to, mutated in place.
+
+        Returns:
+            Tuple ``(accepted, ack_field, requested_map)``, all keyed by
+            ``RadioConfig`` attribute name: ``accepted`` maps to the
+            validated value, ``ack_field`` to the ack-facing field name, and
+            ``requested_map`` to the original raw requested value.
         """
         accepted = {}          # cfg key -> validated value
         ack_field = {}         # cfg key -> field name reported in the ack
         requested_map = {}     # cfg key -> the raw requested value
 
         def tell(field, requested, used, reason):
+            """Append a rounding ack entry for `ack_prefix + field`."""
             rounded.append({
                 "field": ack_prefix + field, "requested": requested,
                 "used": used, "reason": reason,
             })
 
         def reject(field, requested, reason):
+            """Append a rejection ack entry for `ack_prefix + field`."""
             rejected.append({"field": ack_prefix + field,
                              "requested": requested, "reason": reason})
 
@@ -475,16 +698,35 @@ class SharedConfig:
         return accepted, ack_field, requested_map
 
     def _validate_analysis(self, update: dict):
-        """
-        Freedom-model gate (P2a-2, generalized across analysis targets in
-        P2b-1) for the "analysis" block of a control message. The block's
-        optional "target" key routes to the analysis being configured
-        (spectrogram is the default — the P2a wire format is unchanged).
-        Never mutates the live config — returns (survivors, rounded, rejected,
-        ignored) where `survivors` maps RadioConfig keys to values that passed
-        tier 1 (knowable rules → snap and tell) AND tier 2 (striqt scratch
-        validation on a tiny buffer). `rounded`/`rejected` are the ack entries:
-        [{field, requested, used, reason}] / [{field, requested, reason}].
+        """Run the full tier-1 + tier-2 gate on a message's ``analysis`` block.
+
+        Routes to the analysis target named by the block's optional
+        ``target`` key (default ``"spectrogram"``, so the original wire
+        format is unchanged for callers that never set it). Never mutates
+        the live config: builds a working copy from the effective radio
+        snapshot, applies tier-1 accepted fields one at a time onto it, and
+        tier-2 scratch-validates (:meth:`probe_analysis`) each one in the
+        target's declared field order so a failure is attributed to the
+        specific field that caused it — survivors keep applying on top of
+        each other.
+
+        Args:
+            update: The raw control-message dict; only its ``analysis`` key
+                is consulted.
+
+        Returns:
+            Tuple ``(survivors, rounded, rejected, ignored)``:
+
+            - ``survivors``: dict mapping ``RadioConfig`` keys to values
+              that passed both tier 1 (knowable rules -> snap and tell) and
+              tier 2 (striqt scratch validation on a tiny buffer). Only
+              these may be merged into the live config.
+            - ``rounded``: ack entries ``[{field, requested, used, reason}]``
+              for values tier 1 adjusted.
+            - ``rejected``: ack entries ``[{field, requested, reason}]`` for
+              values either tier rejected.
+            - ``ignored``: sorted list of ``"analysis.<key>"`` names the
+              target doesn't recognize.
         """
         req = dict(update.get("analysis") or {})
         target = str(req.pop("target", "spectrogram") or "spectrogram").strip().lower()
@@ -543,8 +785,29 @@ class SharedConfig:
         return survivors, rounded, rejected, ignored
 
     def _tier1_target(self, target, req, eff, on_calibrated_grid, rounded, rejected):
-        """Dispatch tier-1 validation for one analysis target. Returns
-        (accepted, ack_field, requested_map) keyed by RadioConfig key."""
+        """Dispatch tier-1 validation to the routine for one analysis target.
+
+        Args:
+            target: Analysis target name (``"spectrogram"``, ``"psd"``, or
+                ``"ssb"``).
+            req: The target's sub-dict from the ``analysis`` block (``target``
+                key already popped).
+            eff: Effective radio snapshot from :meth:`_effective_radio`.
+            on_calibrated_grid: Whether this target executes on the aligned
+                28-multiple FFT grid.
+            rounded: List to append rounding ack entries to, mutated in place.
+            rejected: List to append rejection ack entries to, mutated in
+                place.
+
+        Returns:
+            Tuple ``(accepted, ack_field, requested_map)`` keyed by
+            ``RadioConfig`` attribute name (see :meth:`_tier1_freq_fields`).
+
+        Raises:
+            RuntimeError: If ``target`` has no tier-1 validator registered
+                (should be unreachable — ``_validate_analysis`` already
+                rejects unknown targets against ``ANALYSIS_TARGETS``).
+        """
         if target == "spectrogram":
             accepted, ack_field, requested_map = self._tier1_freq_fields(
                 req, eff, cfg_prefix="", ack_prefix="",
@@ -577,28 +840,46 @@ class SharedConfig:
         raise RuntimeError(f"no tier-1 validator for analysis target {target!r}")
 
     def _tier1_ssb(self, req, eff, rounded, rejected):
-        """
-        Tier-1 snap rules for the SSB target (P2b-5). Knowable constraints:
-        the subcarrier spacing must admit a compatible capture rate (14·scs ≤
-        SSB_MAX_RATE); the output rate can't exceed the sampled span; the
-        discovery periodicity must cover at least one burst set (2 ms of
-        symbols for every SCS) and one period must fit the IQ ring; the
-        frequency offset must stay inside the sampled span; max_block_count is
-        a whole number of burst sets or none. Everything subtler goes to the
-        tier-2 scratch run. eff.sample_rate is moved onto the SSB grid the
-        retune would pick, so the probes judge the config that would go live.
+        """Apply tier-1 snap rules for the SSB analysis target.
+
+        Knowable constraints checked here: the subcarrier spacing must admit
+        a compatible capture rate (``14 * scs <= SSB_MAX_RATE``); the output
+        rate can't exceed the sampled span; the discovery periodicity must
+        cover at least one burst set (2 ms of symbols for every SCS) and one
+        period must fit the IQ ring; the frequency offset must stay inside
+        the sampled span and land on the subcarrier grid; ``max_block_count``
+        is a whole number of burst sets or ``None``. Everything subtler is
+        left to the tier-2 scratch run. As a side effect, mutates
+        ``eff.sample_rate`` onto the SSB grid the retune would pick, so
+        tier-2 probes judge the config that would actually go live.
+
+        Args:
+            req: The ``ssb`` sub-dict from the ``analysis`` block.
+            eff: Effective radio snapshot from :meth:`_effective_radio`;
+                mutated in place to reflect the SSB-compatible rate.
+            rounded: List to append rounding ack entries to, mutated in
+                place.
+            rejected: List to append rejection ack entries to, mutated in
+                place.
+
+        Returns:
+            Tuple ``(accepted, ack_field, requested_map)`` keyed by
+            ``RadioConfig`` attribute name (see :meth:`_tier1_freq_fields`).
         """
         accepted, ack_field, requested_map = {}, {}, {}
 
         def tell(field, requested, used, reason):
+            """Append a rounding ack entry for `"ssb." + field`."""
             rounded.append({"field": "ssb." + field, "requested": requested,
                             "used": used, "reason": reason})
 
         def reject(field, requested, reason):
+            """Append a rejection ack entry for `"ssb." + field`."""
             rejected.append({"field": "ssb." + field,
                              "requested": requested, "reason": reason})
 
         def take(field, cfg_key, value):
+            """Record `value` as accepted for `cfg_key`, tagged with its ssb.* ack field."""
             accepted[cfg_key] = value
             ack_field[cfg_key] = "ssb." + field
             requested_map[cfg_key] = req.get(field)
@@ -735,13 +1016,33 @@ class SharedConfig:
 
     def _tier1_time_aperture(self, req, eff, on_calibrated_grid,
                              accepted, ack_field, requested_map, rounded, rejected):
-        """
-        Tier-1 rule for the spectrogram time_aperture (P2b-2): striqt requires an
-        integer multiple of the row hop period hop/fs — where hop follows the
-        overlap/nfft THIS message may also be changing. Snaps a requested value
-        to the nearest hop multiple within one frame; when the message moves the
-        hop grid under an existing aperture, the aperture is re-snapped to the
-        new grid (reported), instead of letting the next frame throw.
+        """Apply the tier-1 snap rule for the spectrogram's ``time_aperture``.
+
+        striqt requires ``time_aperture`` to be an integer multiple of the
+        row hop period ``hop / sample_rate``, where ``hop`` follows the
+        overlap/nfft this same message may also be changing. Snaps a
+        requested value to the nearest hop multiple within one frame (capped
+        at ``eff.rows``); when the message moves the hop grid out from under
+        an existing aperture (by changing ``nfft`` or ``fractional_overlap``
+        without touching ``time_aperture`` itself), re-snaps the standing
+        aperture to the new grid and reports it, instead of letting the next
+        computed frame throw.
+
+        Args:
+            req: The spectrogram sub-dict from the ``analysis`` block.
+            eff: Effective radio snapshot from :meth:`_effective_radio`.
+            on_calibrated_grid: Whether the spectrogram executes on the
+                aligned 28-multiple FFT grid.
+            accepted: Tier-1 accepted-values dict from
+                :meth:`_tier1_freq_fields`; read for any ``nfft``/
+                ``fractional_overlap`` this message already accepted, and
+                written with ``time_aperture`` if accepted here.
+            ack_field: Ack-field-name dict, mutated in place.
+            requested_map: Raw-requested-value dict, mutated in place.
+            rounded: List to append rounding ack entries to, mutated in
+                place.
+            rejected: List to append rejection ack entries to, mutated in
+                place.
         """
         nfft_eff = accepted.get("nfft", eff.nfft)
         nfft_axis = aligned_nfft(nfft_eff) if on_calibrated_grid else int(nfft_eff)
@@ -789,9 +1090,54 @@ class SharedConfig:
                 })
 
     def update(self, update: dict) -> dict:
-        """
-        Apply key/value updates. Returns an ack
-        {applied, ignored, reconnect, rounded, rejected}.
+        """Validate and apply a control-message dict to the live config.
+
+        This is the single entry point for every config write in Linda (the
+        WS control path and ``POST /config`` both call it). It runs, in
+        order: (1) analysis-params stripped from the top level (only the
+        validated ``analysis`` block may set them); (2) the ``capture``
+        block mapped onto top-level radio fields; (3) the ``analysis`` block
+        run through :meth:`_validate_analysis` (tiers 1-2); (4) the
+        ``source`` block merged into ``source_config`` (verified-reconnect
+        path — an explicit JSON ``null`` clears an override back to the
+        adapter default); (5) every remaining top-level field individually
+        type-checked, clamped/snapped against the capability envelope, and
+        written to ``self._cfg`` under the lock, with rows/duration
+        ownership and SSB-grid honesty reconciled afterward; (6) an
+        ``OPERATIONS`` entry recorded for the net change (or "no net
+        change").
+
+        A malformed value for any one field is reported via ``rejected``,
+        never raised — allowing an exception to escape mid-loop would leave
+        earlier keys in the same message already written to ``self._cfg``
+        without ever marking it dirty, so the radio and the config would
+        silently disagree until a later change re-armed it.
+
+        Args:
+            update: The control message. Recognized top-level keys: scalar
+                radio/config fields (``center``, ``sample_rate``, ``gain``,
+                ``nfft``, ``rows``, ``backend``, ``lo_null``,
+                ``analysis_bandwidth``, ``lo_shift``, ``host_resample``,
+                ``backend_sample_rate``, ``duration``, ``ahawi``,
+                ``ahawi_capture_ms``, ``ahawi_align``) plus the nested
+                ``capture``, ``analysis``, and ``source`` blocks.
+
+        Returns:
+            Ack dict with keys:
+
+            - ``applied``: list of ``RadioConfig`` field names actually
+              changed.
+            - ``ignored``: sorted list of field names the message set that
+              map to nothing (editor-rendered but not live-applicable, or
+              unsupported by the chosen analysis target).
+            - ``reconnect``: list of ``source`` keys that changed and
+                require a device close/reopen to apply.
+            - ``rounded``: ``[{field, requested, used, reason}]`` for values
+              tier-1/2 adjusted.
+            - ``rejected``: ``[{field, requested, reason}]`` for values a
+                tier rejected outright.
+            - ``op_id``: the ``OPERATIONS`` id for this call (``None`` if the
+              message produced no changes/roundings/rejections to record).
         """
         # Analysis params are only settable through the validated "analysis"
         # block — strip top-level occurrences so nothing bypasses the freedom
@@ -912,10 +1258,12 @@ class SharedConfig:
             # radio-facing fields below now honour the same contract, so a
             # clamped tune can never be reported as an exact one.
             def _tell(field, req, used, reason):
+                """Append a rounding ack entry for a top-level radio field."""
                 rounded.append({"field": field, "requested": req,
                                 "used": used, "reason": reason})
 
             def _reject(field, req, reason):
+                """Append a rejection ack entry for a top-level radio field."""
                 rejected.append({"field": field, "requested": req,
                                  "reason": reason})
 
@@ -1159,13 +1507,29 @@ class SharedConfig:
         }
 
     def take_dirty(self):
-        """Returns (dirty, cfg_snapshot, op_id, reconnect, changed_fields).
+        """Atomically consume the dirty flag and hand off pending config state.
 
-        ``op_id`` is the
-        pending operation awaiting hardware apply/verification (or None);
-        reconnect means source-spec overrides changed and the device must be
-        closed and reopened rather than rearmed. ``changed_fields`` lets the
-        acquisition loop avoid touching the radio for compute-only changes.
+        Called by the acquisition loop each cycle to check whether a
+        validated config write from :meth:`update` needs to be applied to
+        hardware. Resets ``_dirty``, ``_pending_op``, ``_reconnect``, and
+        ``_changed_fields`` to their empty state as a side effect, so each
+        pending change is handed off exactly once.
+
+        Returns:
+            Tuple ``(dirty, cfg, op_id, reconnect, changed_fields)``:
+
+            - ``dirty``: whether any field changed since the last call.
+            - ``cfg``: a fresh ``RadioConfig`` snapshot to apply.
+            - ``op_id``: the ``OPERATIONS`` id awaiting hardware apply and
+              readback verification, or ``None``.
+            - ``reconnect``: whether source-spec overrides changed, meaning
+              the device must be closed and reopened rather than rearmed in
+              place.
+            - ``changed_fields``: the exact field names that changed, so the
+              acquisition loop can skip touching the radio for compute/
+              display-only changes (rebuilding an SDR DMA stream for e.g. a
+              PSD toggle is both unnecessary and unsafe on drivers that
+              retain an exclusive handle).
         """
         with self._lock:
             dirty = self._dirty
@@ -1176,9 +1540,24 @@ class SharedConfig:
             return dirty, self._cfg.snapshot(), op_id, reconnect, changed
 
     def restore_source(self, source_config, reason=""):
-        """Backstop for a failed reconnect: revert the source overrides to the
-        last set that demonstrably opened, notify viewers, and return a fresh
-        snapshot to recover with."""
+        """Backstop for a source-spec reconnect that failed to apply.
+
+        Reverts ``source_config`` to the last set that demonstrably opened
+        the device, queues an explanatory notice for viewers, and returns a
+        fresh snapshot for the caller (typically the Acquirer) to recover
+        with. Does not touch ``_dirty``/``_pending_op``/``_reconnect`` —
+        callers that need a full rollback should use :meth:`restore_config`.
+
+        Args:
+            source_config: The last-known-good source-spec override dict
+                (may be ``None``, treated as empty).
+            reason: Optional human-readable failure reason, folded into the
+                queued notice.
+
+        Returns:
+            A fresh ``RadioConfig`` snapshot reflecting the reverted
+            ``source_config``.
+        """
         with self._lock:
             self._cfg.source_config = dict(source_config or {})
             snap = self._cfg.snapshot()
@@ -1190,7 +1569,23 @@ class SharedConfig:
         return snap
 
     def restore_config(self, config: RadioConfig, reason=""):
-        """Roll back a recipe that validated but failed at hardware apply."""
+        """Roll back to a known-good config after a hardware-apply failure.
+
+        Used when a recipe passed all validation tiers but the radio itself
+        rejected it at apply time. Replaces the entire live config, clears
+        the dirty/reconnect/pending-op/changed-fields state (there is
+        nothing left to hand to the Acquirer — the rollback itself does not
+        need re-verification), and queues an explanatory notice for viewers.
+
+        Args:
+            config: The known-good ``RadioConfig`` to restore (typically the
+                last snapshot the Acquirer successfully verified).
+            reason: Optional human-readable failure reason, folded into the
+                queued notice.
+
+        Returns:
+            A fresh snapshot of the restored config.
+        """
         with self._lock:
             self._cfg = config.snapshot()
             self._dirty = False
@@ -1206,9 +1601,15 @@ class SharedConfig:
         return snap
 
     def stop(self):
+        """Signal the acquisition/compute threads to shut down (see :meth:`stopped`)."""
         with self._lock:
             self._stop = True
 
     def stopped(self):
+        """Return whether :meth:`stop` has been called.
+
+        Returns:
+            bool: True once a shutdown has been signaled.
+        """
         with self._lock:
             return self._stop

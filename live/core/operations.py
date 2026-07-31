@@ -31,7 +31,20 @@ TERMINAL_STATES = {"success", "verified", "unverified", "mismatch", "failed",
 
 
 class OperationLog:
+    """Thread-safe ring buffer of in-flight and completed Operations.
+
+    One process-wide instance (``OPERATIONS`` below) is shared by every
+    module that touches the radio. Callers open an operation with `begin`,
+    narrate its progress with `stage`, and close it with `finish`; the log
+    keeps the most recent ones for the `/operations` endpoint and queues
+    stage events for WebSocket fan-out via `drain_events`.
+    """
+
     def __init__(self, keep: int = 200):
+        """Args:
+            keep: Maximum number of operations retained (oldest evicted
+                first, both from the deque and the id index).
+        """
         self._lock = threading.Lock()
         self._seq = itertools.count(1)
         self._ops = deque(maxlen=keep)          # completed + running op dicts
@@ -41,6 +54,15 @@ class OperationLog:
     # -- lifecycle ---------------------------------------------------------
 
     def begin(self, kind: str, summary: str) -> int:
+        """Start a new operation and record its "requested" stage.
+
+        Args:
+            kind: Short machine-readable category (e.g. "config", "tx").
+            summary: Human-readable one-line description of the request.
+
+        Returns:
+            The new operation's id, used for subsequent `stage`/`finish` calls.
+        """
         op_id = next(self._seq)
         op = {
             "id": op_id,
@@ -62,8 +84,18 @@ class OperationLog:
         return op_id
 
     def stage(self, op_id, stage: str, detail: str = "", level: str = "info"):
-        """Record (and print) one stage of an operation. Unknown/finished op
-        ids are tolerated — logging must never break the radio path."""
+        """Record and print one stage of an operation's progress.
+
+        Unknown or already-evicted op ids are silently tolerated — logging
+        must never raise into the radio control path.
+
+        Args:
+            op_id: Operation id from `begin`, or None to no-op.
+            stage: Stage name (e.g. "validated", "applying", "readback").
+            detail: Human-readable detail printed alongside the stage.
+            level: "info", "warn", or "error"; only affects the printed tag
+                and the level recorded on the queued event.
+        """
         if op_id is None:
             return
         entry = {"t": time.time(), "stage": str(stage),
@@ -81,6 +113,15 @@ class OperationLog:
               else f"[op #{op_id}] {stage}{tag}")
 
     def finish(self, op_id, state: str, detail: str = ""):
+        """Close an operation with its terminal verdict.
+
+        Args:
+            op_id: Operation id from `begin`, or None to no-op.
+            state: Verdict; must be one of `TERMINAL_STATES` or it is coerced
+                to "success". `finish` also derives the stage's print level
+                from it (error for "failed", warn for "mismatch"/"unverified").
+            detail: Human-readable detail for the verdict stage.
+        """
         if op_id is None:
             return
         state = state if state in TERMINAL_STATES else "success"
@@ -97,39 +138,84 @@ class OperationLog:
     # -- readout -----------------------------------------------------------
 
     def recent(self, n: int = 50):
+        """Return the most recent operations, newest last.
+
+        Args:
+            n: Maximum number of operations to return.
+
+        Returns:
+            A list of shallow-copied operation dicts (each with its own
+            "stages" list copy), safe for callers to serialize or mutate.
+        """
         with self._lock:
             return [dict(op, stages=list(op["stages"]))
                     for op in list(self._ops)[-n:]]
 
     def get(self, op_id):
+        """Look up a single operation by id.
+
+        Args:
+            op_id: Operation id from `begin`.
+
+        Returns:
+            A shallow-copied operation dict, or None if unknown/evicted.
+        """
         with self._lock:
             op = self._by_id.get(op_id)
             return dict(op, stages=list(op["stages"])) if op else None
 
     def drain_events(self):
-        """Take the queued stage events (for WS fan-out). Same contract as
-        SharedConfig.drain_notices."""
+        """Take and clear the queued stage events, for WS fan-out.
+
+        Same drain-and-clear contract as `SharedConfig.drain_notices`: each
+        call empties the internal queue, so events are delivered at most once.
+
+        Returns:
+            The list of queued event dicts (each has "op_id", "kind", "state"
+            plus the stage's "t"/"stage"/"detail"/"level").
+        """
         with self._lock:
             events, self._events = self._events, []
             return events
 
     def set_fields(self, op_id, fields):
-        """Record which config fields this operation changed — the Acquirer
-        scopes hardware readback to them (a rows-only change must not be
-        judged by an unrelated missing gain getter)."""
+        """Record which config fields this operation changed.
+
+        The Acquirer scopes hardware readback verification to this list, so
+        e.g. a rows-only change is never judged by an unrelated (and
+        possibly missing) gain getter.
+
+        Args:
+            op_id: Operation id from `begin`, or None to no-op.
+            fields: Iterable of changed field names; stored as strings.
+        """
         with self._lock:
             op = self._by_id.get(op_id)
             if op is not None:
                 op["fields"] = [str(f) for f in fields]
 
     def fields(self, op_id):
-        """The changed-field list for an op, or None (unknown → full check)."""
+        """Look up the changed-field list recorded by `set_fields`.
+
+        Args:
+            op_id: Operation id from `begin`.
+
+        Returns:
+            A list of field names, or None if unknown or never set (callers
+            treat None as "no scoping info available" and do a full check).
+        """
         with self._lock:
             op = self._by_id.get(op_id)
             return list(op["fields"]) if op and "fields" in op else None
 
     def last_terminal(self):
-        """Most recent finished operation (for /health)."""
+        """Find the most recently finished operation, for `/health`.
+
+        Returns:
+            A dict with "id", "kind", "summary", "state", "t_end" for the
+            newest operation whose state is in `TERMINAL_STATES`, or None if
+            no operation has finished yet.
+        """
         with self._lock:
             for op in reversed(self._ops):
                 if op["state"] in TERMINAL_STATES:
@@ -145,7 +231,16 @@ OPERATIONS = OperationLog()
 # -- shared helpers used by config/acquisition ------------------------------
 
 def fmt_value(key, value):
-    """Human units for the common radio fields."""
+    """Format a config value with human-readable units for op-log detail text.
+
+    Args:
+        key: Config field name (e.g. "center", "sample_rate", "gain").
+        value: The field's value; coerced to float for the known keys.
+
+    Returns:
+        A unit-suffixed string (e.g. "1955 MHz") for recognized keys, else
+        `repr(value)` unchanged.
+    """
     try:
         if key in ("center", "center_frequency"):
             return f"{float(value)/1e6:.6g} MHz"
@@ -159,7 +254,16 @@ def fmt_value(key, value):
 
 
 def verdict_state(verdicts):
-    """Collapse per-field readback verdicts into one operation state."""
+    """Collapse per-field readback verdicts into one overall operation state.
+
+    Args:
+        verdicts: Iterable of per-field verdict dicts, each with a "state"
+            key (e.g. "verified", "mismatch", "readback_unsupported").
+
+    Returns:
+        "mismatch" if any field mismatched; "unverified" if every field
+        reported "readback_unsupported"; otherwise "verified".
+    """
     states = {v["state"] for v in verdicts}
     if "mismatch" in states:
         return "mismatch"

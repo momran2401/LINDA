@@ -1,8 +1,24 @@
-"""Acquisition threads: hardware Acquirer, Computer, DemoAcquirer.
+"""Background threads that turn radio (or synthetic) IQ into published frames.
 
-The Acquirer drains raw IQ into a ring buffer; the Computer turns ring
-samples into published frames; the DemoAcquirer synthesizes IQ with no
-hardware. Extracted verbatim from striqt_web_server.py.
+This module is the runtime heart of Linda's live view: three daemon threads
+built on top of `core.devices` (hardware adapters), `core.dsp` (spectrogram /
+AHAWI compute), `core.operations` (the verified-operations log), and
+`core.shims` (striqt-version-tolerant stream calls).
+
+- `Acquirer` owns the real SDR: it drains raw IQ off the DMA/stream API into a
+  per-channel ring buffer as fast as possible, with no compute in that loop,
+  and handles all hardware lifecycle (open/rearm/recover/pause-and-release).
+- `Computer` is the compute-side twin: it pulls the latest ring samples,
+  invokes the DSP backends to build a frame, and publishes it for the
+  broadcaster to fan out over WebSocket.
+- `DemoAcquirer` combines both roles for `--demo` mode, synthesizing IQ (fixed
+  CW "stations" plus a periodic fake-SSB burst) instead of reading hardware,
+  so tuning/AHAWI/TX behavior is testable with no radio attached.
+
+Keeping the raw-IQ drain and the spectrogram math in separate threads is what
+prevents DMA overflow on the real radio: the Acquirer keeps draining while a
+frame is being computed. Originally extracted from striqt_web_server.py; see
+CLAUDE.md's Architecture section for how this fits into the rest of `core/`.
 """
 from __future__ import annotations
 
@@ -31,11 +47,21 @@ from .striqt_compat import ReceiveStreamError, specs
 from .tx import TX
 
 def make_capture(cfg):
-    # port stays fixed at state.CHANNELS — the two-waterfall UI depends on both RX ports
-    # (P1-2). The other four knobs are now driven by the schema editor / cfg.
-    # When cfg.duration owns the time axis (P2a-4) it drives the armed capture
-    # duration honestly; snapped to an integer sample count because striqt's
-    # Capture validation requires duration·sample_rate to be an integer.
+    """Build the striqt capture spec that `arm_spec()` programs onto the source.
+
+    Port is pinned to `state.CHANNELS` (not derived from `cfg`) because the
+    two-waterfall UI depends on both RX ports being armed together; every
+    other knob comes from the schema editor / `cfg`. When `cfg.duration`
+    doesn't own the time axis, duration is derived from `rows * nfft /
+    sample_rate` instead, then snapped so `duration * sample_rate` is an
+    integer sample count — striqt's Capture validation requires that.
+
+    Args:
+        cfg: RadioConfig snapshot describing the requested capture.
+
+    Returns:
+        specs.SoapyCapture: the spec to pass to `source.arm_spec()`.
+    """
     duration = cfg.duration if cfg.duration > 0 else cfg.rows * cfg.nfft / cfg.sample_rate
     duration = max(duration, 1e-3)
     duration = round(duration * cfg.sample_rate) / cfg.sample_rate
@@ -55,18 +81,34 @@ def make_capture(cfg):
 # ---------------------------------------------------------------------------
 
 class Acquirer(threading.Thread):
-    """
-    Drains raw IQ from the AIR8201B into a per-channel ring buffer in a tight
-    read loop (no spectrogram math here). The separate Computer thread pulls the
-    latest samples via get_latest(), computes blocks, and calls publish(); the
-    broadcaster reads latest() at state.BROADCAST_FPS to fan out to all clients.
+    """Drains raw IQ from the live SDR into a ring buffer and owns its lifecycle.
 
-    Keeping compute off this loop is what prevents DMA overflow: while a frame is
-    being computed, _read_stream keeps draining the radio. This mirrors the
-    Acquirer/LocalReceiver split in legacy/striqt_standalone.py.
+    Runs a tight read loop (no spectrogram math here) pulling from the
+    hardware source in `READ_SIZE`-sized chunks into a `MAX_TAIL`-sample
+    per-channel ring buffer. The separate `Computer` thread pulls the latest
+    samples via `get_latest()`, computes blocks, and calls `publish()`; the
+    broadcaster reads `latest()`/`latest_if_newer()` at `state.BROADCAST_FPS`
+    to fan out frames to all clients.
+
+    Beyond draining, this thread also owns opening, retuning, recovering, and
+    pausing/releasing the device (for handoffs to a recording sweep or the TX
+    ladder's `rx_released` rung), and stages every hardware-affecting change
+    through the verified-operations log in `core.operations`.
+
+    Keeping compute off this loop is what prevents DMA overflow: while a frame
+    is being computed, `_read_stream` keeps draining the radio. This mirrors
+    the Acquirer/LocalReceiver split in `legacy/striqt_standalone.py`.
     """
 
     def __init__(self, shared: SharedConfig):
+        """Initialize an idle Acquirer bound to a shared config.
+
+        The thread owns no hardware until `run()` calls `open_radio()`.
+
+        Args:
+            shared: The process-wide SharedConfig this thread reads dirty
+                config changes from and reports analysis/notice feedback to.
+        """
         super().__init__(daemon=True)
         self.shared       = shared
         self.source       = None
@@ -105,14 +147,32 @@ class Acquirer(threading.Thread):
         self._paused = threading.Event()
 
     def pause_and_release(self, timeout=10.0):
-        """Ask the acquisition loop to close the device, then wait for it."""
+        """Ask the run loop to release the RX stream and wait for it to do so.
+
+        This is the cooperative handoff other consumers of the same device
+        (a recording sweep, or the TX ladder's `rx_released` rung) must use
+        instead of disabling/closing the stream themselves: the Acquirer
+        thread is blocked in a blocking read on that stream, so pulling it
+        out from underneath produces an `Inactive RF hardware detected`
+        timeout rather than a clean release. The run loop notices the
+        request, disables and closes the RX stream, clears the ring, and
+        sets `_paused`.
+
+        Args:
+            timeout: Seconds to wait for the loop to confirm it paused.
+
+        Returns:
+            bool: True if the loop paused within `timeout`, else False.
+        """
         self._pause_requested.set()
         return self._paused.wait(timeout)
 
     def resume(self):
+        """Clear the pause request so the run loop reopens/rearms the device."""
         self._pause_requested.clear()
 
     def is_paused(self):
+        """Return True once the run loop has confirmed it released the stream."""
         return self._paused.is_set()
 
     # --- Latest-frame slot (thread-safe) ---
@@ -143,6 +203,14 @@ class Acquirer(threading.Thread):
             return dict(header), [b.copy() for b in self._latest_blocks]
 
     def publish(self, cfg: RadioConfig, blocks: list, meta: dict):
+        """Store a freshly computed frame as the latest one (called by Computer).
+
+        Args:
+            cfg: RadioConfig the frame was computed under (used to build the
+                frame header).
+            blocks: Per-channel computed arrays for this frame.
+            meta: Backend-specific metadata merged into the header.
+        """
         header = build_header(cfg, blocks, meta, demo=False)
         with self._pub_lock:
             self._latest_header = header
@@ -151,6 +219,14 @@ class Acquirer(threading.Thread):
     # --- Ring buffer (thread-safe; ported from legacy/striqt_standalone.py) ---
 
     def _clear_ring_locked(self):
+        """Reset the ring to empty and bump its generation counter.
+
+        Must be called with `self._lock` held. Bumping `_gen` invalidates any
+        in-flight frame computation that started against the pre-clear ring
+        (LV-R5) — the Computer checks `gen` against the ring's current
+        generation before publishing so a retune/recover can never let old
+        and new IQ mix into the same frame.
+        """
         self._write      = 0
         self._count      = 0
         self._last_write = 0.0
@@ -158,7 +234,13 @@ class Acquirer(threading.Thread):
         self._gen       += 1   # invalidate frames straddling this retune/recover (LV-R5)
 
     def _ring_write(self, iq):
-        """Append raw IQ (channels, n) into the ring buffer with wraparound."""
+        """Append raw IQ into the ring buffer, overwriting the oldest samples.
+
+        Args:
+            iq: complex64 array shaped (channels, n) to append. If n exceeds
+                the ring capacity (`MAX_TAIL`), only the newest `MAX_TAIL`
+                samples survive.
+        """
         n = iq.shape[1]
         if n <= 0:
             return
@@ -185,20 +267,39 @@ class Acquirer(threading.Thread):
             self._healthy    = True
 
     def generation(self):
+        """Return the ring's current generation counter (bumped on every clear)."""
         with self._lock:
             return self._gen
 
     def last_gap_time(self):
-        """Wall time of the last suspected drain gap (0.0 = none seen)."""
+        """Wall time of the last suspected drain gap (0.0 = none seen).
+
+        A "gap" is a zero-sample read observed while the stream was
+        otherwise healthy — how an overflow drop surfaces with
+        `on_overflow="log"`. AHAWI mode compares a capture's time span
+        against this to report `coherent=false` instead of pretending the
+        capture had no seam.
+        """
         return self._last_gap
 
     def get_latest(self, n):
-        """
-        Return (out, gen, avail): the most recent `n` complex samples per channel,
-        shape (channels, n) complex64, chronological (oldest -> newest), front-padded
-        with zeros if fewer than `n` exist; `gen` is the ring generation and `avail`
-        the real sample count. Returns None if the ring is empty or stale (so frames
-        never mix old-tuning samples after a retune).
+        """Return the most recent `n` samples per channel from the ring.
+
+        Args:
+            n: Number of complex samples to return per channel.
+
+        Returns:
+            None if the ring is empty or stale (`DATA_STALE_SEC` since the
+            last write) — the caller must wait rather than compute from
+            dead data. Otherwise a 3-tuple:
+                out: complex64 array shaped (channels, n), chronological
+                    (oldest -> newest), front-padded with zeros if fewer
+                    than `n` samples exist yet.
+                gen: the ring generation at read time — callers compare this
+                    to a `generation()` taken before the read to detect a
+                    retune/recover that happened mid-read, so a frame never
+                    mixes old-tuning samples with new (LV-R5).
+                avail: the real (unpadded) sample count available.
         """
         n = int(n)
         if n <= 0:
@@ -225,7 +326,13 @@ class Acquirer(threading.Thread):
     # --- Verified operations (readback + data-path) ---
 
     def ring_status(self):
-        """Radio/stream liveness for /health."""
+        """Summarize radio/stream liveness for the `/health` endpoint.
+
+        Returns:
+            dict: `open` (source exists), `healthy` (ring has fresh data),
+            `last_write_age_s` (seconds since the last ring write, or None
+            if never written), `ring_fill` (fraction of `MAX_TAIL` filled).
+        """
         with self._lock:
             age = (time.time() - self._last_write) if self._last_write else None
             return {
@@ -245,11 +352,26 @@ class Acquirer(threading.Thread):
     _GAIN_FIELDS = frozenset({"gain"})
 
     def _readback_and_verify(self, cfg: RadioConfig, op_id):
-        """Ask the live driver what it ACTUALLY applied and judge it against
-        the request (adapter tolerances), SCOPED to the aspects this
-        operation changed (full recipe check when the field list is unknown,
-        e.g. radio open/recovery or a source reconnect). Logs one readback
-        stage per judged field and returns the op's collapsed verdict."""
+        """Ask the live driver what it actually applied and judge it against the request.
+
+        Only judges the aspects (frequency/rate/gain) this operation
+        actually changed — a full recipe check runs instead when the
+        changed-field list is unknown (radio open/recovery, or a source
+        reconnect), so an operation that never touched an aspect (e.g. rows,
+        backend, analysis knobs) can't be downgraded by an unrelated missing
+        driver getter. Expected values are computed via the device adapter's
+        `hardware_expectations()` so striqt's own intentional LO
+        offset/resample choices are never flagged as a mismatch. Logs one
+        readback stage per judged field to the operations log.
+
+        Args:
+            cfg: The RadioConfig this operation applied.
+            op_id: The operations-log id to stage readback results against.
+
+        Returns:
+            str: The collapsed verdict state (see `operations.verdict_state`),
+            e.g. "success", "verified", "unverified", or "mismatch".
+        """
         fields = OPERATIONS.fields(op_id)
         if fields is None or any(f.startswith("source.") for f in fields):
             check_freq = check_rate = check_gain = True     # full recipe
@@ -300,8 +422,20 @@ class Acquirer(threading.Thread):
         return verdict_state(verdicts)
 
     def _arm_verification(self, op_id, vstate):
-        """Hand the op to the Computer: it finishes when the first frame of
-        the current ring generation is actually computed (data-path proof)."""
+        """Register a pending op for data-path proof by the Computer thread.
+
+        The op finishes only once the Computer actually publishes a frame
+        computed from the current ring generation (`complete_verification`),
+        which is the real proof that IQ is flowing under the new config —
+        readback alone can't prove the data path works.
+
+        Args:
+            op_id: Operations-log id to verify, or None for recovery/resume
+                rearms that don't own an operation (a None op_id is a no-op
+                here — see below for why).
+            vstate: The verdict state computed by `_readback_and_verify`,
+                applied when the op finishes.
+        """
         # Recovery/resume rearms don't own an operation.  They must never
         # replace a real user operation that is still awaiting its fresh-frame
         # proof (the old behavior marked every such operation superseded).
@@ -318,7 +452,16 @@ class Acquirer(threading.Thread):
                               "frame confirmed its data path")
 
     def complete_verification(self, gen):
-        """Called by the compute side after each successfully published frame."""
+        """Finish the pending operation once a frame of its generation publishes.
+
+        Called by the Computer thread after each successfully published
+        frame. A no-op if there is no pending verification or the pending
+        one is for a different ring generation.
+
+        Args:
+            gen: The ring generation the just-published frame was computed
+                from.
+        """
         with self._verify_lock:
             if self._verify is None or self._verify[1] != gen:
                 return
@@ -332,6 +475,30 @@ class Acquirer(threading.Thread):
     # --- Hardware management ---
 
     def open_radio(self, cfg: RadioConfig, op_id=None):
+        """Create the device source, arm it, and enable the RX stream.
+
+        Used both for the initial open in `run()` and for a full
+        close-then-reopen recovery. Validates the source exposes the
+        striqt source API `core/devices` and this module depend on
+        (fails fast, naming the missing methods, rather than surfacing an
+        AttributeError several layers down — method names differ across
+        striqt releases, see INSTALLED_STRIQT_API.txt). After a successful
+        open, invalidates TX's cached capability probe (a new handle may
+        expose different TX channels) and, for profiles that opt in, queries
+        the device's real capability envelope so later config clamps use
+        live bounds instead of the static profile fallback.
+
+        Args:
+            cfg: RadioConfig to open the device with.
+            op_id: Existing operations-log id to stage against, or None to
+                begin (and own) a new "radio" operation for this open.
+
+        Raises:
+            RuntimeError: If the source is missing an API method this
+                module requires.
+            Exception: Any error from source creation, stream setup, or
+                `arm_spec` is re-raised after being logged to the operation.
+        """
         own_op = op_id is None
         if own_op:
             op_id = OPERATIONS.begin(
@@ -384,6 +551,34 @@ class Acquirer(threading.Thread):
         self._arm_verification(op_id, vstate)
 
     def rearm(self, cfg: RadioConfig, op_id=None):
+        """Apply a new capture recipe to the already-open device, in place.
+
+        Disables the stream, reprograms gain/frequency/rate/capture via
+        `arm_spec`, and re-enables the stream — without closing and
+        recreating the underlying DMA stream. That close/recreate path was
+        tried and abandoned: on the AIR-T it left the `/dev/xdma0_c2h_0`
+        handle busy, so every setting change blocked for ~6.5 s and fell
+        into recovery. The in-place path is portable to Pluto/generic Soapy
+        too. Falls back to `open_radio()` if no device is open yet.
+
+        On AIR-T, stream (re)activation retries up to 6 times: activation
+        claims an exclusive XDMA channel, and a rapid
+        deactivate/reconfigure/activate cycle can transiently return EBUSY
+        while the kernel finishes releasing the prior activation — retried
+        on the same stream, never by rebuilding the device. Other radios get
+        one attempt. On success the ring is cleared so stale IQ from the old
+        tuning can never mix into a frame under the new config, then
+        readback verification runs.
+
+        Args:
+            cfg: RadioConfig describing the new capture recipe.
+            op_id: Operations-log id to stage progress against, or None for
+                an unowned (recovery/resume) rearm.
+
+        Raises:
+            Exception: If stream activation never succeeds within the retry
+                budget, the last activation error is re-raised.
+        """
         if self.source is None:
             self.open_radio(cfg, op_id)
             return
@@ -437,6 +632,17 @@ class Acquirer(threading.Thread):
         self._arm_verification(op_id, vstate)
 
     def _make_read_buffers(self):
+        """Allocate the scratch buffers the read loop hands to `_read_stream`.
+
+        Sized to the smaller of the stream's reported MTU and `READ_SIZE`
+        so a single `_read_stream` call never asks for more than either
+        the driver or the read-loop's designed chunk size supports.
+
+        Returns:
+            tuple: (read_size, tmp, buffers) — the chunk size in samples,
+            the complex64 scratch array shaped (channels, read_size), and
+            the driver-specific buffer view(s) built from it.
+        """
         read_size     = min(self.stream_mtu or READ_SIZE, READ_SIZE)
         tmp           = np.empty((len(state.CHANNELS), read_size), dtype=np.complex64)
         buffers, _    = stream_buffers_for(self.source, tmp)
@@ -451,6 +657,16 @@ class Acquirer(threading.Thread):
         on the SAME source rather than escalated into a close/reopen that would
         leave the viewer dark until a service restart. Other radios get one
         attempt and then fall back to a clean reopen.
+
+        Args:
+            cfg: RadioConfig to rearm the resumed source with.
+            attempts: Override for the retry count; defaults to 10 for
+                Deepwave models (AIR8201B/AIR7201B/AIR7101B) and 1 otherwise.
+
+        Returns:
+            bool: True if `rearm()` eventually succeeded, False if all
+            attempts were exhausted or a pause/stop request interrupted
+            retrying.
         """
         deepwave = state.DEVICE in devices.DEEPWAVE_MODELS
         tries = attempts if attempts is not None else (10 if deepwave else 1)
@@ -468,7 +684,23 @@ class Acquirer(threading.Thread):
         return False
 
     def _recover(self, cfg: RadioConfig, reason: str):
-        """Close and reopen the radio. Returns new (read_size, tmp, buffers)."""
+        """Recover the radio after a read/apply error, then rebuild read buffers.
+
+        On Deepwave models, never closes the source (see class docs on why
+        `close_source()` is unsafe on AIR-T) — instead clears the ring and
+        rearms in place, replacing only the RX stream. Other radios get a
+        full close, ring clear, and reopen. Shuts down any active TX
+        transmission first, since keying a PA into a stream whose device is
+        being torn down should never be left to a race.
+
+        Args:
+            cfg: RadioConfig to reopen/rearm the device with.
+            reason: Human-readable cause, logged and passed to TX.shutdown()
+                so an aborted transmission is traceable to this recovery.
+
+        Returns:
+            tuple: (read_size, tmp, buffers) from `_make_read_buffers()`.
+        """
         print(f"[radio] recovering after: {reason}")
         # Stop transmitting BEFORE the device handle is disturbed. The writer
         # thread notices a swapped handle on its own, but that is the backstop;
@@ -496,6 +728,21 @@ class Acquirer(threading.Thread):
     # --- Main loop ---
 
     def run(self):
+        """Thread entry point: open the radio, then drain IQ until stopped.
+
+        Each loop iteration, in priority order: services a pause request
+        (release the stream for another consumer, then wait to resume);
+        applies any pending config change from `shared.take_dirty()`
+        (a verified reconnect, an in-place rearm, or — for compute-only
+        fields — just a ring clear with the stream left alone); reads one
+        chunk of IQ and appends it to the ring; and, on any receive error,
+        recovers the device via `_recover()`. All exceptions from a bad
+        config apply are handled by reverting to the last-known-good config
+        (or source) and retrying rather than propagating, since this thread
+        must outlive any single bad request. Always closes the source on
+        exit (normal shutdown, not the AIR-T recovery path where closing is
+        avoided).
+        """
         cfg = self.shared.snapshot()
         try:
             self.open_radio(cfg)
@@ -683,14 +930,28 @@ class Acquirer(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class Computer(threading.Thread):
-    """
+    """Turns the Acquirer's raw IQ into published frames, off the DMA drain loop.
+
     Pulls the latest raw IQ from the Acquirer's ring buffer, computes the
-    spectrogram, and publishes the frame — all off the DMA drain loop so the
-    radio keeps draining while a frame is being computed. Paced to ~state.BROADCAST_FPS
-    so it doesn't compute frames the broadcaster would only drop.
+    spectrogram (rolling backends) or a full AHAWI capture, and publishes the
+    frame — all off the DMA drain loop so the radio keeps draining while a
+    frame is being computed. Paced to roughly `state.BROADCAST_FPS` so it
+    doesn't compute frames the broadcaster would only drop. Also owns
+    servicing the shared config's tier-2 validation probe, since it holds
+    striqt's thread-bound persistent window cache.
     """
 
     def __init__(self, acquirer: "Acquirer", shared: SharedConfig, insights=None):
+        """Initialize a Computer bound to an Acquirer and the shared config.
+
+        Args:
+            acquirer: The Acquirer instance to pull ring samples from and
+                report data-path verification completions to.
+            shared: The process-wide SharedConfig read for the current
+                config snapshot and used to service tier-2 probes.
+            insights: Optional insights collector updated with each capture's
+                raw samples and config, if provided.
+        """
         super().__init__(daemon=True)
         self.acquirer = acquirer
         self.shared   = shared
@@ -698,13 +959,24 @@ class Computer(threading.Thread):
         self._last_err_notice = 0.0
 
     def _ahawi_cycle(self, cfg):
-        """One AHAWI round: coherent chunk → analyze once → publish → pace.
+        """One AHAWI round: coherent chunk -> analyze once -> publish -> pace.
 
         Unlike the rolling path (recompute a short window per display tick),
-        this analyzes segments·duration of contiguous IQ in one striqt pass;
-        the CLIENT replays the segments. Publishing is paced to
-        AHAWI_REFRESH_S so replay isn't flooded; a config change breaks the
-        pacing hold early.
+        this pulls one phase-coherent `segments * duration` span from the
+        ring and analyzes it in a single striqt pass; the CLIENT replays the
+        segments one viewing window at a time. Waits (without consuming ring
+        state) if the ring generation changed mid-read or isn't yet full
+        enough — i.e. still catching up after startup/retune. On success,
+        publishing is paced to hold for `AHAWI_REFRESH_S` so replay isn't
+        flooded with new captures; a config change breaks the pacing hold
+        early so a new capture starts right away. On a compute error, reverts
+        to the last-good analysis config (or notifies) and backs off for a
+        full second rather than respinning an expensive full-capture compute
+        at display-tick rate.
+
+        Args:
+            cfg: Current RadioConfig snapshot (must have `cfg.ahawi` set and
+                `cfg.backend` in `AHAWI_BACKENDS` — checked by the caller).
         """
         plan = ahawi_plan(cfg)
         need = plan["need_samples"]
@@ -753,6 +1025,18 @@ class Computer(threading.Thread):
             time.sleep(0.05)
 
     def run(self):
+        """Thread entry point: compute and publish frames from ring samples.
+
+        Each iteration services any pending tier-2 validation probe, then
+        either runs one AHAWI cycle (`_ahawi_cycle`) or the rolling path:
+        wait for enough fresh ring samples (skipping frames that straddle a
+        retune, per `get_latest()`'s generation check), compute blocks via
+        `compute_blocks`, publish, and report the fresh frame as data-path
+        proof to the Acquirer's pending verification. A compute error
+        reverts to the last-good analysis config (or notifies) rather than
+        killing the loop — the viewer must never freeze. Paced to
+        `state.BROADCAST_FPS`, sleeping only when compute finished early.
+        """
         interval = 1.0 / max(state.BROADCAST_FPS, 1.0)
         next_t   = time.time()
         while not self.shared.stopped():
@@ -820,13 +1104,26 @@ class Computer(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class DemoAcquirer(threading.Thread):
-    """
-    Generates synthetic IQ data (Gaussian noise + CW tones) and feeds it
-    through the same compute_blocks path as the real Acquirer.
-    Exposes the same latest()/publish() interface.
+    """Acquirer + Computer combined, synthesizing IQ instead of reading hardware.
+
+    Generates synthetic IQ (Gaussian noise + CW tones, plus a periodic fake
+    burst) and feeds it through the same `compute_blocks`/AHAWI paths as the
+    real Acquirer/Computer pair, exposing the same `latest()`/`pause_and_
+    release()` interface so frontends and the broadcaster don't need to know
+    demo mode is active. The tones are fixed STATIONS at absolute RF: they
+    move across the band on retune (rather than staying at a fixed offset
+    from center), so tuning behavior is testable with no radio attached.
     """
 
     def __init__(self, shared: SharedConfig, insights=None):
+        """Initialize a DemoAcquirer bound to the shared config.
+
+        Args:
+            shared: The process-wide SharedConfig this thread reads config
+                snapshots from and reports analysis/notice feedback to.
+            insights: Optional insights collector updated with each
+                synthesized capture's samples and config, if provided.
+        """
         super().__init__(daemon=True)
         self.shared           = shared
         self.insights         = insights
@@ -847,16 +1144,31 @@ class DemoAcquirer(threading.Thread):
         self._rng             = np.random.default_rng(42)
 
     def pause_and_release(self, timeout=10.0):
+        """Ask the run loop to pause (mirrors Acquirer's handoff interface).
+
+        There is no real device to release in demo mode; this exists so
+        callers (recording, TX) can treat DemoAcquirer and Acquirer
+        interchangeably.
+
+        Args:
+            timeout: Seconds to wait for the loop to confirm it paused.
+
+        Returns:
+            bool: True if the loop paused within `timeout`, else False.
+        """
         self._pause_requested.set()
         return self._paused.wait(timeout)
 
     def resume(self):
+        """Clear the pause request so the run loop resumes synthesizing IQ."""
         self._pause_requested.clear()
 
     def is_paused(self):
+        """Return True once the run loop has confirmed it paused."""
         return self._paused.is_set()
 
     def latest(self):
+        """Return (header_dict, [block_array, ...]) of the most recent frame."""
         with self._lock:
             if self._latest_header is None:
                 return None, None
@@ -876,6 +1188,13 @@ class DemoAcquirer(threading.Thread):
             return dict(header), [b.copy() for b in self._latest_blocks]
 
     def _publish(self, cfg: RadioConfig, blocks: list, meta: dict):
+        """Store a freshly computed synthetic frame as the latest one.
+
+        Args:
+            cfg: RadioConfig the frame was computed under.
+            blocks: Per-channel computed arrays for this frame.
+            meta: Backend-specific metadata merged into the header.
+        """
         header = build_header(cfg, blocks, meta, demo=True)
         with self._lock:
             self._latest_header = header
@@ -886,7 +1205,17 @@ class DemoAcquirer(threading.Thread):
 
         Fixed STATIONS (tones at absolute RF, P3-2) plus the periodic DEMO_BURST
         — a fake SSB gated by the running sample counter, so its timing is
-        continuous across chunks regardless of chunk size.
+        continuous across chunks regardless of chunk size. Also injects any
+        active demo TX carrier (`TX.demo_injection()`) at the offset a real
+        receiver would see it.
+
+        Args:
+            cfg: Current RadioConfig (used for center frequency and sample
+                rate — tone offsets are computed relative to these).
+            n: Number of samples to synthesize per channel.
+
+        Returns:
+            np.ndarray: complex64 array shaped (channels, n).
         """
         fs  = float(cfg.sample_rate)
         # Resync to wall clock: the position a continuously-sampling radio
@@ -946,7 +1275,22 @@ class DemoAcquirer(threading.Thread):
     def _ahawi_cycle(self, cfg, pending_op):
         """Demo AHAWI round: synth one coherent chunk, analyze, publish, pace.
 
-        Returns the still-pending op (None once finished by this frame)."""
+        Mirrors `Computer._ahawi_cycle` but synthesizes the coherent span
+        instead of reading it from a ring, so it is always `coherent=True`
+        (nothing to drain from, nothing to gap). Finishes any pending
+        operation once the first capture under the new config publishes,
+        with an honest note that demo mode has no hardware readback.
+
+        Args:
+            cfg: Current RadioConfig snapshot (must have `cfg.ahawi` set and
+                `cfg.backend` in `AHAWI_BACKENDS` — checked by the caller).
+            pending_op: Operations-log id awaiting data-path confirmation,
+                or None.
+
+        Returns:
+            The still-pending op id, or None once finished by this frame
+            (or if there was none to begin with).
+        """
         plan = ahawi_plan(cfg)
         samples = self._synth_chunk(cfg, plan["need_samples"])
         try:
@@ -984,6 +1328,18 @@ class DemoAcquirer(threading.Thread):
         return pending_op
 
     def run(self):
+        """Thread entry point: synthesize IQ and publish frames until stopped.
+
+        Services pause requests (no device to release, just holds until
+        resumed) and pending config changes (demo retunes are instantaneous,
+        so the operation is staged and finished directly rather than going
+        through readback/rearm). Each cycle synthesizes one chunk via
+        `_synth_chunk` and runs either the AHAWI path (`_ahawi_cycle`) or the
+        rolling `compute_blocks` path, publishing the result and finishing
+        any pending operation as data-path proof. A compute error reverts to
+        the last-good analysis config (or notifies) rather than stopping the
+        loop. Paced to `state.BROADCAST_FPS`.
+        """
         last_err_notice = 0.0
         pending_op = None
         print("[demo] Synthetic IQ mode — no radio hardware used.")

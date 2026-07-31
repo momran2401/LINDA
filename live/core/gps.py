@@ -50,7 +50,16 @@ CAPTURE_FIELDS = (
 
 
 def _f(value):
-    """float() that maps missing/garbage to NaN instead of raising."""
+    """Coerce a value to float, mapping missing/non-finite input to NaN.
+
+    Args:
+        value: Any value; typically a gpsd JSON field that may be absent,
+            None, or a non-numeric type.
+
+    Returns:
+        `float(value)`, or `math.nan` if that raises or the result isn't
+        finite (inf/NaN in, NaN out).
+    """
     try:
         out = float(value)
     except (TypeError, ValueError):
@@ -59,7 +68,15 @@ def _f(value):
 
 
 def _parse_gps_time(value):
-    """gpsd ISO-8601 UTC timestamp -> unix seconds (NaN when absent)."""
+    """Parse a gpsd ISO-8601 UTC timestamp into Unix seconds.
+
+    Args:
+        value: The TPV message's "time" field, e.g. "2026-07-31T12:00:00.000Z".
+
+    Returns:
+        Seconds since the Unix epoch, or `math.nan` if `value` is absent,
+        empty, or not a valid ISO-8601 string.
+    """
     if not isinstance(value, str) or not value:
         return math.nan
     text = value.replace("Z", "+00:00")
@@ -80,6 +97,12 @@ class GpsReader(threading.Thread):
 
     def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT,
                  stale_after=DEFAULT_STALE_AFTER_S):
+        """Args:
+            host: gpsd host to connect to.
+            port: gpsd port to connect to.
+            stale_after: Seconds after which a held fix is reported as
+                "stale" rather than dropped outright.
+        """
         super().__init__(daemon=True, name="gps-reader")
         self.host = str(host)
         self.port = int(port)
@@ -99,9 +122,17 @@ class GpsReader(threading.Thread):
     # --- lifecycle ---
 
     def stop(self):
+        """Signal the background thread to exit at its next wait point."""
         self._stop.set()
 
     def run(self):
+        """Thread entry point: reconnect to gpsd forever with backoff.
+
+        Each dropped/failed `_session` is caught and recorded as `_error`
+        rather than propagated, then retried after an exponential backoff
+        (capped at 10 s, reset to 1 s on any successful session) until `stop`
+        is called.
+        """
         backoff = 1.0
         while not self._stop.is_set():
             try:
@@ -116,6 +147,13 @@ class GpsReader(threading.Thread):
             backoff = min(backoff * 2, 10.0)
 
     def _session(self):
+        """Open one gpsd connection, enable JSON watch mode, and consume
+        newline-delimited messages until the socket drops or `stop` fires.
+
+        Raises:
+            ConnectionError: gpsd closed the connection.
+            OSError: the connection could not be established or was lost.
+        """
         with socket.create_connection((self.host, self.port), timeout=5.0) as sock:
             sock.sendall(_WATCH)
             sock.settimeout(1.0)
@@ -140,6 +178,13 @@ class GpsReader(threading.Thread):
             self._connected = False
 
     def _consume(self, line):
+        """Parse one gpsd JSON line and fold it into the held state.
+
+        Args:
+            line: A single stripped line from the gpsd socket (one JSON
+                object per gpsd's protocol); blank or unparseable lines are
+                ignored.
+        """
         if not line:
             return
         try:
@@ -179,7 +224,17 @@ class GpsReader(threading.Thread):
     # --- reading ---
 
     def snapshot(self):
-        """Current GPS state. Pure data; safe to call from any thread."""
+        """Current GPS state, computed fresh from the last-held TPV/SKY data.
+
+        Pure data; safe to call from any thread without side effects.
+
+        Returns:
+            A dict with "connected", "device", "error", "mode", "valid",
+            "stale", "latitude", "longitude", "altitude_m", "time_unix",
+            "satellites_used", "error_horizontal_m", "error_vertical_m", and
+            "age_s". "valid" requires mode >= 2 (a 2-D or 3-D fix), a fresh
+            (non-stale) fix, and finite lat/lon.
+        """
         with self._lock:
             tpv, at = dict(self._tpv), self._tpv_at
             sats, device = self._sats, self._device
@@ -215,11 +270,16 @@ class GpsReader(threading.Thread):
         }
 
     def capture_fields(self):
-        """The per-capture variable dict striqt merges into each capture.
+        """Build the per-capture GPS variable dict striqt merges into a capture.
 
         Every value is a float so xarray/zarr store them without object
-        dtypes. Missing values are NaN — never zero, which would read as a
-        real position at 0°N 0°E.
+        dtypes. Missing or invalid values are NaN — never zero, which would
+        read as a real position at 0°N 0°E.
+
+        Returns:
+            A dict keyed by the names in `CAPTURE_FIELDS`, all float values.
+            `gps_altitude_m` is NaN unless the fix is valid AND 3-D (a 2-D
+            fix's altitude is meaningless). `gps_valid` is 1.0 or 0.0.
         """
         snap = self.snapshot()
         valid = snap["valid"]
@@ -228,7 +288,6 @@ class GpsReader(threading.Thread):
         return {
             "gps_latitude_deg":  float(snap["latitude"]) if valid else math.nan,
             "gps_longitude_deg": float(snap["longitude"]) if valid else math.nan,
-            # Altitude needs a 3-D fix; a 2-D fix's altitude is meaningless.
             "gps_altitude_m":    float(snap["altitude_m"]) if (valid and snap["mode"] >= 3) else math.nan,
             "gps_fix_mode":      float(snap["mode"]),
             "gps_satellites_used": float(sats) if sats is not None else math.nan,
@@ -241,7 +300,14 @@ class GpsReader(threading.Thread):
 
     @staticmethod
     def absent_fields():
-        """capture_fields() for a run with GPS disabled or unavailable."""
+        """The `capture_fields()` equivalent for a run with GPS disabled or
+        unavailable, so every archived Dataset carries the same variables
+        whether or not GPS was in play.
+
+        Returns:
+            A dict keyed by `CAPTURE_FIELDS`: all NaN except `gps_fix_mode`
+            and `gps_valid`, which are 0.0.
+        """
         fields = {name: math.nan for name in CAPTURE_FIELDS}
         fields["gps_fix_mode"] = 0.0
         fields["gps_valid"] = 0.0
@@ -257,13 +323,27 @@ _reader_lock = threading.Lock()
 
 
 def gps_enabled():
-    """False when RADIO_GPS=0/off/false disables the integration entirely."""
+    """Check whether the GPS integration is enabled.
+
+    Returns:
+        False when the `RADIO_GPS` environment variable is "0", "off",
+        "false", or "no" (case-insensitive); True otherwise (the default).
+    """
     return str(os.environ.get("RADIO_GPS", "1")).strip().lower() not in (
         "0", "off", "false", "no")
 
 
 def get_reader(start=True):
-    """The shared GpsReader, started on first use. None when disabled."""
+    """Get the process-wide GpsReader, creating and starting it on first use.
+
+    Args:
+        start: Whether to start the reader thread if this call creates it.
+            Set False in tests that only need the object, not the thread.
+
+    Returns:
+        The shared `GpsReader`, honoring `RADIO_GPS_HOST`/`RADIO_GPS_PORT`,
+        or None if GPS is disabled via `gps_enabled()`.
+    """
     global _reader
     if not gps_enabled():
         return None
@@ -279,7 +359,13 @@ def get_reader(start=True):
 
 
 def status():
-    """GPS status for /health and the Record tab."""
+    """Build the GPS status payload for `/health` and the Record tab.
+
+    Returns:
+        A dict matching `GpsReader.snapshot()` plus an "enabled" key; when
+        disabled, a minimal dict with "enabled": False and an explanatory
+        "error" instead (the reader is never started in that case).
+    """
     if not gps_enabled():
         return {"enabled": False, "connected": False, "valid": False,
                 "error": "disabled by RADIO_GPS"}
@@ -296,8 +382,12 @@ def status():
 def gps_peripherals_class():
     """Build the striqt Peripherals subclass that stamps captures with GPS.
 
-    Returns None when striqt is unavailable, so callers fall back to
-    NoPeripherals. Imported lazily: core/ must stay importable without striqt.
+    striqt is imported lazily here (rather than at module load) so that
+    `core/` stays importable on hosts without striqt installed.
+
+    Returns:
+        The `GpsPeripherals` class, or None when striqt is unavailable — in
+        which case callers should fall back to striqt's `NoPeripherals`.
     """
     try:
         from striqt.sensor.lib import peripherals as _peripherals
@@ -313,25 +403,42 @@ def gps_peripherals_class():
         """
 
         def open(self):
+            """Attach the process-wide GpsReader for the sweep's lifetime."""
             self._reader = get_reader()
 
         def close(self):
-            return   # the reader is process-wide; other users may still need it
+            """No-op: the reader is process-wide and other users (the
+            status endpoint, another sweep) may still need it, so this
+            method must not stop or tear it down.
+            """
+            return
 
         def setup(self, captures, loops):
+            """No-op: GPS needs no per-sweep setup beyond `open`."""
             return
 
         def arm(self, capture):
+            """No-op: GPS needs no per-capture arming."""
             return
 
         def acquire(self, capture):
+            """Return the GPS fields to merge into this capture's extra_data.
+
+            Args:
+                capture: The striqt capture being armed (unused; GPS fields
+                    are the same regardless of capture parameters).
+
+            Returns:
+                `GpsReader.capture_fields()` from the cached snapshot, or
+                `GpsReader.absent_fields()` if no reader is attached or
+                reading it raises — a recording must never die over metadata.
+            """
             reader = getattr(self, "_reader", None)
             if reader is None:
                 return GpsReader.absent_fields()
             try:
                 return reader.capture_fields()
             except Exception:
-                # A recording must never die over metadata.
                 return GpsReader.absent_fields()
 
     return GpsPeripherals

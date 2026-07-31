@@ -111,13 +111,30 @@ _STREAM_CONFLICT_MARKERS = ("trigger", "in use", "busy", "already", "resource")
 
 
 def _is_stream_conflict(exc):
+    """Tell a "someone else holds this resource" driver error from a bad request.
+
+    Args:
+        exc: The exception raised by a SoapySDR call.
+
+    Returns:
+        bool: True if the exception text matches `_STREAM_CONFLICT_MARKERS`,
+        meaning the arming ladder should escalate to the next rung rather than
+        fail outright.
+    """
     text = str(exc).lower()
     return any(marker in text for marker in _STREAM_CONFLICT_MARKERS)
 
 
 def _close_stream(dev, stream):
-    """Unkey and release a TX stream. Never raises: this runs on failure paths
-    where a stream left active would keep the PA keyed."""
+    """Unkey and release a TX stream.
+
+    Never raises: this runs on failure paths (including inside `finally`
+    blocks), where a stream left active would keep the PA keyed.
+
+    Args:
+        dev: Open SoapySDR device handle.
+        stream: The TX stream to deactivate and close, or None to no-op.
+    """
     if stream is None:
         return
     for action in (lambda: dev.deactivateStream(stream),
@@ -138,6 +155,21 @@ class Waveform:
     """
 
     def __init__(self, kind, sample_rate, params=None, seed=None):
+        """Build a generator for one waveform kind at a fixed sample rate.
+
+        Args:
+            kind: One of the keys in `TX_WAVEFORMS` (`cw`, `two_tone`,
+                `chirp`, `noise`).
+            sample_rate: Sample rate in Hz the generated IQ will be played at
+                (used to convert Hz offsets into cycles-per-sample).
+            params: Optional dict of waveform parameters (`amplitude`,
+                `offset_hz`, `spacing_hz`, `chirp_bandwidth_hz`,
+                `chirp_period_s`); unspecified keys take their defaults.
+            seed: Optional seed for the noise waveform's RNG.
+
+        Raises:
+            ValueError: If `kind` is not one of `TX_WAVEFORMS`.
+        """
         if kind not in TX_WAVEFORMS:
             raise ValueError(f"unknown waveform {kind!r} "
                              f"(known: {', '.join(sorted(TX_WAVEFORMS))})")
@@ -153,11 +185,30 @@ class Waveform:
         self._rng = np.random.default_rng(seed)
 
     def _tone(self, idx, amp, off_hz):
+        """A single complex tone evaluated at the given sample indices.
+
+        Args:
+            idx: Array of absolute sample indices (int64), used so phase
+                stays continuous across chunk boundaries.
+            amp: Linear amplitude of the tone.
+            off_hz: Tone offset from baseband, in Hz.
+
+        Returns:
+            np.ndarray: complex64 samples of the tone at `idx`.
+        """
         frac = np.mod(idx * (off_hz / self.fs), 1.0)
         return (amp * np.exp(2j * np.pi * frac)).astype(np.complex64)
 
     def next(self, n):
-        """The next `n` samples, complex64, scaled to |amplitude| full scale."""
+        """Generate the next `n` samples, continuing the phase from the last call.
+
+        Args:
+            n: Number of samples to generate.
+
+        Returns:
+            np.ndarray: `n` complex64 samples scaled to at most `|amplitude|`
+            of full scale.
+        """
         idx = self._idx + np.arange(n, dtype=np.int64)
         self._idx += n
         a = self.amplitude
@@ -193,6 +244,13 @@ class Waveform:
         return np.ascontiguousarray(out, dtype=np.complex64)
 
     def describe(self):
+        """Summarize this waveform's kind and parameters for status/UI display.
+
+        Returns:
+            dict: `kind`, `label`, `amplitude`, `offset_hz`, plus
+            waveform-specific keys (`spacing_hz` for two_tone;
+            `chirp_bandwidth_hz`/`chirp_period_s` for chirp).
+        """
         d = {"kind": self.kind, "label": TX_WAVEFORMS[self.kind],
              "amplitude": self.amplitude, "offset_hz": self.offset_hz}
         if self.kind == "two_tone":
@@ -203,7 +261,13 @@ class Waveform:
         return d
 
     def occupied_bandwidth_hz(self):
-        """Roughly what this waveform lights up, for the disclosure line."""
+        """Roughly what this waveform lights up, for the disclosure line.
+
+        Returns:
+            float: 0.0 for `cw` (a single tone); `spacing_hz` for
+            `two_tone`; `chirp_bandwidth_hz` for `chirp`; the full sample
+            rate for `noise` (unshaped, band-filling).
+        """
         if self.kind == "cw":
             return 0.0
         if self.kind == "two_tone":
@@ -218,7 +282,12 @@ class Waveform:
 # ---------------------------------------------------------------------------
 
 def tx_enabled():
-    """False when RADIO_TX=0/off/false disables transmit for this process."""
+    """Whether transmit is enabled for this process.
+
+    Returns:
+        bool: False when the `RADIO_TX` environment variable is set to
+        `0`/`off`/`false`/`no`/empty string; True otherwise (the default).
+    """
     return str(os.environ.get("RADIO_TX", "1")).strip().lower() not in (
         "0", "off", "false", "no", "")
 
@@ -228,6 +297,12 @@ def tx_enabled():
 # ---------------------------------------------------------------------------
 
 def _soapy():
+    """Import and return the SoapySDR module, or None if it is not installed.
+
+    Returns:
+        The `SoapySDR` module, or None on import failure (e.g. running tests
+        without the SoapySDR bindings present).
+    """
     try:
         import SoapySDR
         return SoapySDR
@@ -236,11 +311,17 @@ def _soapy():
 
 
 def _tx_dir():
+    """SoapySDR's TX direction constant, resolved defensively.
+
+    Returns:
+        The value of `SoapySDR.SOAPY_SDR_TX`, or `0` (its actual numeric
+        value) if the module cannot be imported.
+    """
     try:
         from SoapySDR import SOAPY_SDR_TX
         return SOAPY_SDR_TX
     except Exception:
-        return 0   # SoapySDR's TX direction constant
+        return 0
 
 
 def _cf32():
@@ -249,6 +330,9 @@ def _cf32():
     Resolved through a function so tests can drive the controller without the
     SoapySDR module installed. The fallback is not a guess: SOAPY_SDR_CF32 *is*
     the string "CF32" in the SoapySDR bindings.
+
+    Returns:
+        str: `SoapySDR.SOAPY_SDR_CF32` if importable, else the literal `"CF32"`.
     """
     try:
         from SoapySDR import SOAPY_SDR_CF32
@@ -269,7 +353,22 @@ _TX_FORMAT_PREFERENCE = ("CS16", "CF32")
 
 
 def _pick_tx_format(dev, d, ch):
-    """(format, full_scale, how_we_decided) for this radio's TX stream."""
+    """Ask the radio what wire format its TX stream wants, never assume.
+
+    Prefers CS16 (see `_TX_FORMAT_PREFERENCE`): on the AIR-T, requesting CF32
+    is a silent failure — `setupStream`/`activateStream` succeed but
+    `writeStream` then times out forever.
+
+    Args:
+        dev: Open SoapySDR device handle.
+        d: TX direction constant (from `_tx_dir()`).
+        ch: TX channel index.
+
+    Returns:
+        tuple: `(format, full_scale, how)` — the stream format string, the
+        full-scale value to encode against, and a short string describing
+        which driver call supplied the answer (or that it fell back).
+    """
     try:
         fmt, full_scale = dev.getNativeStreamFormat(d, ch)
         fmt = str(fmt)
@@ -289,11 +388,19 @@ def _pick_tx_format(dev, d, ch):
 
 
 def _encode_tx(buf, fmt, full_scale):
-    """complex64 → the wire format this radio wants. Returns (array, stride).
+    """Convert a complex64 waveform buffer to the wire format the radio wants.
 
-    `stride` is array elements per IQ sample, because writeStream counts
-    SAMPLES while a CS16 buffer is interleaved int16 — getting that wrong
-    transmits half a buffer of garbage.
+    Args:
+        buf: complex64 array of IQ samples.
+        fmt: Target wire format, `"CS16"` or anything else (treated as CF32,
+            i.e. passed through unchanged).
+        full_scale: Scale factor applied before quantizing to CS16.
+
+    Returns:
+        tuple: `(array, stride)`. `stride` is array elements per IQ sample,
+        because `writeStream` counts SAMPLES while a CS16 buffer is
+        interleaved int16 — getting that wrong transmits half a buffer of
+        garbage.
     """
     if fmt == "CS16":
         # complex64.view(float32) is already [I, Q, I, Q, …] — exactly the CS16
@@ -305,13 +412,21 @@ def _encode_tx(buf, fmt, full_scale):
 
 
 def _bounds(ranges):
-    """min/max across a SoapySDR range list, tolerating Range objects or pairs.
+    """Compute min/max across a SoapySDR range list, tolerating Range objects or pairs.
 
     Drivers are inconsistent here: getFrequencyRange returns a LIST of Range
     objects, getGainRange returns ONE Range, and some bindings hand back a bare
     (min, max) numeric pair. Treating that last shape as a list of two ranges
     silently yields no bounds at all — and a missing gain range means the UI
     cannot default the gain to the radio's quietest setting.
+
+    Args:
+        ranges: A single SoapySDR Range, a list of Range objects, a bare
+            `(min, max)` numeric pair, or a list of such pairs.
+
+    Returns:
+        tuple or None: `(min, max)` as floats spanning every range found, or
+        None if nothing usable could be extracted.
     """
     if (isinstance(ranges, (list, tuple)) and len(ranges) == 2
             and all(isinstance(v, (int, float)) for v in ranges)):
@@ -335,10 +450,14 @@ def _bounds(ranges):
 def probe_tx(device):
     """Ask an open SoapySDR device what its TX side can do.
 
-    Returns {"channels": int, "freq_min"/"freq_max"/"gain_min"/"gain_max"/
-    "rate_min"/"rate_max": float} — only the keys the driver answered.
-    `channels == 0` means this radio cannot transmit (an RTL-SDR, say), which
-    is the signal the whole feature hides itself behind.
+    Args:
+        device: Open SoapySDR device handle, or None.
+
+    Returns:
+        dict: `{"channels": int, "freq_min"/"freq_max"/"gain_min"/"gain_max"/
+        "rate_min"/"rate_max": float}` — only the keys the driver answered.
+        `channels == 0` means this radio cannot transmit (an RTL-SDR, say),
+        which is the signal the whole feature hides itself behind.
     """
     out = {"channels": 0}
     if device is None:
@@ -379,6 +498,10 @@ class TxController:
     """
 
     def __init__(self):
+        """Initialize an idle controller with no acquirer bound yet.
+
+        `bind()` must be called before `start()`/`capabilities()` are useful.
+        """
         self._lock = threading.Lock()
         self._acquirer = None
         self._is_demo = False
@@ -398,11 +521,26 @@ class TxController:
     # -- wiring ------------------------------------------------------------
 
     def bind(self, acquirer, demo=False):
-        """Called once by the frontend after the acquisition stack is built."""
+        """Wire this controller to the live acquisition stack.
+
+        Called once by the frontend after the acquisition stack is built.
+
+        Args:
+            acquirer: The `Acquirer` (or `DemoAcquirer`) whose `.source` this
+                controller will borrow the device handle from, and whose
+                `pause_and_release()`/`resume()` it uses to free the trigger.
+            demo: True when running against the demo acquirer, so transmit is
+                simulated rather than radiated.
+        """
         self._acquirer = acquirer
         self._is_demo = bool(demo)
 
     def _device(self):
+        """The live SoapySDR device handle borrowed from the acquirer's source.
+
+        Returns:
+            The open SoapySDR device, or None if no source is open.
+        """
         src = getattr(self._acquirer, "source", None)
         return get_device(src) if src is not None else None
 
@@ -421,11 +559,24 @@ class TxController:
         "arm TX" path having never been shown the notice, while the notice
         itself promises that every transmission is attributable to its
         operator. A short TTL means a returning operator sees it again.
+
+        Args:
+            subject: Identifier for who acknowledged (the role/username).
         """
         with self._lock:
             self._acknowledged[str(subject)] = time.monotonic()
 
     def is_acknowledged(self, subject):
+        """Whether `subject`'s legal-notice acknowledgment is still valid.
+
+        Args:
+            subject: Identifier for who would be transmitting.
+
+        Returns:
+            bool: True if `subject` acknowledged within the last `ACK_TTL_S`
+            seconds. A stale acknowledgment is dropped from the cache and
+            counts as not acknowledged.
+        """
         with self._lock:
             at = self._acknowledged.get(str(subject))
             if at is None:
@@ -442,6 +593,15 @@ class TxController:
 
         Cached: probing walks several driver calls and the answer cannot change
         without the source being reopened. `refresh=True` re-probes.
+
+        Args:
+            refresh: Force a re-probe instead of returning the cached result.
+
+        Returns:
+            dict: `{"available": bool, "reason": str or None, "simulated":
+            bool, "channels": int, "waveforms": dict, "envelope": dict,
+            "device": str}`. `reason` explains why `available` is False
+            (feature disabled, demo, receive-only, not open yet).
         """
         with self._lock:
             if self._caps_cache is not None and not refresh:
@@ -494,10 +654,25 @@ class TxController:
     # -- status ------------------------------------------------------------
 
     def active(self):
+        """Whether a transmission is in progress or winding down.
+
+        Returns:
+            bool: True while `_state` is `arming`, `transmitting`, or
+            `stopping`.
+        """
         with self._lock:
             return self._state in ("arming", "transmitting", "stopping")
 
     def status(self):
+        """Full status snapshot for the `/tx` endpoint and UI polling.
+
+        Returns:
+            dict: Lifecycle state, error (if any), the current op id, timing
+            (`started_at`/`elapsed_s`/`remaining_s`), sample/underflow
+            counters, the as-executed `plan` (once armed), and the
+            `capabilities()` result merged in as `available`/`reason`/
+            `simulated`/`capabilities`.
+        """
         caps = self.capabilities()
         with self._lock:
             plan = dict(self._plan) if self._plan else None
@@ -531,7 +706,14 @@ class TxController:
         Simulated transmit still has to SHOW something: the demo waterfall
         grows the transmitted tone at the right offset, so the whole feature —
         including "did I tune where I meant to" — is verifiable with no radio
-        and no radiation. Returns None when not transmitting.
+        and no radiation.
+
+        Returns:
+            tuple or None: `(offset_hz, amplitude)` to inject into the demo
+            synth, where `offset_hz` is relative to the receiver's current
+            center frequency. None when not transmitting, or when the active
+            waveform is not `cw`/`two_tone` (chirp/noise have no single
+            offset to place).
         """
         with self._lock:
             if self._state != "transmitting" or not self._plan:
@@ -552,6 +734,26 @@ class TxController:
         Frequency is REJECTED rather than clamped when it falls outside the
         radio's range. Silently transmitting somewhere other than where the
         operator asked is the one failure mode this feature cannot have.
+
+        Args:
+            payload: The raw JSON request dict (`waveform`, `frequency_hz`,
+                `gain_db`, `amplitude`, `duration_s`, `channel`, `offset_hz`,
+                waveform-specific params, `sample_rate_hz`).
+            caps: The `capabilities()` dict, used for the radio's envelope
+                (frequency/gain ranges, channel count).
+
+        Returns:
+            dict: The executable plan — `waveform`, `frequency_hz`,
+            `gain_db`, `sample_rate_hz`, `channel`, `duration_s` (None means
+            "until Stop"), `params`.
+
+        Raises:
+            ValueError: If the payload is not a dict, names an unknown
+                waveform, is missing/has an invalid `frequency_hz`, requests
+                a frequency or gain outside the radio's range, an amplitude
+                outside `(0, 1]`, a non-positive `duration_s`, a
+                non-positive `chirp_period_s`, a channel that does not
+                exist, or a non-positive `sample_rate_hz`.
         """
         if not isinstance(payload, dict):
             raise ValueError("TX request must be a JSON object")
@@ -634,7 +836,26 @@ class TxController:
                 "duration_s": duration, "params": params}
 
     def start(self, payload, requested_by="admin"):
-        """Validate, tune, and begin transmitting. Returns the status dict."""
+        """Validate, tune, and begin transmitting on a dedicated writer thread.
+
+        Args:
+            payload: The raw TX request dict, passed to `_validate()`.
+            requested_by: Identifier for the operator, used for the legal
+                acknowledgment check and recorded in the op log summary.
+
+        Returns:
+            dict: The status snapshot (see `status()`), taken right after
+            the writer thread is started (so it will typically show
+            `state: "arming"`).
+
+        Raises:
+            RuntimeError: If transmit is not available (see `capabilities()`
+                reason), or a transmission is already in progress.
+            PermissionError: If `requested_by` has not acknowledged the
+                legal notice within `ACK_TTL_S`.
+            ValueError: Propagated from `_validate()` for a malformed or
+                out-of-range request.
+        """
         caps = self.capabilities(refresh=True)
         if not caps["available"]:
             raise RuntimeError(caps["reason"] or "transmit is not available")
@@ -675,6 +896,22 @@ class TxController:
         return self.status()
 
     def stop(self, reason="stopped by operator", timeout=5.0):
+        """Request the transmission stop and wait (briefly) for it to finish.
+
+        Idempotent and safe to call from any thread, including from within
+        the writer thread itself (e.g. `shutdown()` called during recovery).
+
+        Args:
+            reason: Human-readable reason recorded in the op log and
+                surfaced via `_stop_reason` — attributes an otherwise
+                unexplainable cancellation (e.g. Acquirer recovery calling
+                `shutdown()` mid-arm).
+            timeout: Seconds to join the writer thread before returning
+                regardless of whether it has finished.
+
+        Returns:
+            dict: The status snapshot after signaling stop (see `status()`).
+        """
         # NOTHING that re-enters this object may run under _lock: it is a plain
         # (non-reentrant) Lock, and status() takes it too. Stopping an already
         # idle transmitter used to call status() from inside the critical
@@ -699,13 +936,27 @@ class TxController:
         return self.status()
 
     def shutdown(self, reason="the radio is being released or shut down"):
-        """Stop unconditionally — process exit, reset-radio, source teardown."""
+        """Stop unconditionally — process exit, reset-radio, source teardown.
+
+        Args:
+            reason: Human-readable reason recorded in the op log if a
+                transmission was in fact active.
+        """
         if self.active():
             self.stop(reason)
 
     # -- writer thread -----------------------------------------------------
 
     def _finish(self, op_id, verdict, detail):
+        """Return the controller to idle and close out the operation log entry.
+
+        Args:
+            op_id: The operation id returned by `OPERATIONS.begin()`.
+            verdict: One of the OPERATIONS verdicts (`success`, `verified`,
+                `unverified`, `mismatch`, `failed`).
+            detail: Human-readable detail string for the log; also stored as
+                `self._error` when `verdict == "failed"`.
+        """
         with self._lock:
             self._state = "idle"
             self._started_at = None
@@ -714,6 +965,17 @@ class TxController:
         OPERATIONS.finish(op_id, verdict, detail)
 
     def _run(self, plan, wave, op_id):
+        """Writer-thread entry point: dispatch to simulated or hardware TX.
+
+        Any exception escaping `_run_hardware` is caught here so a driver
+        failure always ends the operation with a `failed` verdict rather than
+        leaving the controller stuck in `transmitting`/`arming`.
+
+        Args:
+            plan: The validated plan from `_validate()`.
+            wave: The `Waveform` generator built from the plan.
+            op_id: The operation id for this transmission.
+        """
         if self._is_demo:
             self._run_simulated(plan, op_id)
             return
@@ -723,6 +985,12 @@ class TxController:
             self._finish(op_id, "failed", f"transmit failed: {exc}")
 
     def _run_simulated(self, plan, op_id):
+        """Demo-mode "transmission": advance a fake sample counter, radiate nothing.
+
+        Args:
+            plan: The validated plan from `_validate()`.
+            op_id: The operation id for this transmission.
+        """
         OPERATIONS.stage(op_id, "applying",
                          "demo device — nothing is radiated; the transmitted "
                          "tone is injected into the synthetic IQ so the whole "
@@ -748,6 +1016,22 @@ class TxController:
                      f"{time.time() - started:.1f} s (nothing radiated)")
 
     def _run_hardware(self, plan, wave, op_id):
+        """Arm the transmitter, pump samples, and tear down — the real-radio path.
+
+        Runs on the writer thread. Arms via `_arm_with_escalation()` (which
+        may pause and release the live RX stream), regenerates the waveform
+        if the driver snapped the sample rate, activates the stream, pumps
+        samples with `_pump()` until it stops for any reason, computes a duty
+        cycle and verdict, and always deactivates/closes the TX stream and
+        restores RX in a `finally` block — even on failure, since a TX stream
+        left active keeps the PA keyed.
+
+        Args:
+            plan: The validated plan from `_validate()`.
+            wave: The `Waveform` generator built from the plan (may be
+                replaced with one built against the driver's actual rate).
+            op_id: The operation id for this transmission.
+        """
         SoapySDR = _soapy()
         if SoapySDR is None:
             self._finish(op_id, "failed", "SoapySDR is not importable")
@@ -832,12 +1116,16 @@ class TxController:
     _RX_RUNGS = (TX_COEXIST, TX_RX_RELEASED)
 
     def _source(self):
+        """The acquirer's current source object, or None if none is open.
+
+        Returns:
+            The live acquisition source, used by `_enter_rung`/`_abandon_rung`
+            to pause/resume it.
+        """
         return getattr(self._acquirer, "source", None)
 
     def _arm_with_escalation(self, dev, d, ch, plan, op_id):
         """Free the trigger, program the TX chain, and open its stream.
-
-        Returns (stream, actual, mismatched, rx_mode).
 
         On the AIR-T the FPGA trigger gates the TUNING CALLS as well as
         `setupStream`. Both failures were observed on real hardware, in this
@@ -854,6 +1142,24 @@ class TxController:
         Computer happened to have the RX stream disabled at that instant. That
         race is the whole reason the ladder retries the ENTIRE tune + setup
         sequence at each rung instead of just the stream call.
+
+        Args:
+            dev: Open SoapySDR device handle.
+            d: TX direction constant.
+            ch: TX channel index.
+            plan: The validated plan from `_validate()`.
+            op_id: The operation id, for staging log entries per rung.
+
+        Returns:
+            tuple: `(stream, actual, mismatched, rx_mode, fmt, full_scale)` —
+            the open TX stream, the driver's readback of what it actually
+            tuned to, the list of plan keys the readback disagreed with,
+            which rung of `_RX_RUNGS` succeeded, the wire format chosen by
+            `_setup_tx_stream`, and its full-scale value.
+
+        Raises:
+            Exception: Whatever the last rung's failure was, if even the
+                final (most invasive) rung could not arm the transmitter.
         """
         last = None
         for index, rung in enumerate(self._RX_RUNGS):
@@ -887,7 +1193,18 @@ class TxController:
         raise last or RuntimeError("could not arm the transmitter")
 
     def _enter_rung(self, rung, op_id):
-        """Free as much of the trigger as this rung calls for."""
+        """Free as much of the trigger as this rung calls for.
+
+        Args:
+            rung: One of `_RX_RUNGS` (`TX_COEXIST` or `TX_RX_RELEASED`).
+            op_id: The operation id, for staging a log entry when the RX
+                stream must be paused.
+
+        Raises:
+            RuntimeError: If a stop was requested while climbing the ladder,
+                or if `acquirer.pause_and_release()` does not free the radio
+                within its timeout.
+        """
         if rung == TX_COEXIST:
             return
         if self._stop_evt.is_set():
@@ -911,7 +1228,13 @@ class TxController:
                 "the transmitter cannot be armed (this radio has one trigger)")
 
     def _abandon_rung(self, rung, op_id):
-        """Undo whatever _enter_rung took, so the next rung starts clean."""
+        """Undo whatever _enter_rung took, so the next rung starts clean.
+
+        Args:
+            rung: The rung that was entered and is now being abandoned.
+            op_id: The operation id (unused directly here, kept for symmetry
+                with `_enter_rung`).
+        """
         try:
             if rung == TX_RX_RELEASED:
                 self._acquirer.resume()
@@ -928,6 +1251,20 @@ class TxController:
         "Trigger in use, can't change ..." for nothing. Since the TX rate
         defaults to the live RX rate, the common case now touches the rate not
         at all.
+
+        Args:
+            dev: Open SoapySDR device handle.
+            d: TX direction constant.
+            ch: TX channel index.
+            plan: The validated plan from `_validate()`.
+            op_id: The operation id, for staging the applying/readback log
+                entries.
+
+        Returns:
+            tuple: `(actual, mismatched)` — the driver's readback of
+            `sample_rate_hz`/`frequency_hz`/`gain_db` (None for any getter
+            that failed), and the list of keys (excluding `gain_db`) whose
+            readback disagreed with the plan by more than its tolerance.
         """
         OPERATIONS.stage(op_id, "applying",
                          f"tuning TX{ch}: {plan['frequency_hz']/1e6:.6g} MHz, "
@@ -992,10 +1329,18 @@ class TxController:
     def _setup_tx_stream(self, dev, d, ch):
         """Open the TX stream in the format the RADIO wants.
 
-        Returns (stream, format, full_scale, how). Deepwave's own TX example
-        passes tx_buffer_size; drivers that do not know the key ignore it, and
-        the no-args form is retried for bindings whose setupStream takes no
-        kwargs at all.
+        Deepwave's own TX example passes tx_buffer_size; drivers that do not
+        know the key ignore it, and the no-args form is retried for bindings
+        whose setupStream takes no kwargs at all.
+
+        Args:
+            dev: Open SoapySDR device handle.
+            d: TX direction constant.
+            ch: TX channel index.
+
+        Returns:
+            tuple: `(stream, format, full_scale, how)` from `_pick_tx_format`
+            plus the opened stream.
         """
         fmt, full_scale, how = _pick_tx_format(dev, d, ch)
         try:
@@ -1006,7 +1351,13 @@ class TxController:
         return stream, fmt, full_scale, how
 
     def _restore_rx(self, rx_mode, op_id):
-        """Give the live view back. Only rung 2 actually took it away."""
+        """Give the live view back. Only rung 2 actually took it away.
+
+        Args:
+            rx_mode: The rung that was used to arm (`TX_COEXIST` or
+                `TX_RX_RELEASED`); a no-op unless it is `TX_RX_RELEASED`.
+            op_id: The operation id, for staging the resume-live log entry.
+        """
         if rx_mode != TX_RX_RELEASED:
             return
         try:
@@ -1022,9 +1373,37 @@ class TxController:
               fmt="CF32", full_scale=1.0):
         """Feed the TX stream until stop, duration, or the device disappears.
 
-        Returns a short reason for WHY it returned. A transmission that reports
-        "0 samples" is otherwise unexplainable from the log, and guessing at it
-        after the fact wastes a trip to the radio.
+        Carries one encoded buffer across `writeStream` timeouts and
+        re-offers exactly the unwritten remainder, rather than dropping it
+        and generating a fresh chunk — a timeout means the DAC's queue is
+        full, not that the samples were unwanted, and the naive approach
+        silently jumps the waveform's phase by a whole chunk on every
+        timeout (measured on hardware as a 20% duty cycle gappy burst train).
+
+        Args:
+            dev: Open SoapySDR device handle.
+            stream: The open TX stream to write into.
+            wave: The `Waveform` generator supplying chunks.
+            plan: The validated plan (for `duration_s`).
+            chunk: Samples per `writeStream` call (the stream MTU, or
+                `DEFAULT_CHUNK`).
+            op_id: The operation id, for staging stop/abort log entries.
+            fmt: Wire format to encode into (from `_pick_tx_format`).
+            full_scale: Full-scale value to encode against.
+
+        Returns:
+            str: A short reason for WHY the pump returned — one of
+            `"stopped before the first write"`, `"duration elapsed"`,
+            `"radio was reopened underneath the transmission"`, or
+            `"stopped by request"`. A transmission that reports "0 samples"
+            is otherwise unexplainable from the log, and guessing at it
+            after the fact wastes a trip to the radio.
+
+        Raises:
+            RuntimeError: If `writeStream` itself raises, returns an
+                unrecognized negative code, or the stream accepts no samples
+                for more than 5 seconds (the AIR-T's silent-CF32-failure
+                signature).
         """
         try:
             from SoapySDR import SOAPY_SDR_TIMEOUT

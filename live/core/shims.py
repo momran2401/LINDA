@@ -1,8 +1,33 @@
-"""striqt hardware accessor shims.
+"""Accessors and mode-switching helpers for the live striqt source object.
 
-getattr-based accessors that work against the installed striqt build, whose
-method/attribute names may differ from the vendored source tree. Extracted
-verbatim from striqt_web_server.py.
+Two responsibilities:
+
+* getattr-based accessors (``get_device``, ``get_rx_stream``,
+  ``enable_stream``, ``stream_buffers_for``, etc.) that reach into a striqt
+  source's semi-private attributes without hardcoding one naming convention.
+  The installed striqt build (pinned v0.7.0) can expose different
+  attribute/method names than the newer API of the `striqt/` tree vendored in
+  this repo, so these shims probe several candidate names — the same
+  defensive pattern used in `live/legacy/striqt_server_TCP.py`. Extracted
+  verbatim from `striqt_web_server.py`.
+* :func:`finite_capture_mode`, the context manager that lets a recording
+  sweep run safely on the SAME source object the live viewer already has open
+  in ``gapless=True`` mode. The live view opens gapless because striqt treats
+  any receive overflow there as fatal and forbids retries; a recording sweep
+  analyzes and archives data *between* captures, so the stream is guaranteed
+  to overflow in those gaps by construction. Inside the context, the source's
+  spec is swapped to ``gapless=False, receive_retries=...`` (and optionally a
+  different ``array_backend``) so striqt tolerates the expected
+  between-capture overflow; the live spec is restored on exit, including when
+  the sweep raises.
+
+Everything from ``REQUIRED_SOURCE_API`` onward targets the INSTALLED striqt
+API (``arm_spec``/``_read_stream``/``setup_spec``) rather than the vendored
+tree's renamed equivalents (see `INSTALLED_STRIQT_API.txt`), and fails loudly
+(``missing_source_api``, explicit ``RuntimeError``s) on an unexpected API
+rather than silently no-opping — a ``hasattr()`` guard around a method that
+only exists upstream was previously how a recording-overflow bug went
+unnoticed.
 """
 from __future__ import annotations
 
@@ -29,6 +54,10 @@ def seal_open_fds_for_exec():
     unchanged.  The helper is intentionally device-agnostic: server sockets,
     USB/IIO handles, and future SDR backends must not leak into child tools
     either.
+
+    Returns:
+        None. Silently skips descriptors it fails to read or set (races with
+        another thread closing the same fd are expected and harmless).
     """
     fd_dir = "/proc/self/fd"
     try:
@@ -46,15 +75,54 @@ def seal_open_fds_for_exec():
             pass
 
 def get_device(source):
+    """Return the underlying SoapySDR device object for a striqt source.
+
+    Args:
+        source: An open striqt source object.
+
+    Returns:
+        The device object (checking ``_device`` then ``device``), or None if
+        neither attribute is set.
+    """
     return getattr(source, "_device", getattr(source, "device", None))
 
 def get_rx_stream(source):
+    """Return the striqt RX stream wrapper for a source.
+
+    Args:
+        source: An open striqt source object.
+
+    Returns:
+        The RX stream object (checking ``_rx_stream`` then ``rx_stream``), or
+        None if neither attribute is set.
+    """
     return getattr(source, "_rx_stream", getattr(source, "rx_stream", None))
 
 def get_stream_ports(source):
+    """Return the RX port order the source's stream was set up with.
+
+    Args:
+        source: An open striqt source object.
+
+    Returns:
+        tuple: The stream's ``ports`` attribute, or ``state.CHANNELS`` if the
+        stream has none (e.g. not yet opened).
+    """
     return tuple(getattr(get_rx_stream(source), "ports", state.CHANNELS))
 
 def get_stream_mtu(source):
+    """Return the RX stream's MTU (max samples returned per read call).
+
+    Tries several attribute names on the stream wrapper first, then falls
+    back to asking the device directly (``getStreamMTU``/``get_stream_mtu``).
+
+    Args:
+        source: An open striqt source object.
+
+    Returns:
+        int or None: The MTU in samples, or None if it could not be
+        determined by any of the above.
+    """
     rx = get_rx_stream(source)
     if rx is None:
         return None
@@ -78,6 +146,14 @@ def get_stream_mtu(source):
     return None
 
 def open_stream(source):
+    """Open `source`'s RX stream if it is not already open, then seal fds.
+
+    Args:
+        source: An open striqt source object.
+
+    Raises:
+        RuntimeError: If `source` has no RX stream/device to open.
+    """
     rx  = get_rx_stream(source)
     dev = get_device(source)
     if rx is None or dev is None:
@@ -87,6 +163,25 @@ def open_stream(source):
     seal_open_fds_for_exec()
 
 def enable_stream(source, enabled):
+    """Activate or deactivate `source`'s RX stream.
+
+    Prefers striqt's own ``RxStream.enable()`` wrapper, which — besides
+    calling into SoapySDR — maintains ``RxStream._enabled``; bypassing it
+    left that flag false after activation and caused later arm/recovery
+    transitions to issue duplicate activate/deactivate calls (a failed
+    duplicate activation reports XDMA EBUSY on SoapyAIRT). Falls back to the
+    raw ``activateStream``/``deactivateStream`` device calls, retrying
+    no-args if the 3-arg form raises ``TypeError``, when the wrapper is
+    unavailable.
+
+    Args:
+        source: An open striqt source object.
+        enabled: True to activate the stream, False to deactivate it.
+
+    Raises:
+        Exception: The last driver error encountered, if every enable/disable
+            path failed. No-ops (returns) if the source has no stream/device.
+    """
     rx     = get_rx_stream(source)
     if rx is None:
         return
@@ -129,6 +224,15 @@ def enable_stream(source, enabled):
         raise last_error
 
 def close_source(source):
+    """Best-effort full teardown of a striqt source.
+
+    Deactivates the RX stream, closes the RX stream, then closes the source
+    itself, ignoring any exception from each step so a failure at one stage
+    does not block the remaining teardown steps.
+
+    Args:
+        source: An open striqt source object.
+    """
     for action in [lambda: enable_stream(source, False),
                    lambda: _close_rx_stream(source),
                    lambda: source.close()]:
@@ -138,6 +242,7 @@ def close_source(source):
             pass
 
 def _close_rx_stream(source):
+    """Close `source`'s RX stream via the striqt stream wrapper, if open."""
     rx = get_rx_stream(source)
     if rx is not None:
         dev = get_device(source)
@@ -145,6 +250,21 @@ def _close_rx_stream(source):
             rx.close(dev)
 
 def stream_buffers_for(source, samples):
+    """Reorder a per-channel sample array into the stream's own port order.
+
+    `samples` is indexed by ``state.CHANNELS`` order; SoapySDR's
+    ``readStream`` expects buffers in the stream's own port order, which can
+    differ.
+
+    Args:
+        source: An open striqt source object.
+        samples: Per-channel sample array indexed in ``state.CHANNELS`` order.
+
+    Returns:
+        tuple: ``(buffers, ports)`` where `buffers` is a list of float32
+        views into `samples`, one per stream port, and `ports` is the
+        stream's port tuple.
+    """
     rx    = get_rx_stream(source)
     ports = tuple(getattr(rx, "ports", state.CHANNELS))
     return [samples[state.CHANNELS.index(p)].view(np.float32) for p in ports], ports
@@ -167,18 +287,33 @@ REQUIRED_SOURCE_API = ("arm_spec", "_read_stream", "setup_spec")
 
 
 def missing_source_api(source):
-    """Names in REQUIRED_SOURCE_API that `source` does not provide.
+    """Find which names in REQUIRED_SOURCE_API `source` does not provide.
 
     A non-empty result means the installed striqt is not the API live/core is
     written against; the caller should say so plainly instead of waiting for a
     downstream AttributeError.
+
+    Args:
+        source: An open striqt source object.
+
+    Returns:
+        tuple: Names from ``REQUIRED_SOURCE_API`` that are missing or None on
+        `source`. Empty if the source provides all of them.
     """
     return tuple(name for name in REQUIRED_SOURCE_API
                  if getattr(source, name, None) is None)
 
 
 def get_setup_spec(source):
-    """The immutable source spec this source was opened with (None if absent)."""
+    """Return the immutable source spec `source` was opened with.
+
+    Args:
+        source: An open striqt source object.
+
+    Returns:
+        The spec object (checking ``__setup__``, then ``setup_spec``, then
+        ``spec``), or None if none of those attributes are set.
+    """
     for name in ("__setup__", "setup_spec", "spec"):
         spec = getattr(source, name, None)
         if spec is not None:
@@ -192,6 +327,15 @@ def _set_setup_spec(source, spec):
     `setup_spec` is a functools.cached_property over `__setup__`, so the
     backing attribute and the instance cache have to move together: striqt
     re-reads `setup_spec` on every read_iq / arm_spec / overlap calculation.
+
+    Args:
+        source: An open striqt source object.
+        spec: The spec to install as `source`'s active setup spec.
+
+    Raises:
+        RuntimeError: If, after the assignment, `source.setup_spec` is not
+            `spec` — meaning the installed striqt doesn't expose
+            `setup_spec` the way live/core expects.
     """
     source.__setup__ = spec
     source.__dict__["setup_spec"] = spec
@@ -203,7 +347,14 @@ def _set_setup_spec(source, spec):
 
 
 def _spec_registry():
-    """striqt's spec → source map, used to resolve source IDs for sink paths."""
+    """Look up striqt's spec-to-source map, used to resolve source IDs for sink paths.
+
+    Returns:
+        tuple: ``(registry, mapper)`` — the dict-like spec→source registry
+        and its optional setter function, both from
+        ``striqt.sensor.lib.sources.base``; ``(None, None)`` if that module
+        isn't importable.
+    """
     try:
         from striqt.sensor.lib.sources import base as _base
     except Exception:
@@ -212,11 +363,19 @@ def _spec_registry():
 
 
 def _register_source_spec(source, spec):
-    """Make `spec` resolve to `source` in striqt's registry.
+    """Make `spec` resolve to `source` in striqt's spec→source registry.
 
     Sink path formatting looks the sweep's source spec up by identity to get a
     radio ID; a spec striqt has never seen blocks for the lookup timeout and
     then raises. Any spec handed to a sweep must be registered first.
+
+    Args:
+        source: The striqt source object `spec` should resolve to.
+        spec: The spec to register.
+
+    Returns:
+        bool: True if the registry was found and updated, False if striqt's
+        registry module was not importable.
     """
     registry, mapper = _spec_registry()
     if registry is None:
@@ -229,6 +388,7 @@ def _register_source_spec(source, spec):
 
 
 def _unregister_source_spec(spec):
+    """Remove `spec`'s entry from striqt's spec→source registry, if present."""
     registry, _ = _spec_registry()
     if registry is not None:
         registry.pop(spec, None)
@@ -254,7 +414,19 @@ def finite_capture_mode(source, *, receive_retries=2, array_backend=None):
     capture). The live spec is restored on exit, before the viewer resumes,
     including when the sweep raises.
 
-    Yields the spec now in force (the live one when nothing needed changing).
+    Args:
+        source: The live striqt source object (already open, gapless).
+        receive_retries: Retry count to set when swapping off gapless mode.
+        array_backend: Optional array module name (e.g. ``"cupy"``) to force
+            for the sweep, if different from the live spec's.
+
+    Yields:
+        The spec now in force on `source` — the live one unchanged if neither
+        gapless nor array_backend needed to change, otherwise the replaced
+        (finite-capture) spec.
+
+    Raises:
+        RuntimeError: If `source` exposes no setup spec at all.
     """
     live = get_setup_spec(source)
     if live is None:
@@ -289,12 +461,21 @@ def finite_capture_mode(source, *, receive_retries=2, array_backend=None):
 
 
 def query_device_envelope(source):
-    """
-    Ask the open SoapySDR device for its real capability ranges (P3-3).
-    Returns a partial envelope dict — only the keys the device answered — to
-    be merged over the profile fallback by SharedConfig.set_envelope. Every
-    step is defensive: a missing method, failed call, or odd range-object
-    shape just drops that key (the fallback bound stays in force).
+    """Ask the open SoapySDR device for its real frequency/gain/rate ranges (P3-3).
+
+    Every step is defensive: a missing method, a failed call, or an
+    unexpected range-object shape just drops that one key, leaving the
+    profile fallback bound in force for it.
+
+    Args:
+        source: An open striqt source object.
+
+    Returns:
+        dict: A partial envelope — only the keys the device actually
+        answered (``freq_min``/``freq_max``, ``gain_min``/``gain_max``,
+        ``rate_min``/``rate_max``) — meant to be merged over the profile
+        fallback by ``SharedConfig.set_envelope``. Empty if the source has no
+        device.
     """
     dev = get_device(source)
     if dev is None:
