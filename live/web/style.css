@@ -705,47 +705,33 @@ body.light-theme ::-webkit-scrollbar-thumb:hover { background: #aab6c7; }
 }
 
 /* ══ PHONES ═══════════════════════════════════════════════════════════════
-   Everything below is inside a media query on purpose: the desktop layout is
+   Everything here is inside a media query on purpose: the desktop layout is
    the product and must not shift by a pixel to make a phone work.
 
-   THE BUG THIS FIXES. On desktop the app is a fixed app-shell — #dashboard
-   is a flex column inside a viewport-height grid row, so `flex: 1.6 1 0` and
+   THE BUG THIS FIXES. On desktop the app is a fixed app-shell — #dashboard is
+   a flex column inside a viewport-height grid row, so `flex: 1.6 1 0` and
    `flex: 1.05 1 0` divide a KNOWN height between the waterfalls and the PSD.
-   The 720px rule above switches the body to `overflow-y: auto`, which makes
-   #dashboard content-height instead. A flex-basis of 0 in a container whose
-   height comes from its content resolves to nothing, and the canvases inside
-   are height:100% of nothing — so both graph rows collapsed. Measured on a
-   375px viewport before this block: waterfall pane 2px tall, PSD row 8px.
-   That is the whole "you can't see the graphs on mobile" report: not a
-   scaling problem, a collapsed-flex problem.
+   Once the page scrolls, #dashboard becomes content-height, a flex-basis of 0
+   resolves to nothing, and the canvases inside are height:100% of nothing —
+   both graph rows collapsed (measured: 2px waterfall pane, 8px PSD row).
 
-   The fix is to stop pretending the page is an app-shell once it scrolls.
-   Each graph becomes a card with a REAL height and the page scrolls through
-   them, which is also the right interaction on a phone. */
-/* Matched on SIZE only, deliberately — no `pointer: coarse`. The condition a
-   layout actually cares about is how much room it has, not what is pointing
-   at it; a 700px desktop window has the identical problem and the existing
-   720px block above already treats it as a small screen, so keying off the
-   same width keeps the two consistent. It is also the only version that can
-   be tested: `pointer: coarse` is not emulated by viewport resizing, so a
-   rule gated on it cannot be verified before it ships.
+   So phones stop pretending to be an app-shell. Every graph is a card with a
+   REAL PIXEL height (not a vh fraction, which just re-introduces a dependency
+   on a viewport that varies by 200px across phones), the two spectrograms sit
+   SIDE BY SIDE, the band monitor moves up under them, and the whole UI lands
+   in ~1.3 screens. Big enough to prove a graph is live; not big enough to
+   measure off — tap any graph header (⤢) for the full-screen look at one.
 
-   The second clause catches a phone held SIDEWAYS. 812x375 is wider than any
-   width breakpoint, so it used to fall through to the desktop app-shell and
-   squeeze the waterfall into 49px. The 950px companion bound keeps a normal
-   desktop window out of it — one both under 950px wide AND under 560px tall
-   is not a desktop layout anyone is using on purpose. */
+   Matched on SIZE only, never `pointer: coarse`: that cannot be emulated by
+   viewport resizing, so a rule gated on it ships unverified. The max-height
+   clause catches a phone held SIDEWAYS (812x375 is wider than any width
+   breakpoint and used to fall through to the desktop shell). Its 950px
+   companion bound keeps a real desktop window out.
+   ═════════════════════════════════════════════════════════════════════════ */
 @media (max-width: 720px),
        (max-height: 560px) and (max-width: 950px) {
-    /* Let the document GROW. `html, body { height: 100% }` plus body's
-       `height: 100dvh` pins the body to exactly one screen, so the `main`
-       row got whatever was left over — 246px — while the dashboard inside it
-       held ~950px of graph cards and simply painted OUT of its row, straight
-       over the footer. Everything below only works once the page is allowed
-       to be taller than the screen.
-       Also: graphs BEFORE controls. On a phone the first thing on screen
-       after the header should be the signal, not three screens of knobs you
-       have to scroll past to find out whether the radio is even running. */
+
+    /* ── Let the document grow, single column, graphs before controls ───── */
     html, body { height: auto; }
     body {
         min-height: 100dvh;
@@ -754,129 +740,209 @@ body.light-theme ::-webkit-scrollbar-thumb:hover { background: #aab6c7; }
            matches a LANDSCAPE phone at 812px wide, where the 720px block
            above does not run — and without it the body kept its two-column
            `var(--rail-w) minmax(0,1fr)` track list, so every named area sat
-           in the 288px rail column and the dashboard was a third of the
-           screen wide. */
+           in the 288px rail column and the dashboard was a third as wide. */
         grid-template-columns: 1fr;
         grid-template-rows: auto auto auto auto;
         grid-template-areas: "header" "main" "rail" "footer";
     }
-    #app-header { flex-wrap: wrap; }
-    #applied-settings {
-        order: 5; width: 100%;
-        border-left: none; padding-left: 0; margin-left: 0;
-    }
-    #dashboard { overflow: visible; }
+    #dashboard { overflow: visible; padding: 8px; gap: 8px; min-width: 0; }
+    /* No nested scroll region: the rail is the last thing on the page, so
+       capping it only buys a second scrollbar inside the first — and it cut
+       controls in half at the boundary, which reads as broken. */
     #rail {
-        border-right: none;
-        border-bottom: none; border-top: 1px solid var(--border);
+        border-right: none; border-bottom: none;
+        border-top: 1px solid var(--border);
+        max-height: none; overflow: visible;
     }
+    .rail-panel { overflow: visible; min-width: 0; }
 
-    /* Give the header its space back. 179px of a 812px phone was 22% of the
-       screen before a single pixel of signal. */
-    #app-header { padding: 6px 12px; gap: 5px 10px; }
-    #freq-mhz { font-size: 18px; }
+    /* ── Header: two compact rows + a clamped config line ──────────────── */
+    #app-header { flex-wrap: wrap; padding: 6px 12px; gap: 5px 10px; }
     .hdiv { display: none; }
-    #applied-settings { font-size: 8.5px; line-height: 1.3; gap: 1px; }
-    .status-pill, #signout-btn, .mode-opt, #theme-toggle { padding-top: 2px; padding-bottom: 2px; }
-    .brand-sub { margin-top: 1px; }
-    #applied-settings .ap-row { flex-wrap: wrap; gap: 4px 10px; white-space: normal; }
-    /* The status cluster (connected · role · calibration · DAN/ARIC · theme ·
-       sign out) is `margin-left:auto; flex:0 0 auto` and does not wrap, so at
-       375px it ran 543px wide and pushed the whole document sideways. Let it
-       be its own wrapped row instead of a rigid rail. */
+    #freq-mhz { font-size: 19px; }
+    .freq-unit { font-size: 11px; }
+    .brand-sub { margin-top: 1px; font-size: 9px; }
+    /* The status cluster is `margin-left:auto; flex:0 0 auto` and does not
+       wrap, so at 375px it ran 543px wide and pushed the whole document
+       sideways. Let it be its own wrapped row instead of a rigid rail. */
     #statusbar {
         flex: 1 1 100%; margin-left: 0; flex-wrap: wrap;
-        gap: 6px; justify-content: flex-start;
+        gap: 5px; justify-content: flex-start;
     }
-    /* No nested scroll region. The rail is the LAST thing on the page now, so
-       capping its height only buys a second scrollbar inside the first — and
-       it cut controls in half at the boundary, which reads as broken. Let it
-       run its full length and be part of the one page scroll. */
-    #rail { max-height: none; overflow: visible; }
-    .rail-panel { overflow: visible; }
+    .status-pill { padding: 2px 8px; }
+    #status-text { font-size: 10px; }
+    .role-badge  { font-size: 9px; padding: 1px 6px; }
+    .mode-switch { margin-left: auto; }
+    .mode-opt    { padding: 2px 9px; font-size: 10px; }
+    /* Icon-only theme button: the word "Dark" is the least useful string in
+       the header on a 390px screen. */
+    #theme-toggle { padding: 3px 8px; }
+    #theme-toggle .theme-label { display: none; }
+    #signout-btn { padding: 2px 8px; }
 
-    /* Five frequency labels do not fit across 375px — they ran together into
-       "3742.3 MHz3746.2 MHz3750.0 MHz…". Keep the ends and the centre (the
-       tuned frequency), which is what the axis is actually for. */
-    .wf-freq-axis span:nth-child(2),
-    .wf-freq-axis span:nth-child(4) { display: none; }
+    /* Applied config: 22 fields in 3 nowrap rows is 33px of a 390px screen
+       before any signal. Clamp to ONE line with a chevron; .ap-expanded (set
+       by the tap handler in app.js) restores the full block, so nothing is
+       permanently hidden — it is folded, not dropped. */
+    #applied-settings {
+        order: 5; flex: 1 1 100%; width: 100%;
+        position: relative;
+        border-left: none; border-top: 1px solid var(--border);
+        padding-left: 0; margin-left: 0; padding-top: 1px; padding-right: 14px;
+        font-size: 9px; line-height: 1.5; gap: 0;
+        max-height: 15px; overflow: hidden;
+    }
+    #applied-settings .ap-row { display: inline; white-space: normal; }
+    #applied-settings .ap-row > span { margin-right: 9px; }
+    #applied-settings::after {
+        content: "\25be"; position: absolute; right: 0; top: 1px;
+        font-size: 10px; color: var(--text-faint);
+    }
+    #applied-settings.ap-expanded { max-height: none; }
+    #applied-settings.ap-expanded::after { content: "\25b4"; }
+    /* "waiting for first frame…" must not be clipped to nothing. */
+    #applied-settings.waiting { max-height: none; }
 
-    /* The PSD legend is a 1fr/auto/1fr grid; at this width the centred
-       "Frequency (MHz)" label collides with the trace keys on both sides.
-       The keys carry the information — the x tick labels are already the
-       same MHz values shown on the waterfall axis directly above. */
-    #psd-axis-label { display: none; }
-    #psd-legend { grid-template-columns: 1fr 1fr; gap: 8px; }
-    /* Nine keys never fit one 14px row at 375px — "RX2 Mean" was being
-       clipped to "ıx". paintPsdLegend already marks the keys whose series is
-       hidden, so on a phone the legend simply lists what is actually DRAWN.
-       Hold/Min/diff stay reachable from their rail checkboxes, and their keys
-       reappear here the moment the trace does. */
-    #psd-legend .psd-key.is-off { display: none; }
-
-    #dashboard { padding: 8px; gap: 8px; }
-
-    /* Stack the waterfalls as plain blocks. The desktop grid places panes in
-       ONE row (grid-template-rows: 1fr); with a single column and two
-       channels the second pane lands in an implicit auto row and the two
-       size differently. Flex column gives every channel the same treatment. */
+    /* ── Spectrograms: side by side, real heights ───────────────────────── */
+    /* The desktop grid places panes in ONE row (grid-template-rows: 1fr);
+       with a single column and two channels the second pane lands in an
+       implicit auto row and the two size differently. Flex gives every
+       channel the same treatment. */
     #waterfall-row {
-        display: flex; flex-direction: column; gap: 8px;
+        display: flex; flex-direction: row; gap: 8px;
         flex: 0 0 auto; min-height: 0;
     }
-    /* Real heights, because there is no longer a parent height to divide.
-       Sized to SHOW that a graph is live, not to measure anything off it —
-       the whole UI should be reachable in about two screens of scrolling, and
-       instrument-grade panes put it at three. Anyone who wants a close look
-       taps the header and gets 78vh (focus mode, below), which is the right
-       way to read one graph on a phone anyway. */
-    .wf-pane { min-height: 22vh; }
-    #psd-row  { flex: 0 0 auto; min-height: 22vh; }
-    #log-row  { flex: 0 0 auto; }
-    #log-pre  { height: 74px; font-size: 10px; line-height: 1.5; }
+    .wf-pane { flex: 1 1 0; min-width: 0; min-height: 0; }
+    .wf-wrap { flex: 0 0 auto; height: 130px; }
+    .wf-title { min-height: 22px; padding: 2px 8px; font-size: 9.5px; gap: 6px; }
+    .wf-title .wf-title-text { overflow: hidden; text-overflow: ellipsis; }
+    /* Five MHz ticks do not fit 181px. Keep the two ends and the window. */
+    .wf-freq-axis { height: 14px; font-size: 9px; padding: 0 3px; }
+    .wf-freq-axis span:nth-child(2),
+    .wf-freq-axis span:nth-child(3),
+    .wf-freq-axis span:nth-child(4) { display: none; }
 
-    /* Focus mode earns its keep here: one graph, full screen, one tap. The
-       desktop rules hide the siblings; these give the survivor a height,
-       since the flex-fill they rely on has nothing to fill on a scrolling
-       page. */
-    body[data-focus^="wf"] .wf-pane.pane-focused { min-height: 78vh; }
-    body[data-focus="psd"] #psd-row { min-height: 78vh; }
-    /* Touch target: a 12px glyph is not tappable. Pad it out without moving
-       it — the header row keeps its height. */
+    /* ── PSD ───────────────────────────────────────────────────────────── */
+    #psd-row { flex: 0 0 auto; min-height: 0; }
+    #psd-container { flex: 0 0 auto; height: 152px; }
+    .panel-head { min-height: 24px; padding: 2px 8px; }
+    .panel-head h2 { font-size: 9.5px; }
+    #psd-row .legend-key { display: none; }   /* the key row below carries it */
+    #psd-axis-label { display: none; }
+    #psd-legend { grid-template-columns: 1fr 1fr; gap: 8px; }
+    /* Nine keys never fit one row at this width — "RX2 Mean" was clipped to
+       "ıx". paintPsdLegend already marks the keys whose series is hidden, so
+       the legend simply lists what is actually DRAWN. Hold/Min/diff stay
+       reachable from their rail checkboxes and their keys reappear here the
+       moment the trace does. */
+    #psd-legend .psd-key.is-off { display: none; }
+
+    /* ── Log: a tail, not a pane ────────────────────────────────────────── */
+    #log-row { flex: 0 0 auto; }
+    #log-pre { height: 58px; font-size: 9.5px; line-height: 1.55; padding: 5px 10px; }
+
+    /* ── Band monitor: directly under the graphs, 3 across ─────────────── */
+    /* #rail is a flex column and the rail follows main, so order:-1 lifts the
+       band monitor to the top of the rail — i.e. immediately below the
+       graphs, where the numbers belong. */
+    #band-monitor { order: -1; padding: 8px 12px; border-top: none; }
+    .bm-head  { margin-bottom: 5px; }
+    .bm-big   { margin-bottom: 5px; }
+    .bm-big b { font-size: 18px; }
+    .bm-bar   { height: 6px; margin-bottom: 8px; }
+    .bm-grid  { grid-template-columns: repeat(3, 1fr); gap: 6px 10px; }
+    .bm-k     { font-size: 8.5px; }
+    .bm-v     { font-size: 11.5px; }
+    .bm-span  { display: none; }
+
+    /* ── Inspector tabs: all six visible at once, no drop-over, no side
+       scroll. 6 equal columns of a 390px screen is ~57px each, which fits
+       MEASURE/CAPTURE at 9.5px and still gives a 30px touch target.
+       The rail JS only toggles classes (.open/.active), never inline
+       display, so making the menu a static grid simply makes .open inert. */
+    .rail-strip { display: none; }
+    .rail-menu {
+        position: static; display: grid;
+        grid-template-columns: repeat(6, 1fr); gap: 5px;
+        padding: 7px 10px; overflow: visible;
+        opacity: 1; transform: none; pointer-events: auto;
+        box-shadow: none; border-bottom: 1px solid var(--border);
+    }
+    .rail-tab {
+        min-height: 30px; padding: 6px 2px; border: none;
+        border-radius: var(--radius); background: var(--bg0);
+        font-size: 9.5px; letter-spacing: .02em; text-align: center;
+        color: var(--text-faint);
+    }
+    /* Roles/modes hide tabs (pro-only, admin-only); the grid just reflows to
+       whatever is left, so ARIC mode gets wide tabs, not narrow ones with a
+       hole. */
+    body.mode-noob .rail-menu { grid-template-columns: repeat(2, 1fr); }
+    body:not(.is-admin) .rail-menu { grid-template-columns: repeat(5, 1fr); }
+    body.mode-noob:not(.is-admin) .rail-menu { grid-template-columns: repeat(2, 1fr); }
+    .rail-tab.active {
+        background: var(--accent-soft);
+        box-shadow: inset 0 0 0 1px var(--accent);
+        color: #eef1f5;
+    }
+    body.light-theme .rail-tab.active { color: #10151c; }
+    .rail-scroll { padding: 10px 12px; }
+
+    /* ── DISPLAY panel: 2-column control grid, stacked labels ──────────── */
+    .rail-panel[data-panel="display"].active {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px;
+    }
+    .rail-panel[data-panel="display"] > .btn-row { grid-column: 1 / -1; margin-bottom: 0; }
+    .rail-panel[data-panel="display"] > .btn-row button { padding: 9px 8px; }
+    .rail-panel[data-panel="display"] > .ctrl-row:not(.check) {
+        display: grid; gap: 3px; padding: 0; border-bottom: none;
+        font-size: 9.5px; font-weight: 600; letter-spacing: .05em;
+        text-transform: uppercase; color: var(--text-faint);
+    }
+    .rail-panel[data-panel="display"] > .ctrl-row select,
+    .rail-panel[data-panel="display"] > .ctrl-row input[type="number"] {
+        min-width: 0; width: 100%; padding: 7px 8px;
+    }
+    .rail-panel[data-panel="display"] > .ctrl-row.check {
+        border-bottom: none; border-top: 1px solid #17181b;
+        font-size: 11.5px; min-height: 32px;
+    }
+    body.light-theme .rail-panel[data-panel="display"] > .ctrl-row.check { border-top-color: #e2e6ec; }
+    .rail-panel[data-panel="display"] > .rail-danger { margin-top: 0; }
+    .rail-panel select, .rail-panel input[type="number"], .rail-panel input[type="text"] { max-width: 100%; }
+
+    /* ── Focus mode: one tap, one graph, most of the screen ────────────── */
+    body[data-focus^="wf"] .wf-pane.pane-focused .wf-wrap { height: 74vh; }
+    body[data-focus="psd"] #psd-container { height: 74vh; }
+    /* Touch target: a 12px glyph is not tappable. Pad it without moving it. */
     .pane-zoom { padding: 6px 8px; margin: -6px -4px -6px auto; font-size: 15px; }
     .panel-head .pane-zoom { margin-left: 0; }
 
-    /* Fixed banners sit at the TOP on desktop, where there is chrome to spare.
-       On a phone that lands squarely on the brand and the frequency readout —
-       the two things a viewer looks at first. Move them to the bottom, where
-       they still cannot be missed (they stay fixed while the page scrolls)
-       but cover nothing that matters. */
+    /* ── Fixed banners to the bottom, off the readouts ──────────────────── */
+    /* They sit at the TOP on desktop, where there is chrome to spare. On a
+       phone that lands on the brand and the frequency readout. They stay
+       fixed while the page scrolls, so nothing is lost by moving them. */
     #recording-banner, #tx-banner, #rate-banner {
         top: auto; bottom: 8px; left: 8px; right: 8px;
         transform: none; max-width: none; border-radius: 7px;
     }
     #rate-banner { white-space: normal; border-top: 1px solid #e57373; }
 
-    /* Wide fixed-width controls overflow a 375px column otherwise. */
-    #dashboard, .rail-panel { min-width: 0; }
-    .rail-panel select, .rail-panel input[type="number"], .rail-panel input[type="text"] {
-        max-width: 100%;
-    }
+    /* ── Footer stacks ─────────────────────────────────────────────────── */
+    #app-footer { padding: 7px 12px; font-size: 9px; }
 }
 
-/* Phone in LANDSCAPE. Same scrolling cards as portrait — 375px of height
-   cannot hold a header plus two waterfalls plus a PSD however it is sliced —
-   but the width is back, so the channels sit side by side again and each card
-   is a near-full screen of signal. */
+/* Phone in LANDSCAPE — width is back, so spend it on the graphs. Still one
+   scrolling page: 375px of height cannot hold header + graphs + controls. */
 @media (min-width: 561px) and (max-height: 560px) and (max-width: 950px) {
-    #waterfall-row { flex-direction: row; }
-    /* Share the width evenly. Without a basis the panes size to their content
-       — a canvas that is width:100% of nothing — and collapse to ~130px in an
-       812px viewport, which is the portrait bug wearing a different hat. */
-    .wf-pane { flex: 1 1 0; min-width: 0; min-height: 52vh; }
-    #psd-row  { min-height: 46vh; }
-    body[data-focus^="wf"] .wf-pane.pane-focused { min-height: 80vh; }
-    body[data-focus="psd"] #psd-row { min-height: 80vh; }
+    .wf-wrap { height: 200px; }
+    #psd-container { height: 200px; }
+    #log-pre { height: 52px; }
+    .bm-grid { grid-template-columns: repeat(6, 1fr); }
+    .rail-panel[data-panel="display"].active { grid-template-columns: repeat(4, 1fr); }
+    .rail-menu { grid-template-columns: repeat(6, 1fr); }
+    body[data-focus^="wf"] .wf-pane.pane-focused .wf-wrap { height: 80vh; }
+    body[data-focus="psd"] #psd-container { height: 80vh; }
 }
 
 /* ── OPS panel: verified operations + service health ─────────────────────── */

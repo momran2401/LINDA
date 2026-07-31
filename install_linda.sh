@@ -13,6 +13,10 @@
 #     --mode=web|kiosk|hotspot|ethernet|terminal
 #     --port=8000  --hostname=<name>  --hotspot-ssid=X  --hotspot-pass=X
 #     --skip-radio-check            provision before the radio arrives
+#     --gps / --no-gps              GPS is OFF by default; --gps installs gpsd,
+#                                   probes for a receiver, and records position
+#                                   in every capture. RADIO_GPS=1 or naming a
+#                                   RADIO_GPS_DEVICE=... does the same.
 #
 # What it does, in order (idempotent — re-running is always safe):
 #     1.  preflight: root, distro, arch, Python, disk, port
@@ -63,6 +67,19 @@ SETUP_COMPLETE=0
 WAS_SERVICE_ACTIVE=0
 RADIO_CHECK_STATUS="not run"
 UHD_IMAGES_PATH=""
+# GPS is OPT-IN. It is off by default because it is the only optional
+# subsystem here that costs time and noise on a host that has no receiver:
+# apt work, a serial-port probe that re-bauds every candidate tty, and a gpsd
+# unit left enabled for hardware nobody attached. Recordings without it simply
+# stamp gps_valid=0 and NaN coordinates, which is the honest result anyway.
+# Turn it on for a deployment that genuinely records position:
+#     sudo bash install_linda.sh --gps
+#     sudo env RADIO_GPS=1 bash install_linda.sh
+#     sudo env RADIO_GPS_DEVICE=/dev/ttyTHS1 bash install_linda.sh  # implies --gps
+# (`sudo env VAR=...` — plain `sudo VAR=... bash` drops the variable, since
+#  sudo does not pass the caller's environment through by default.)
+# An explicit --no-gps on the command line always wins.
+WANT_GPS=""                  # "" → decide from the environment below
 
 # ── 0. Output helpers and the failure trap ──────────────────────────────────
 # The trap is installed before ANY other logic runs. A `set -e` abort with no
@@ -101,6 +118,8 @@ for arg in "$@"; do
         --demo)              DEVICE="demo"; ASK=0 ;;
         --deps-only)         DEPS_ONLY=1 ;;
         --skip-radio-check)  SKIP_RADIO_CHECK=1 ;;
+        --gps)               WANT_GPS=1 ;;
+        --no-gps)            WANT_GPS=0 ;;
         --mode=*)            MODE="${arg#*=}" ;;
         --device=*)          DEVICE="${arg#*=}" ;;
         --port=*)            PORT="${arg#*=}" ;;
@@ -116,6 +135,16 @@ for arg in "$@"; do
         *) die "unknown option: $arg  (run: bash $SELF --help)" ;;
     esac
 done
+
+# Resolve the GPS choice once, now that the flags have been parsed. A flag on
+# the command line beats the environment; naming a device implies wanting it.
+if [[ -z "$WANT_GPS" ]]; then
+    case "$(printf '%s' "${RADIO_GPS:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on)  WANT_GPS=1 ;;
+        0|false|no|off|none) WANT_GPS=0 ;;
+        *) if [[ -n "${RADIO_GPS_DEVICE:-}" ]]; then WANT_GPS=1; else WANT_GPS=0; fi ;;
+    esac
+fi
 
 IS_ROOT=0; [[ ${EUID} -eq 0 ]] && IS_ROOT=1
 ARCH="$(uname -m)"
@@ -515,6 +544,21 @@ install_radio_driver() {
 install_pluto_driver() {
     say "Installing the ADALM-Pluto driver"
     apt_install libiio-utils libiio0 libad9361-0 || true
+    # Already there? Say so and stop. The source build below wipes and
+    # re-clones from GitHub every time, which on a Pi costs minutes per run
+    # and — the part that matters for a demo — DIES if the box is offline,
+    # which a hotspot/ethernet-mode install very often is. Swapping radios
+    # back and forth is a normal thing to do, and re-running the installer
+    # must not need the internet to reinstall a driver that is already built.
+    #
+    # Presence is the only safe direction to trust this check in: a module
+    # that IS listed is unambiguously loadable. Absence proves nothing (an
+    # earlier version treated it as build failure and cried wolf on a working
+    # Pluto), so a miss just falls through and builds.
+    if SoapySDRUtil --info 2>/dev/null | grep -qi 'plutosdr'; then
+        ok "SoapyPlutoSDR already present — leaving it alone"
+        return 0
+    fi
     if apt_has soapysdr-module-plutosdr && apt_install soapysdr-module-plutosdr; then
         ok "SoapyPlutoSDR installed from apt"
         return 0
@@ -669,6 +713,15 @@ EOF
 install_gps() {
     [[ $IS_ROOT -eq 1 && $HAVE_APT -eq 1 ]] || return 0
     [[ "$RADIO_KIND" != "demo" ]] || return 0
+    if [[ $WANT_GPS -ne 1 ]]; then
+        say "GPS support (skipped)"
+        info "position stamping is off; recordings will record gps_valid=0"
+        info "enable it with:  sudo bash $SELF --gps"
+        # Leave any gpsd this host already had alone — this installer did not
+        # put it there and a previous --gps run may still want it. RADIO_GPS=0
+        # in the env file is what actually keeps the server from dialling it.
+        return 0
+    fi
     say "Installing GPS support (optional)"
     # gpsd only, plus the ~330 kB CLI tools (cgps/gpsmon) for diagnosing a
     # receiver. NOT gpsd-clients: it hard-depends on python3-matplotlib and
@@ -828,6 +881,24 @@ install_python() {
         info "existing venv does not match this configuration; moved to $backup"
         mv "$VENV" "$backup"
     fi
+    # Marker matches AND the environment actually imports? Then every input
+    # that decides what pip would install is unchanged and there is nothing to
+    # do. This early-out is not a speed tweak: the transaction below is
+    # `pip install --upgrade` against a GIT URL, so it reaches the network on
+    # EVERY run and `die`s when it cannot — which meant re-running the
+    # installer (to swap radios, change mode, or re-verify) was impossible on
+    # an offline box, exactly the hotspot/ethernet deployments this project
+    # exists to support. The import check is what makes the skip safe: a venv
+    # that matches the marker but no longer works falls through and is rebuilt.
+    if [[ -d "$VENV" && "$current" == "$wanted" ]] \
+            && "$VENV_PY" -c 'import striqt, fastapi, numpy, uvicorn' 2>/dev/null; then
+        link_soapysdr
+        [[ $IS_ROOT -eq 1 ]] && chown -R "$SERVICE_USER:$SERVICE_USER" "$VENV"
+        ok "Python environment already matches this configuration — unchanged"
+        info "force a rebuild by deleting it:  sudo rm -rf $VENV"
+        return 0
+    fi
+
     [[ -d "$VENV" ]] || python3 -m venv "$VENV"
     "$VENV_PY" -m pip install --upgrade -q pip setuptools wheel \
         || die "could not bootstrap pip in the venv"
@@ -1081,6 +1152,11 @@ RADIO_SESSION_SECRET="$secret"
 # admin (the radio still has to have a TX port). Set to 0 on any deployment
 # where nobody should be able to key the PA — a kiosk in a public space, say.
 RADIO_TX="$RADIO_TX_DEFAULT"
+# GPS position stamping. 0 = core/gps.py never opens a socket to gpsd, /gps
+# reports "disabled", and every recording stores gps_valid=0 with NaN
+# coordinates (never 0.0/0.0). Default off — re-run with --gps to provision a
+# receiver and flip this to 1.
+RADIO_GPS="$WANT_GPS"
 EOF
     # UHD locates a B2xx FPGA image through this variable. Debian's downloader
     # and Debian's libuhd disagree about the default path, so state it.
@@ -1314,6 +1390,14 @@ if [[ $DEPS_ONLY -eq 1 ]]; then
 fi
 
 preflight
+# BEFORE any probing. A previously-installed service is still running at this
+# point on every re-run, and a radio another process holds open does not
+# appear in SoapySDR's enumeration AT ALL (see release_radio). Detecting first
+# and stopping later — which is what this did — meant swapping the radio and
+# re-running could mis-detect: the old service, still looping on the radio
+# that was just unplugged, could be holding the new one instead. Stopping
+# first costs nothing; install_service starts it again at the end.
+stop_existing_service
 install_base                 # lsusb must exist before we can detect anything
 detect_radio                 # USB vendor IDs: works with no driver installed
 install_soapy_core           # SoapySDRUtil must exist for the catch-all below
@@ -1327,7 +1411,7 @@ clear_other_mode_state       # undo the PREVIOUS mode before installing this one
 install_kiosk
 install_python
 install_web_assets
-stop_existing_service
+stop_existing_service        # again: the venv/kiosk steps can relaunch a viewer
 verify_software
 verify_radio
 write_env_file
@@ -1344,6 +1428,11 @@ echo "    sign in as  admin        — username only, no password"
 echo "    radio       $DEVICE  ($RADIO_LABEL)"
 echo "    radio check $RADIO_CHECK_STATUS"
 echo "    transmit    ${TX_NOTE:-enabled}"
+if [[ $WANT_GPS -eq 1 ]]; then
+    echo "    gps         enabled — check the fix: ./.venv/bin/python live/radioctl.py gps"
+else
+    echo "    gps         off (default) — recordings store gps_valid=0; enable: sudo bash $SELF --gps"
+fi
 echo "    mode        $MODE"
 [[ -n "${HOTSPOT_NOTE:-}" ]]  && echo "    hotspot     $HOTSPOT_NOTE"
 [[ -n "${ETHERNET_NOTE:-}" ]] && echo "    ethernet    $ETHERNET_NOTE"

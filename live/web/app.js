@@ -1778,6 +1778,19 @@ document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && focusTarget !== null) setFocus(null);
 });
 
+// Tap-to-expand for the header's applied-config block. On a phone the CSS
+// clamps those 22 fields to a single line with a chevron, so this is what
+// makes the rest reachable — folded, not dropped. Desktop is unaffected: the
+// clamp only exists inside the phone media query, so the class this toggles
+// has nothing to undo there.
+(function installAppliedSettingsToggle() {
+    const meta = document.getElementById("applied-settings");
+    if (!meta) return;
+    meta.style.cursor = "pointer";
+    meta.title = "Tap to show all applied settings";
+    meta.addEventListener("click", () => meta.classList.toggle("ap-expanded"));
+})();
+
 // Ingest one channel's new rows into its display buffer. Painting is a
 // SEPARATE pass (renderWaterfalls) because the color scale is shared: it
 // cannot be computed until every channel's buffer for this frame is in.
@@ -2455,15 +2468,24 @@ function psdAxis(opts) {
 }
 
 function psdAxes() {
+    // On a phone the y-axis LABEL is dropped, not shrunk. It is rotated inside
+    // the axis gutter, so at the phone's 152px plot height "Integrated power
+    // (dB rel. FS)" is longer than the axis it sits on and renders clipped at
+    // both ends — and the 54+14px gutter it needs is 17% of a 390px screen
+    // spent on a string that is already unreadable. The units are not lost:
+    // the PSD panel's own key row carries them.
+    const narrow = window.matchMedia("(max-width: 720px)").matches;
     return [
         // No x label here: "Frequency (MHz)" lives in the #psd-legend row below,
         // flanked by the trace keys, so the label band is not paid for twice.
         // 22 px = 4 px ticks + 3 px gap + one row of 11 px tick text.
-        psdAxis({ size: 22 }),
+        psdAxis({ size: narrow ? 20 : 22 }),
         // The y gutter carries the tick values, so it stays wide; 14 px of it is
         // the rotated axis label (vs uPlot's default 30).
-        psdAxis({ label: psdYLabel(), size: 54,
-                  labelSize: 14, labelFont: "10px Menlo,monospace" }),
+        narrow
+            ? psdAxis({ size: 34 })
+            : psdAxis({ label: psdYLabel(), size: 54,
+                        labelSize: 14, labelFont: "10px Menlo,monospace" }),
     ];
 }
 
