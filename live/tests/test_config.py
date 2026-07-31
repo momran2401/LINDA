@@ -138,3 +138,81 @@ def test_restore_config_rolls_back_failed_hardware_recipe(shared):
     assert not dirty and op_id is None and not reconnect
     assert changed == set()
     assert current.sample_rate == good.sample_rate
+
+
+# ── Device-derived sample-rate ceiling ────────────────────────────────────
+# The rate a radio may run is the DRIVER's answer, not a constant. These
+# cover the three ways that answer arrives (static grid, queried endpoints,
+# enumerated discrete list) and the disclosure that fires above the rate
+# hardware_qual has actually sustained.
+
+def test_rate_grid_reaches_past_the_qualified_ceiling(shared):
+    # The historical 30.72 MS/s cap was the GRID, not any radio's limit.
+    from core.constants import QUALIFIED_MAX_RATE_HZ, RATES_HZ
+    assert max(RATES_HZ) > QUALIFIED_MAX_RATE_HZ
+    shared.update({"sample_rate": 61.44e6})
+    assert shared.snapshot().sample_rate == 61.44e6
+
+
+def test_driver_reported_rates_override_the_static_grid(shared):
+    # A driver that enumerates its rates wins outright: the grid is a guess
+    # about the family, this is the radio speaking about itself.
+    from core.dsp import allowed_rates
+    shared.set_envelope({"rate_list": [7.68e6, 15.36e6, 46.08e6]})
+    assert allowed_rates(shared.envelope()) == (7.68e6, 15.36e6, 46.08e6)
+    # 40 is off the LTE grid entirely; it must land on the driver's value.
+    shared.update({"sample_rate": 40e6})
+    assert shared.snapshot().sample_rate == 46.08e6
+
+
+def test_driver_rate_list_is_still_clipped_to_the_envelope(shared):
+    from core.dsp import allowed_rates
+    shared.set_envelope({"rate_list": [1e3, 15.36e6, 999e9]})
+    assert allowed_rates(shared.envelope()) == (15.36e6,)
+
+
+def test_allowed_rates_never_empty(shared):
+    # Callers snap to this result; an empty choice list would raise inside
+    # min() and take the control path down with it.
+    from core.constants import RATES_HZ
+    from core.dsp import allowed_rates
+    assert allowed_rates({"rate_min": 5e9, "rate_max": 6e9}) == RATES_HZ
+    assert allowed_rates({"rate_min": 5e9, "rate_max": 6e9,
+                          "rate_list": [1.0, 2.0]}) == RATES_HZ
+
+
+def test_unqualified_rate_is_disclosed_once_per_change(shared):
+    from core.constants import QUALIFIED_MAX_RATE_HZ
+    shared.drain_notices()
+    shared.update({"sample_rate": 61.44e6})
+    notices = shared.drain_notices()
+    assert any("61.44" in n and "qualified" in n for n in notices), notices
+    # Re-applying the SAME rate must not re-announce: the banner is the
+    # standing disclosure, so a notice per no-op Apply would be noise.
+    shared.update({"sample_rate": 61.44e6})
+    assert shared.drain_notices() == []
+    # Coming back under the line says nothing at all.
+    shared.update({"sample_rate": QUALIFIED_MAX_RATE_HZ})
+    assert shared.drain_notices() == []
+
+
+def test_qualified_rate_is_not_disclosed(shared):
+    shared.drain_notices()
+    shared.update({"sample_rate": 7.68e6})
+    assert shared.drain_notices() == []
+
+
+def test_envelope_query_groups_are_per_profile():
+    # The AIR-T's gain window is a striqt calibrated convention the driver
+    # would overwrite; its rate bounds are a guess only the driver can fix.
+    from core.constants import DEVICE_PROFILES, envelope_query_groups
+    assert envelope_query_groups(DEVICE_PROFILES["air8201b"]) == {"rate"}
+    assert envelope_query_groups(DEVICE_PROFILES["demo"]) == frozenset()
+    assert envelope_query_groups(DEVICE_PROFILES["pluto"]) == {
+        "freq", "gain", "rate"}
+
+
+def test_set_envelope_rejects_a_malformed_rate_list(shared):
+    before = shared.envelope().get("rate_list")
+    shared.set_envelope({"rate_list": ["not-a-rate"]})
+    assert shared.envelope().get("rate_list") == before

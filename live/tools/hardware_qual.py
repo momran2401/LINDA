@@ -41,7 +41,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import devices, health, state                       # noqa: E402
 from core.constants import (DEFAULT_CENTER, DEFAULT_SAMPLE_RATE,  # noqa: E402
-                            DEVICE_PROFILES, RATES_HZ)
+                            DEVICE_PROFILES, QUALIFIED_MAX_RATE_HZ)
+from core.dsp import allowed_rates                             # noqa: E402
 from core.acquisition import Acquirer, Computer, DemoAcquirer  # noqa: E402
 from core.config import SharedConfig                           # noqa: E402
 from core.operations import OPERATIONS                         # noqa: E402
@@ -382,8 +383,9 @@ def main():
     # would have failed a perfectly healthy radio at a rate nobody runs it at.
     home_rate = DEVICE_PROFILES.get(name, {}).get("defaults", {}).get(
         "sample_rate", DEFAULT_SAMPLE_RATE)
-    legal_rates = [r for r in RATES_HZ
-                   if env["rate_min"] <= r <= env["rate_max"]]
+    # The rates this radio actually reports (its own enumerated list when it
+    # has one), not the whole cellular family.
+    legal_rates = list(allowed_rates(env))
     if home_rate not in legal_rates:
         home_rate = legal_rates[0] if legal_rates else home_rate
     neighbours = [r for r in legal_rates if r != home_rate]
@@ -415,16 +417,26 @@ def main():
     results = []
     for field, value, hkey in points:
         label = f"{field} = {value/1e6:.4g} M" if value > 1e4 else f"{field} = {value:g}"
+        # Rates above the qualified ceiling are EXPLORATORY, not pass/fail.
+        # The rate grid now runs past what any radio here has sustained, so
+        # a radio that declines 122.88 MS/s is behaving correctly — failing
+        # the whole qualification for it would report a healthy radio as
+        # broken, which is exactly the mistake the gain probe above exists
+        # to avoid. Their result is printed and summarized, but a failure
+        # here is what this run is FINDING OUT, not a defect it found.
+        exploratory = field == "sample_rate" and value > QUALIFIED_MAX_RATE_HZ
+        if exploratory:
+            label += " (above qualified — exploratory)"
         print(f"→ {label}")
         verdict, detail = run_point(shared, acquirer, field, value, hkey,
                                     args.timeout)
         print(f"   {verdict.upper()}: {detail}\n")
-        results.append((label, verdict, detail))
+        results.append((label, verdict, detail, exploratory))
 
     if args.tx:
         for row in qualify_tx(acquirer, shared, args, is_demo):
             print(f"   {row[1].upper()}: {row[2]}")
-            results.append(row)
+            results.append((row[0], row[1], row[2], False))
         print()
 
     # Sustained streaming check after all changes.
@@ -438,21 +450,33 @@ def main():
         lambda: (acquirer.latest()[0] or {}).get("time", 0.0) > t0, 20.0)
     results.append(("sustained streaming after all changes",
                     "success" if streaming else "failed",
-                    "frames still advancing" if streaming else "stream stalled"))
+                    "frames still advancing" if streaming else "stream stalled",
+                    False))
 
     print("=== summary ===")
-    bad = unverified = 0
-    for label, verdict, _ in results:
+    bad = unverified = explored = 0
+    for label, verdict, _, exploratory in results:
         mark = {"verified": "✓", "success": "✓", "unverified": "~",
                 "mismatch": "✗", "failed": "✗"}.get(verdict, "?")
-        if verdict in ("mismatch", "failed"):
+        if exploratory:
+            # Counted and shown, never fatal — see the exploratory note above.
+            if verdict in ("mismatch", "failed"):
+                mark = "?"
+                explored += 1
+        elif verdict in ("mismatch", "failed"):
             bad += 1
         elif verdict == "unverified":
             unverified += 1
         print(f"  {mark} {verdict.upper():10s} {label}")
-    print(f"\n{len(results) - bad}/{len(results)} points OK"
+    graded = [r for r in results if not r[3]]
+    print(f"\n{len(graded) - bad}/{len(graded)} graded points OK"
           + (f" ({unverified} unverified — driver gave no readback)"
              if unverified else ""))
+    if explored:
+        print(f"{explored} exploratory rate(s) above "
+              f"{QUALIFIED_MAX_RATE_HZ/1e6:g} MS/s did not hold — expected "
+              f"until proven, and not counted against this radio. Raise "
+              f"QUALIFIED_MAX_RATE_HZ only for rates that DID hold here.")
 
     shared.stop()
     acquirer.join(timeout=3.0)

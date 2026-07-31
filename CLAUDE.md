@@ -349,6 +349,32 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   RECEIVER at the commanded offset, because a radio can report a perfect
   readback while emitting nothing.
 
+## Sample-rate ceiling (device-derived, not a constant)
+
+- The legal rates come from the RADIO, not `RATES_HZ`. `dsp.allowed_rates(env)`
+  prefers `env["rate_list"]` — SoapySDR `listSampleRates`, collected by
+  `_probe_rate_limits()` at ENUMERATION (before any source opens, same as the
+  master clock) and again by `query_device_envelope()` after open. `RATES_HZ`
+  is only the fallback for drivers that do not enumerate. Both static guesses
+  are known wrong: this AIR-T firmware rejects the nominal LOW grid points
+  while its profile claims a 125 MHz ceiling nothing has run.
+- `query_envelope` is PER-GROUP (`("freq","gain","rate")`, via
+  `envelope_query_groups()`), not a bool. air8201b queries **rate only**: its
+  −60…10 dB gain window is a striqt calibrated-gain convention the driver
+  would overwrite (and SoapyAIRT rejects −60/−50 outright), while its rate
+  bounds are a guess only the driver can correct.
+- `QUALIFIED_MAX_RATE_HZ` (30.72 MS/s) is **not a clamp** — nothing stops you
+  above it. It is the line between "proven" and "the driver said yes". Above
+  it the radio can accept the rate and read it back perfectly while the
+  pipeline drops samples (2 ch × 122.88 MS/s ≈ 2 GB/s) or the fixed `MAX_TAIL`
+  ring holds ~34 ms. **Both failures are silent** — a gappy waterfall looks
+  like a quiet band — so crossing the line raises a persistent banner for
+  every viewer, a `warn` op stage, a queued notice, and a `radioctl status`
+  line. Raise the constant only for a rate `hardware_qual.py` actually
+  sustained; that tool now runs rates above it as **exploratory** (printed and
+  summarized, never counted against the radio — a radio declining 122.88 MS/s
+  is behaving correctly, not failing).
+
 ## Verified operations / Reset Radio
 
 - Config changes are only trusted after driver readback + a fresh frame; the
@@ -417,7 +443,8 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 |---|---|---|
 | `MAX_TAIL` | `1 << 22` | Ring buffer capacity (4M samples) |
 | `READ_SIZE` | `1 << 18` | Chunk size per `_read_stream` call |
-| `RATES_HZ` | 3.84/7.68/15.36/30.72 MS/s | LTE/5G-NR grid; incoming rates snap to this |
+| `RATES_HZ` | 3.84 … 122.88 MS/s | LTE/5G-NR family (1.92 MHz × 2ⁿ). A FALLBACK: `dsp.allowed_rates()` prefers the driver's own `rate_list` |
+| `QUALIFIED_MAX_RATE_HZ` | 30.72e6 | Highest rate qualified on hardware. Not a clamp — the line above which the UI warns |
 | `NFFT_CHOICES` | 256…4096 | Valid FFT sizes; always snap |
 | `ALIGNED_NFFTS` | 252/504/1008/2016/4032 | 28-multiples the calibrated STFT actually runs |
 | `MASTER_CLOCK_RATE` | 125e6 | AIR-T reference clock. **Not** a universal default — each profile declares its own `master_clock_rate` |

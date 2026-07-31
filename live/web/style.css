@@ -743,6 +743,27 @@ body.light-theme .op-summary { color: #26313c; }
 body.recording #settings-apply, body.recording #analysis-apply,
 body.recording #reset-radio-btn { opacity: .45; pointer-events: none; }
 
+/* Unqualified sample rate. Below the recording/TX banners: those announce a
+   thing happening NOW, this is a standing condition of the current tuning
+   and stays up as long as that rate runs. Which is exactly why it is ONE
+   SLIM LINE — a full-paragraph banner parked over the waterfall for an
+   entire session stops being a warning and starts being an obstruction, and
+   the operator covers it up or stops seeing it. The detail lives in the
+   tooltip, the log, and the OPS tab; the strip only has to be impossible to
+   miss. Not dismissible: it describes what the radio is doing right now. */
+#rate-banner { position: fixed; z-index: 49; top: 92px; left: 50%;
+               transform: translateX(-50%); max-width: 92vw;
+               padding: 4px 12px; text-align: center;
+               white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+               border: 1px solid #e57373; border-radius: 0 0 7px 7px;
+               border-top: none; cursor: help;
+               background: #2e1616; color: #ffb4ac;
+               font: 600 10.5px/1.5 sans-serif; letter-spacing: .02em;
+               box-shadow: 0 4px 14px rgba(0,0,0,.45); }
+/* The rate field itself, while it holds an unqualified value — so the warning
+   is attached to the control that causes it, before Apply is ever pressed. */
+input.rate-unqualified { border-color: #e57373 !important; color: #ffb4ac; }
+
 /* ── AHAWI mode (coherent capture → segmented replay) ──────────────────── */
 /* Everything AHAWI-specific hides unless the body carries mode-ahawi (set
    when AHAWI frames actually arrive — clients follow the server's output). */

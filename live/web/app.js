@@ -3727,6 +3727,10 @@ function seedStaticControls(config) {
             ahawiSelected = true;
         }
     }
+    // Also here, not only in seedCaptureForm: this runs on the initial page
+    // load (where the capture form has not been rendered yet), so the rate
+    // banner is up from the first paint rather than from the first ack.
+    updateRateUi(config);
 }
 
 function seedCaptureForm(config) {
@@ -3759,7 +3763,98 @@ function seedCaptureForm(config) {
                 input.title = `device range: ${lo} – ${hi} ${unit}`;
             }
         });
+    updateRateUi(config);
     snapshotFormBaseline();
+}
+
+// ── Sample-rate ceiling ───────────────────────────────────────────────────
+// `rates` is what the RADIO reports it accepts (its own listSampleRates when
+// it enumerates them, else the cellular grid clipped to its envelope).
+// `qualified_max_rate` is the highest rate this project has actually
+// sustained on hardware. The gap between the two is real and worth saying
+// out loud: above the qualified line the driver can accept the rate and read
+// it back perfectly while the pipeline drops samples or the fixed-size IQ
+// ring holds only a few ms of history. Neither failure raises, and neither
+// looks like a failure — a waterfall with holes in it reads as a quiet band.
+let rateChoices     = [];
+let qualifiedMaxRate = Infinity;
+
+function unprovenRateText(rateHz) {
+    return `${rateHz / 1e6} MS/s is above the ${qualifiedMaxRate / 1e6} MS/s `
+         + `this radio has been qualified at — the driver accepted it, but `
+         + `nothing has verified the pipeline keeps up. Watch for dropped `
+         + `samples and a shorter time span; both are silent.`;
+}
+
+function updateRateUi(config) {
+    if (config && Array.isArray(config.rates) && config.rates.length) {
+        rateChoices = config.rates.slice();
+    }
+    if (config && typeof config.qualified_max_rate === "number") {
+        qualifiedMaxRate = config.qualified_max_rate;
+    }
+    const input = document.querySelector(
+        '#capture-settings-form input[data-field="sample_rate"]');
+
+    // Offer the reported rates as a datalist rather than replacing the number
+    // input with a select: the field stays free-entry (the server still snaps
+    // and tells), but the legal values stop being something you discover by
+    // being rounded.
+    if (input && rateChoices.length) {
+        let list = document.getElementById("rate-choices");
+        if (!list) {
+            list = document.createElement("datalist");
+            list.id = "rate-choices";
+            document.body.appendChild(list);
+        }
+        const wanted = rateChoices.join(",");
+        if (list.dataset.rates !== wanted) {
+            list.dataset.rates = wanted;
+            list.textContent = "";
+            for (const rate of rateChoices) {
+                const option = document.createElement("option");
+                option.value = String(rate / 1e6);
+                option.label = `${rate / 1e6} MS/s`;
+                list.appendChild(option);
+            }
+        }
+        input.setAttribute("list", "rate-choices");
+        input.title = `this radio reports: `
+            + rateChoices.map((r) => r / 1e6).join(" / ") + " MS/s"
+            + (Number.isFinite(qualifiedMaxRate)
+               ? ` — qualified to ${qualifiedMaxRate / 1e6} MS/s` : "");
+        // Flag an unqualified value AS IT IS TYPED, not only once applied.
+        if (!input.dataset.rateWatch) {
+            input.dataset.rateWatch = "1";
+            input.addEventListener("input", () => markRateField(input));
+        }
+        markRateField(input);
+    }
+
+    // The banner tracks the APPLIED rate, so it stays up for every viewer as
+    // long as that rate is running — not just for whoever typed it.
+    const banner = document.getElementById("rate-banner");
+    if (!banner) return;
+    const applied = Number(config && config.capture && config.capture.sample_rate);
+    const over = Number.isFinite(applied) && applied > qualifiedMaxRate;
+    banner.hidden = !over;
+    if (over) {
+        // One line on screen, the whole story on hover. The strip has to
+        // survive being looked at for an hour without becoming furniture.
+        banner.textContent =
+            `⚠ UNQUALIFIED SAMPLE RATE — ${applied / 1e6} MS/s, above the `
+            + `${qualifiedMaxRate / 1e6} MS/s qualified on hardware. `
+            + `Dropped samples and a shorter span are possible, and silent.`;
+        banner.title = unprovenRateText(applied);
+    }
+}
+
+function markRateField(input) {
+    // The field is in MHz/MS/s (dataset.unitScale); qualifiedMaxRate is Hz.
+    const scale = Number(input.dataset.unitScale) || 1;
+    const value = Number(input.value) * scale;
+    input.classList.toggle("rate-unqualified",
+                           Number.isFinite(value) && value > qualifiedMaxRate);
 }
 
 // Applied source-spec overrides (verified-reconnect path): seed the Source

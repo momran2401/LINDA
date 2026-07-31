@@ -24,7 +24,7 @@ didn't raise actually took effect.
 from __future__ import annotations
 
 from .. import state
-from ..constants import DEVICE_PROFILES
+from ..constants import DEVICE_PROFILES, envelope_query_groups
 from ..shims import get_device
 
 try:
@@ -95,13 +95,26 @@ class DeviceAdapter:
     def describe_capabilities(self):
         """Summarize this device's identity and capabilities for the frontend.
 
+        The reported envelope folds in any rate limits learned at
+        enumeration (`_probe_rate_limits`). Without that it would keep
+        serving the profile's static guess next to the live, driver-derived
+        envelope `/config` ships separately — two numbers for one radio,
+        which is exactly the kind of quiet disagreement this layer exists to
+        prevent.
+
         Returns:
             dict: Static/near-static capability info — name, label, serial,
             driver, active channels, TX channel count, sample-rate/frequency
-            envelope, whether the envelope is a live device query, whether
-            readback is supported, and the verification tolerances.
+            envelope, which envelope groups are taken from a live device
+            query, whether readback is supported, and the verification
+            tolerances.
         """
         prof = self.profile
+        envelope = dict(prof["envelope"])
+        for key in ("rate_min", "rate_max", "rate_list"):
+            probed = self.info.get("_" + key)
+            if probed:
+                envelope[key] = probed
         return {
             "name":              self.name,
             "label":             self.label,
@@ -109,8 +122,8 @@ class DeviceAdapter:
             "driver":            self.info.get("driver"),
             "channels":          list(state.CHANNELS),
             "tx_channels":       self.tx_channels(),
-            "envelope":          dict(prof["envelope"]),
-            "query_envelope":    bool(prof.get("query_envelope")),
+            "envelope":          envelope,
+            "query_envelope":    sorted(envelope_query_groups(prof)),
             "supports_readback": bool(self.supports_readback),
             "tolerances": {
                 "freq_hz":  self.freq_tol_hz,

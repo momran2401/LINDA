@@ -72,24 +72,41 @@ def _snap(value, choices):
 
 
 def allowed_rates(env):
-    """LTE-grid sample rates within a device's capability envelope (P3-3).
+    """Sample rates this radio will actually accept (P3-3).
 
-    The rate grid itself (`RATES_HZ`, cellular multiples of 1.92 MHz) is
-    domain logic, not a device property; `env` only filters which grid
-    entries a given radio can actually run.
+    Two sources, in order of authority:
+
+    1. ``env["rate_list"]`` — the DISCRETE set the driver itself reported
+       (SoapySDR ``listSampleRates``, collected by
+       `core.shims.query_device_envelope`). When a radio answers this
+       question, its answer wins outright: the static grid below is a guess
+       about the family, and this is the radio speaking about itself. This
+       matters because the guesses are known wrong in both directions — this
+       AIR-T firmware rejects the nominal LOW grid points (see
+       `radioctl.py`'s self-test note) while the profile simultaneously
+       claims a 125 MHz ceiling nothing has ever run.
+    2. ``RATES_HZ`` clipped to ``[rate_min, rate_max]`` — the cellular
+       family, for the drivers that do not enumerate their rates.
 
     Args:
         env: Device capability envelope with `rate_min`/`rate_max` bounds
-            (Hz), as returned by the device adapter layer.
+            (Hz) and optionally `rate_list`, as returned by the device
+            adapter layer.
 
     Returns:
-        Tuple of rates from `RATES_HZ` within `[env["rate_min"],
-        env["rate_max"]]`. Falls back to the full `RATES_HZ` grid if that
-        intersection is empty, so callers snapping to the result never face
-        an empty choice list.
+        Sorted tuple of legal rates in Hz. Never empty: an envelope that
+        excludes every candidate falls back to the full `RATES_HZ` grid, so
+        callers snapping to the result always have somewhere to land.
     """
-    rates = tuple(r for r in RATES_HZ
-                  if env["rate_min"] <= r <= env["rate_max"])
+    lo = float(env.get("rate_min", 0.0))
+    hi = float(env.get("rate_max", float("inf")))
+    reported = env.get("rate_list")
+    if reported:
+        rates = tuple(sorted(
+            float(r) for r in reported if lo <= float(r) <= hi))
+        if rates:
+            return rates
+    rates = tuple(r for r in RATES_HZ if lo <= r <= hi)
     return rates or RATES_HZ
 # ---------------------------------------------------------------------------
 # Spectrogram compute backends

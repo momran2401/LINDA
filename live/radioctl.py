@@ -171,6 +171,18 @@ def print_status(client):
     print("capture      : {:.6f} MHz  {:.4f} MS/s  gain={:.2f} dB  nfft={}".format(
         cap["center_frequency"] / 1e6, cap["sample_rate"] / 1e6,
         cap["gain"], cap["nfft"]))
+    # The rates this radio reports, and whether the one running is proven.
+    # Over SSH this line is the only place the ceiling is visible at all —
+    # there is no banner out here.
+    rates = config.get("rates") or ()
+    if rates:
+        qualified = float(config.get("qualified_max_rate") or 0)
+        print("rates        : {}  MS/s".format(
+            " / ".join(f"{float(r)/1e6:g}" for r in rates)))
+        if qualified and cap["sample_rate"] > qualified:
+            print("               ⚠ RUNNING ABOVE THE QUALIFIED {:g} MS/s — the "
+                  "driver accepted it,\n                 but dropped samples and "
+                  "a shorter span are possible, and silent.".format(qualified / 1e6))
     print("analysis     : {}  rows={}".format(config["backend"], config["rows"]))
     if config.get("source"):
         print("source ovr   : {}".format(config["source"]))
@@ -294,9 +306,15 @@ def self_test(client, timeout=30.0):
     cap, env = config["capture"], config["envelope"]
     center = float(cap["center_frequency"])
     step = 1e6 if center + 1e6 <= env["freq_max"] else -1e6
-    # Prefer a higher LTE-grid rate: AIR-T's current CV firmware accepts
-    # 15.36/30.72 MS/s but rejects the nominal lower grid points.
-    rates = [r for r in (30.72e6, 15.36e6, 7.68e6, 3.84e6)
+    # Prefer a higher rate: AIR-T's current CV firmware accepts 15.36/30.72
+    # MS/s but rejects the nominal lower grid points. Drawn from the rates
+    # the SERVER says this radio accepts (`/config`'s `rates`), and capped
+    # at the qualified ceiling — a reversible self-test must not be the
+    # thing that discovers an unproven rate starves the display.
+    qualified = float(config.get("qualified_max_rate") or 30.72e6)
+    offered = [float(r) for r in (config.get("rates") or ())
+               if float(r) <= qualified]
+    rates = [r for r in sorted(offered, reverse=True)
              if env["rate_min"] <= r <= env["rate_max"]
              and r != cap["sample_rate"]]
     if env["gain_min"] < 0 and cap["gain"] <= 0:
