@@ -704,6 +704,173 @@ body.light-theme ::-webkit-scrollbar-thumb:hover { background: #aab6c7; }
        that section comes later in the file and would override them here. */
 }
 
+/* ══ PHONES ═══════════════════════════════════════════════════════════════
+   Everything below is inside a media query on purpose: the desktop layout is
+   the product and must not shift by a pixel to make a phone work.
+
+   THE BUG THIS FIXES. On desktop the app is a fixed app-shell — #dashboard
+   is a flex column inside a viewport-height grid row, so `flex: 1.6 1 0` and
+   `flex: 1.05 1 0` divide a KNOWN height between the waterfalls and the PSD.
+   The 720px rule above switches the body to `overflow-y: auto`, which makes
+   #dashboard content-height instead. A flex-basis of 0 in a container whose
+   height comes from its content resolves to nothing, and the canvases inside
+   are height:100% of nothing — so both graph rows collapsed. Measured on a
+   375px viewport before this block: waterfall pane 2px tall, PSD row 8px.
+   That is the whole "you can't see the graphs on mobile" report: not a
+   scaling problem, a collapsed-flex problem.
+
+   The fix is to stop pretending the page is an app-shell once it scrolls.
+   Each graph becomes a card with a REAL height and the page scrolls through
+   them, which is also the right interaction on a phone. */
+/* Matched on SIZE only, deliberately — no `pointer: coarse`. The condition a
+   layout actually cares about is how much room it has, not what is pointing
+   at it; a 700px desktop window has the identical problem and the existing
+   720px block above already treats it as a small screen, so keying off the
+   same width keeps the two consistent. It is also the only version that can
+   be tested: `pointer: coarse` is not emulated by viewport resizing, so a
+   rule gated on it cannot be verified before it ships.
+
+   The second clause catches a phone held SIDEWAYS. 812x375 is wider than any
+   width breakpoint, so it used to fall through to the desktop app-shell and
+   squeeze the waterfall into 49px. The 950px companion bound keeps a normal
+   desktop window out of it — one both under 950px wide AND under 560px tall
+   is not a desktop layout anyone is using on purpose. */
+@media (max-width: 720px),
+       (max-height: 560px) and (max-width: 950px) {
+    /* Let the document GROW. `html, body { height: 100% }` plus body's
+       `height: 100dvh` pins the body to exactly one screen, so the `main`
+       row got whatever was left over — 246px — while the dashboard inside it
+       held ~950px of graph cards and simply painted OUT of its row, straight
+       over the footer. Everything below only works once the page is allowed
+       to be taller than the screen.
+       Also: graphs BEFORE controls. On a phone the first thing on screen
+       after the header should be the signal, not three screens of knobs you
+       have to scroll past to find out whether the radio is even running. */
+    html, body { height: auto; }
+    body {
+        min-height: 100dvh;
+        overflow-y: auto;
+        /* Single column, restated rather than inherited: this block also
+           matches a LANDSCAPE phone at 812px wide, where the 720px block
+           above does not run — and without it the body kept its two-column
+           `var(--rail-w) minmax(0,1fr)` track list, so every named area sat
+           in the 288px rail column and the dashboard was a third of the
+           screen wide. */
+        grid-template-columns: 1fr;
+        grid-template-rows: auto auto auto auto;
+        grid-template-areas: "header" "main" "rail" "footer";
+    }
+    #app-header { flex-wrap: wrap; }
+    #applied-settings {
+        order: 5; width: 100%;
+        border-left: none; padding-left: 0; margin-left: 0;
+    }
+    #dashboard { overflow: visible; }
+    #rail {
+        border-right: none;
+        border-bottom: none; border-top: 1px solid var(--border);
+    }
+
+    /* Give the header its space back. 179px of a 812px phone was 22% of the
+       screen before a single pixel of signal. */
+    #app-header { padding: 7px 12px; gap: 6px 12px; }
+    #freq-mhz { font-size: 20px; }
+    .hdiv { display: none; }
+    #applied-settings { font-size: 9px; line-height: 1.35; gap: 2px; }
+    #applied-settings .ap-row { flex-wrap: wrap; gap: 4px 10px; white-space: normal; }
+    /* The status cluster (connected · role · calibration · DAN/ARIC · theme ·
+       sign out) is `margin-left:auto; flex:0 0 auto` and does not wrap, so at
+       375px it ran 543px wide and pushed the whole document sideways. Let it
+       be its own wrapped row instead of a rigid rail. */
+    #statusbar {
+        flex: 1 1 100%; margin-left: 0; flex-wrap: wrap;
+        gap: 6px; justify-content: flex-start;
+    }
+    /* No nested scroll region. The rail is the LAST thing on the page now, so
+       capping its height only buys a second scrollbar inside the first — and
+       it cut controls in half at the boundary, which reads as broken. Let it
+       run its full length and be part of the one page scroll. */
+    #rail { max-height: none; overflow: visible; }
+    .rail-panel { overflow: visible; }
+
+    /* Five frequency labels do not fit across 375px — they ran together into
+       "3742.3 MHz3746.2 MHz3750.0 MHz…". Keep the ends and the centre (the
+       tuned frequency), which is what the axis is actually for. */
+    .wf-freq-axis span:nth-child(2),
+    .wf-freq-axis span:nth-child(4) { display: none; }
+
+    /* The PSD legend is a 1fr/auto/1fr grid; at this width the centred
+       "Frequency (MHz)" label collides with the trace keys on both sides.
+       The keys carry the information — the x tick labels are already the
+       same MHz values shown on the waterfall axis directly above. */
+    #psd-axis-label { display: none; }
+    #psd-legend { grid-template-columns: 1fr 1fr; gap: 8px; }
+    /* Nine keys never fit one 14px row at 375px — "RX2 Mean" was being
+       clipped to "ıx". paintPsdLegend already marks the keys whose series is
+       hidden, so on a phone the legend simply lists what is actually DRAWN.
+       Hold/Min/diff stay reachable from their rail checkboxes, and their keys
+       reappear here the moment the trace does. */
+    #psd-legend .psd-key.is-off { display: none; }
+
+    #dashboard { padding: 8px; gap: 8px; }
+
+    /* Stack the waterfalls as plain blocks. The desktop grid places panes in
+       ONE row (grid-template-rows: 1fr); with a single column and two
+       channels the second pane lands in an implicit auto row and the two
+       size differently. Flex column gives every channel the same treatment. */
+    #waterfall-row {
+        display: flex; flex-direction: column; gap: 8px;
+        flex: 0 0 auto; min-height: 0;
+    }
+    /* Real heights, because there is no longer a parent height to divide. */
+    .wf-pane { min-height: 34vh; }
+    #psd-row  { flex: 0 0 auto; min-height: 32vh; }
+    #log-row  { flex: 0 0 auto; }
+
+    /* Focus mode earns its keep here: one graph, full screen, one tap. The
+       desktop rules hide the siblings; these give the survivor a height,
+       since the flex-fill they rely on has nothing to fill on a scrolling
+       page. */
+    body[data-focus^="wf"] .wf-pane.pane-focused { min-height: 78vh; }
+    body[data-focus="psd"] #psd-row { min-height: 78vh; }
+    /* Touch target: a 12px glyph is not tappable. Pad it out without moving
+       it — the header row keeps its height. */
+    .pane-zoom { padding: 6px 8px; margin: -6px -4px -6px auto; font-size: 15px; }
+    .panel-head .pane-zoom { margin-left: 0; }
+
+    /* Fixed banners sit at the TOP on desktop, where there is chrome to spare.
+       On a phone that lands squarely on the brand and the frequency readout —
+       the two things a viewer looks at first. Move them to the bottom, where
+       they still cannot be missed (they stay fixed while the page scrolls)
+       but cover nothing that matters. */
+    #recording-banner, #tx-banner, #rate-banner {
+        top: auto; bottom: 8px; left: 8px; right: 8px;
+        transform: none; max-width: none; border-radius: 7px;
+    }
+    #rate-banner { white-space: normal; border-top: 1px solid #e57373; }
+
+    /* Wide fixed-width controls overflow a 375px column otherwise. */
+    #dashboard, .rail-panel { min-width: 0; }
+    .rail-panel select, .rail-panel input[type="number"], .rail-panel input[type="text"] {
+        max-width: 100%;
+    }
+}
+
+/* Phone in LANDSCAPE. Same scrolling cards as portrait — 375px of height
+   cannot hold a header plus two waterfalls plus a PSD however it is sliced —
+   but the width is back, so the channels sit side by side again and each card
+   is a near-full screen of signal. */
+@media (min-width: 561px) and (max-height: 560px) and (max-width: 950px) {
+    #waterfall-row { flex-direction: row; }
+    /* Share the width evenly. Without a basis the panes size to their content
+       — a canvas that is width:100% of nothing — and collapse to ~130px in an
+       812px viewport, which is the portrait bug wearing a different hat. */
+    .wf-pane { flex: 1 1 0; min-width: 0; min-height: 68vh; }
+    #psd-row  { min-height: 62vh; }
+    body[data-focus^="wf"] .wf-pane.pane-focused { min-height: 80vh; }
+    body[data-focus="psd"] #psd-row { min-height: 80vh; }
+}
+
 /* ── OPS panel: verified operations + service health ─────────────────────── */
 #ops-health {
     font: 11px/1.6 "IBM Plex Mono", Menlo, monospace;
