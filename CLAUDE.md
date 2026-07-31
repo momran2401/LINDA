@@ -447,6 +447,21 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   old `floor(size/2000)` stride aliased against the bin grid and, at depth
   2000 with a 1024-point FFT, sampled a single frequency bin for the entire
   scale.
+- **Mobile is a separate layout, not a scaled desktop.** Desktop is a fixed
+  no-scroll app-shell: `#dashboard` divides a KNOWN viewport height between
+  the waterfalls (`flex: 1.6 1 0`) and the PSD (`flex: 1.05 1 0`). The phone
+  block makes the page SCROLL, which makes `#dashboard` content-height — and
+  a flex-basis of 0 in a content-height container resolves to nothing, so
+  both graph rows collapsed (measured: 2px waterfall pane, 8px PSD row).
+  Phones therefore get explicit `min-height` cards, `grid-template-areas`
+  reordered to put graphs BEFORE the control rail, and no nested scroll
+  region. The block restates `grid-template-columns: 1fr` rather than
+  inheriting it, because it also matches a LANDSCAPE phone (812×375) where
+  the older 720px block does not run — without it every area sat in the
+  288px rail column. Matched on size only, never `pointer: coarse`: that
+  cannot be emulated by viewport resizing, so a rule gated on it ships
+  unverified. Desktop must stay byte-identical — verify no mobile query
+  matches at 1440×900 before calling a change done.
 - **Never draw a uPlot whose scales are still null** (`uplotDrawable`).
   `initUplot` builds with all-null series, and drawing in that window makes
   uPlot's `axes()` throw "object null is not iterable", which aborts its own

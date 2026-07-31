@@ -131,8 +131,10 @@ function updateDeviceLabel(label) {
     curDevice = label;
     // The header title is now static ("SDR LIVE Viewer" / NIST) — the device
     // name and channel count live in the Applied Settings band via updateMeta().
-    // We still set the browser tab title so the device is identifiable there.
-    document.title = `${label} · SDR LIVE Viewer`;
+    // We still set the browser tab title so the radio is identifiable there:
+    // several of these are open at once when more than one radio is running,
+    // and the tab has to say WHICH radio without being clicked.
+    document.title = `LINDA - ${label}`;
     // Brand sub-line in the header shows the live device + channel count.
     const brandSub = document.getElementById("brand-device");
     if (brandSub) brandSub.textContent = n ? `${label} · ${n}ch` : label;
