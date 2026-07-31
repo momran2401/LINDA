@@ -1,5 +1,5 @@
 # Versions qualified together for the maintained web/kiosk/terminal runtime.
-# striqt remains pinned by commit in setup.sh. Python's Requires-Python metadata
+# striqt remains pinned by commit in install_linda.sh. Python's Requires-Python metadata
 # selects compatible transitive releases on supported Python 3.9+ hosts.
 fastapi==0.115.14
 uvicorn==0.34.3

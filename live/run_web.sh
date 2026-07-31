@@ -14,11 +14,11 @@
 #   bash live/run_web.sh --tunnel --demo --fps 10 --quantize --channels 1
 #
 # Requirements:
-#   pip install -r live/requirements.txt          (or: bash setup.sh --deps-only)
+#   pip install -r live/requirements.txt          (or: bash install_linda.sh --deps-only)
 #   --tunnel additionally needs cloudflared in PATH.
 #
 # Authentication (three username-only roles):
-#   Production deployments should use setup.sh. For ad-hoc runs:
+#   Production deployments should use install_linda.sh. For ad-hoc runs:
 #     ADMIN_USER, VIEWER_USER, INTERN_USER
 #     RADIO_SESSION_SECRET   cookie-signing key, e.g. "$(openssl rand -hex 32)"
 #     RADIO_AUTH_DISABLE=1   auth OFF for local/demo; everyone becomes admin.
@@ -33,7 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 PORT=${PORT:-8000}
 
-# Prefer the setup.sh venv when it exists.
+# Prefer the install_linda.sh venv when it exists.
 PY="$REPO_ROOT/.venv/bin/python3"
 [[ -x "$PY" ]] || PY="$(command -v python3)"
 
@@ -44,9 +44,29 @@ for a in "$@"; do
     if [[ "$a" == "--tunnel" ]]; then TUNNEL=1; else ARGS+=("$a"); fi
 done
 
+# A pass-through --port wins for the server (argparse takes the last value), so
+# it has to win here too. Without this the server listened on the requested port
+# while the tunnel, the banner, and the shutdown message all still said $PORT —
+# the published URL pointed at a port nothing was serving.
+resolve_port_override() {
+    local i
+    for ((i = 1; i <= $#; i++)); do
+        case "${!i}" in
+            --port)
+                local j=$((i + 1))
+                [[ $j -le $# ]] && PORT="${!j}"
+                ;;
+            --port=*)
+                PORT="${!i#--port=}"
+                ;;
+        esac
+    done
+}
+resolve_port_override "${ARGS[@]}"
+
 "$PY" -c "import fastapi, uvicorn" 2>/dev/null || {
     echo "ERROR: fastapi or uvicorn not installed."
-    echo "Run:  pip install -r live/requirements.txt   (or: bash setup.sh --deps-only)"
+    echo "Run:  pip install -r live/requirements.txt   (or: bash install_linda.sh --deps-only)"
     exit 1
 }
 

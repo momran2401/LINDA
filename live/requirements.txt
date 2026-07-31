@@ -1,9 +1,9 @@
 # Python dependencies for the live viewer frontends (live/core + web server).
-# The striqt acquisition/analysis stack is installed separately (see setup.sh):
+# The striqt acquisition/analysis stack is installed separately (see install_linda.sh):
 #   pip install 'striqt @ git+https://github.com/usnistgov/striqt@2e7696d3cd7c9f710f406b4b83148476ead8c20f'
 fastapi>=0.110
 uvicorn[standard]>=0.27
 # NumPy is used directly by the live acquisition and quicklook DSP paths.
 # striqt brings its own scientific/analysis dependencies when real-radio
-# support is installed by setup.sh.
+# support is installed by install_linda.sh.
 numpy>=1.24,<3

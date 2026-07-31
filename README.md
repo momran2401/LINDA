@@ -28,7 +28,7 @@ x86-64 or 64-bit ARM), clone the repository, connect the radio, then run:
 ```sh
 git clone https://github.com/momran2401/LINDA.git
 cd LINDA
-sudo bash setup.sh
+sudo bash install_linda.sh
 ```
 
 ### Method 2 — laptop/demo installation
@@ -36,7 +36,7 @@ sudo bash setup.sh
 Create the Python environment only, then start synthetic IQ data:
 
 ```sh
-bash setup.sh --deps-only
+bash install_linda.sh --deps-only
 ./.venv/bin/python live/striqt_web_server.py --demo
 ```
 
@@ -65,7 +65,7 @@ bash live/run_web.sh --device auto
 
 ## Quick Troubleshooting
 - **Setup fails after Installing GPS support** — no GPS serial device was
-    detected. Re-run with `sudo env RADIO_GPS_DEVICE=none bash setup.sh`; this
+    detected. Re-run with `sudo env RADIO_GPS_DEVICE=none bash install_linda.sh`; this
     skips GPS probing for that run and recordings will set gps_valid=0.
 - **No frames / "waiting for first frame"** — check `journalctl -u radio-web
   -f` (or the OPS tab's journal pane). The operation log names the exact
@@ -96,7 +96,7 @@ transmit safety, diagnostics, and troubleshooting.
   recordings, and tests.
 - `striqt` — separately developed upstream RF acquisition and analysis
   library; see its [README](https://github.com/usnistgov/striqt/blob/main/README.md) and documentation.
-- `setup.sh` / `uninstall_linda.sh` — idempotent installation and
+- `install_linda.sh` / `uninstall_linda.sh` — idempotent installation and
   removal of program.
 
 ## Testing
@@ -113,7 +113,7 @@ All AI-generated outputs were reviewed, tested, and edited by the human project 
 ## Additional references
 
 - [LINDA manual](docs/README_MANUAL.md) — detailed operational manual.
-- [Repository overview](REPO_OVERVIEW.md) — codebase architecture and source map.
+- [Repository overview](docs/REPO_OVERVIEW.md) — codebase architecture and source map.
 - [striqt README](https://github.com/usnistgov/striqt/blob/main/README.md) — upstream package install and CLI notes.
 
 ## License and Attribution

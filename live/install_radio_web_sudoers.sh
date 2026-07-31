@@ -56,9 +56,6 @@ fi
 install -m 0440 -o root -g root "$TMP" "$SUDOERS_FILE"
 echo "Installed. Verifying passwordless restart is now permitted…"
 
-if sudo -n -u "$SERVICE_USER" true 2>/dev/null; then
-    :  # sudo -n works for the user in general
-fi
 # Best-effort check: confirm the exact command is allowed for the user.
 if su -s /bin/bash -c "sudo -n -l $SYSTEMCTL restart $SERVICE_NAME" "$SERVICE_USER" >/dev/null 2>&1; then
     echo "OK: '$SERVICE_USER' may run 'sudo -n systemctl restart $SERVICE_NAME' without a password."

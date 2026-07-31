@@ -376,9 +376,11 @@ function connect() {
     ws.onopen = () => {
         setStatus("connected", "ok");
         logMsg("WebSocket connected");
-        // Tell the server our initial time window (duration in replace mode,
-        // fixed frame chunks in scroll mode — P2a-4)
-        sendTimeControl();
+        // The initial time window is sent once the ROLE arrives (see
+        // applyRole). Sending it here raced the role message, so sendControl's
+        // read-only guard could not suppress it and every viewer's log opened
+        // with a server "read-only role: control ignored" reply on each
+        // connect and reconnect.
     };
 
     ws.onmessage = (e) => {
@@ -476,6 +478,10 @@ function applyRole(role, authEnabled = true) {
     // Whether the TX button exists at all depends on the role AND on the radio
     // having a TX port — re-ask now that we know which role we are.
     if (typeof refreshTx === "function") refreshTx();
+    // Now that the role is known, send the initial time window — admins only,
+    // so a read-only client never provokes a "control ignored" reply it could
+    // not have avoided.
+    if (isAdmin && typeof sendTimeControl === "function") sendTimeControl();
 }
 
 let _denyHideTimer = null;
@@ -535,6 +541,11 @@ const SAFE_SELECTOR =
     "#peak-chk, #hold-chk, #diff-chk, #min-chk, #clear-hold-btn, #cross-chk, " +
     "#yspan-sel, #pause-btn, #fps-sel, #auto-color, #abs-rf, #csv-btn, #png-btn, " +
     "#ops-refresh, " +
+    // Client-only readouts: #metadata-export builds a Blob download in the
+    // browser and #preset-select only fills in a description — neither sends
+    // anything. They were denied while the equivalent #csv-btn/#png-btn were
+    // allowed, which just looked broken.
+    "#metadata-export, #preset-select, " +
     // AHAWI replay controls are pure client-side display (verified: none call
     // sendControl) — viewers may scrub the capture the admin enabled.
     "#ahawi-play, #ahawi-prev, #ahawi-next, #ahawi-scrub, #ahawi-dwell, " +
@@ -542,6 +553,10 @@ const SAFE_SELECTOR =
 function installReadOnlyGuard() {
     const block = (ev) => {
         if (!currentRole || isAdmin) return;              // admin or not-yet-known
+        // Only real user interaction is gated. A synthetic event dispatched by
+        // our own code is not someone trying to touch the radio, and treating
+        // it as one produced "access denied" popups nobody asked for.
+        if (ev.isTrusted === false) return;
         const t = ev.target;
         if (t && t.closest && t.closest("#access-denied")) return;  // popup itself
         // Allow the whitelisted safe controls through untouched — including a
@@ -1316,7 +1331,10 @@ function renderInsights(data) {
         const lines = power.values.map((_, ch) => {
             const rms = lastDetector(power.values, ch, 0);
             const peak = lastDetector(power.values, ch, 1);
-            return `RX${ch + 1}  RMS ${rms?.toFixed(2) ?? "—"} ${power.units}  ·  peak ${peak?.toFixed(2) ?? "—"}  ·  crest ${(peak !== null && rms !== null ? peak-rms : NaN).toFixed(2)} dB`;
+            // A missing detector renders as an em-dash, not the string "NaN dB".
+            const crest = (peak !== null && rms !== null)
+                ? `${(peak - rms).toFixed(2)} dB` : "—";
+            return `RX${ch + 1}  RMS ${rms?.toFixed(2) ?? "—"} ${power.units}  ·  peak ${peak?.toFixed(2) ?? "—"}  ·  crest ${crest}`;
         });
         pel.textContent = lines.join("\n") + `\n${power.detector_period_s * 1000} ms native detector bins`;
     }
@@ -1349,12 +1367,21 @@ async function loadPresets() {
     analysisPresets.forEach(p => {
         const opt = document.createElement("option"); opt.value = p.id; opt.textContent = p.label; select.appendChild(opt);
     });
-    select.dispatchEvent(new Event("change"));
+    // Call the handler directly instead of dispatching a synthetic "change".
+    // The read-only guard listens for change in the capture phase and
+    // #preset-select is not whitelisted, so the synthetic event was blocked
+    // like a real click: every viewer got an unprovoked "access denied" popup
+    // (a full-screen takeover for interns) ~1 s after page load, and the
+    // stopImmediatePropagation also meant the description never filled in.
+    showPresetDescription(select.value);
 }
-document.getElementById("preset-select")?.addEventListener("change", e => {
-    const p = analysisPresets.find(x => x.id === e.target.value);
+function showPresetDescription(id) {
+    const p = analysisPresets.find(x => x.id === id);
     const el = document.getElementById("preset-description");
     if (el) el.textContent = p?.description || "";
+}
+document.getElementById("preset-select")?.addEventListener("change", e => {
+    showPresetDescription(e.target.value);
 });
 document.getElementById("preset-apply")?.addEventListener("click", async () => {
     const id = document.getElementById("preset-select").value;
@@ -2875,9 +2902,19 @@ function resetBand(freqs) {
 
 // PSD band-monitor selection: drag to move/resize the analysis band.
 // No x-axis zoom/pan/box-zoom — the PSD always live-follows the full span.
+let bandDragAbort = null;      // AbortController for the CURRENT plot's listeners
 function setupBandDrag() {
     if (!uplot) return;
     const over = uplot.over;   // the event-capture div over the uPlot canvas
+
+    // Drop the previous plot's window listeners. setupBandDrag runs on every
+    // uPlot rebuild — retune, theme toggle, Absolute-RF toggle, channel change,
+    // std↔psd-stats swap — and the old anonymous window listeners were never
+    // removed, so a long session accumulated one live closure set per rebuild,
+    // each recomputing the band on every pointermove.
+    if (bandDragAbort) bandDragAbort.abort();
+    bandDragAbort = new AbortController();
+    const sig = bandDragAbort.signal;
 
     let dragStart = null;
     let origLo, origHi;
@@ -2938,14 +2975,14 @@ function setupBandDrag() {
         else if (bandDrag === "body"){ bandLo = origLo + delta; bandHi = origHi + delta; }
         else if (bandDrag === "new") { bandHi = f; }
         if (uplot) uplot.redraw();
-    });
+    }, { signal: sig });
 
     window.addEventListener("pointerup", () => {
         if (bandDrag) {
             bandDrag = null;
             over.style.cursor = "crosshair";
         }
-    });
+    }, { signal: sig });
 }
 
 // ---------------------------------------------------------------------------
@@ -3182,7 +3219,19 @@ function applyDuration() {
 
 durSel.addEventListener("change", applyDuration);
 durCustom.addEventListener("change", applyDuration);
-durCustom.addEventListener("input", applyDuration);
+// Debounced, NOT applied per keystroke. Bound directly to "input", typing
+// "150" sent three control messages (1 ms, 15 ms, 150 ms) — three server
+// operations, each clearing the IQ ring — and each ack scheduled a /config
+// re-seed that could rewrite this very box mid-typing.
+let durCustomTimer = null;
+durCustom.addEventListener("input", () => {
+    clearTimeout(durCustomTimer);
+    durCustomTimer = setTimeout(applyDuration, 500);
+});
+durCustom.addEventListener("blur", () => {
+    clearTimeout(durCustomTimer);
+    applyDuration();
+});
 
 document.getElementById("fps-sel").addEventListener("change", (e) => {
     maxFps = parseFloat(e.target.value) || 15;   // client-side render cap (LV-U1a)
@@ -3286,7 +3335,7 @@ function verifyRestart(oldBootId) {
                       "rule installed?)",
                 "ERROR"
             );
-            setStatus("reset NOT verified — see log", "err");
+            setStatus("reset NOT verified — see log", "error");
             return;
         }
         let health = null;
@@ -3337,7 +3386,7 @@ if (resetRadioBtn) {
                     verifyRestart(j.boot_id || null);
                 } else {
                     logMsg(`[reset] FAILED (${status}): ${j.error || "unknown"}`, "ERROR");
-                    setStatus("reset failed — see log", "err");
+                    setStatus("reset failed — see log", "error");
                 }
             })
             .catch((err) => {
@@ -3610,6 +3659,15 @@ function gateStationChips(env) {
         const legal = hz >= env.freq_min && hz <= env.freq_max;
         chip.disabled = !legal;
         chip.classList.toggle("is-disabled", !legal);
+        // Keep the caption honest too: a chip re-enabled for a wider-tuning
+        // radio used to keep reading "below radio range" while being clickable.
+        const mhzEl = chip.querySelector(".fc-mhz");
+        if (mhzEl) {
+            mhzEl.textContent = legal
+                ? `${(hz / 1e6) >= 1000 ? (hz / 1e9).toFixed(3) + " GHz"
+                                        : (hz / 1e6).toFixed(3) + " MHz"}`
+                : "outside radio range";
+        }
         if (!legal) {
             chip.title = `Outside this device's ${(env.freq_min / 1e6).toFixed(0)}–` +
                          `${(env.freq_max / 1e6).toFixed(0)} MHz tuning range`;
