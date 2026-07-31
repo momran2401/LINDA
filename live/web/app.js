@@ -1531,7 +1531,10 @@ function onFrame(data) {
     } else if (serverStats) {
         if (ahawiActive) ahawiDeactivate();
         // PSD backend (P2b-4): block rows are statistic traces, not time —
-        // draw them directly; no waterfall to update.
+        // draw them directly; no waterfall to update. body.analysis-psd hides
+        // the waterfall row outright, so a waterfall focus has nothing left to
+        // show — release it rather than leave a blank dashboard.
+        if (typeof focusTarget === "number") setFocus(null);
         renderServerPsd(channels, blocks, rows, nfft);
     } else {
         if (ahawiActive) ahawiDeactivate();
@@ -1626,6 +1629,11 @@ function ensureChannels(channels) {
     if (channelList && channelsKey(channelList) === channelsKey(list)) return;
     channelList = list;
 
+    // The panes are about to be rebuilt from scratch. A focus on a channel
+    // that may not survive the new header set would hide every pane with
+    // nothing left to restore, so drop it and let the user re-pick.
+    if (typeof focusTarget === "number") setFocus(null);
+
     const row = document.getElementById("waterfall-row");
     const tpl = document.getElementById("wf-pane-tpl");
     row.textContent = "";
@@ -1669,6 +1677,94 @@ function computeDisplayDepth(rows, nfft, fs) {
     if (replaceMode || ahawiActive) return rows;
     return rowsForWindowMs(windowMs);
 }
+
+// ---------------------------------------------------------------------------
+// Focus mode: give one graph the whole dashboard
+// ---------------------------------------------------------------------------
+// Click a pane's header and that graph takes the panel area; the other graphs
+// collapse. The gain is real and not cosmetic — see the .pane-zoom comment in
+// style.css: a half-width pane showing 1024 bins is dropping ~40% of them to
+// nearest-neighbour downscaling before you ever see them.
+//
+// What this deliberately does NOT do:
+//
+//   - It does not free buffer. The IQ ring is allocated per channel
+//     (core/acquisition.py: (channels, MAX_TAIL)); hiding a pane gives the
+//     other one exactly zero extra samples. Depth is a function of sample
+//     rate and MAX_TAIL, nothing else.
+//   - It does not touch server config. `rows` is GLOBAL — one viewer zooming
+//     their own pane must not change the frame geometry every other viewer is
+//     watching, and it must not write an operation to the log per click.
+//
+// So this is a per-client view state that sends nothing. Hidden panes keep
+// ingesting (their buffers stay whole) and skip only their pixel work.
+let focusTarget = null;          // null | "psd" | channel number
+const wfNeedsRepaint = {};       // pane fell behind while hidden → full repaint
+const wfGeom = {};               // ch → {nfft, depth} for the repaint path
+
+function paneVisible(ch) {
+    return focusTarget === null || focusTarget === ch;
+}
+
+function setFocus(target) {
+    if (focusTarget === target) return;
+    focusTarget = target;
+    if (target === null) delete document.body.dataset.focus;
+    else document.body.dataset.focus = (target === "psd") ? "psd" : `wf${target}`;
+
+    for (const ch of (channelList || [])) {
+        const pane = document.getElementById(`wf-pane-${ch}`);
+        if (pane) pane.classList.toggle("pane-focused", target === ch);
+    }
+    // Panes that were hidden have a stale canvas: their buffer kept filling
+    // but nothing painted it. Repaint from the buffer so a restored pane shows
+    // continuous history instead of a frozen strip with a seam in it.
+    for (const ch of (channelList || [])) {
+        if (!paneVisible(ch) || !wfNeedsRepaint[ch]) continue;
+        const geom = wfGeom[ch];
+        if (geom) paintWaterfall(ch, geom.nfft, geom.depth, geom.depth, true);
+        wfNeedsRepaint[ch] = false;
+    }
+    // The PSD plot is absolutely sized by uPlot, so it has to be told.
+    fitUplotToContainer();
+    if (ahawiActive) drawAhawiStrips();
+}
+
+// Focus a target only if it is actually on screen: the PSD backend hides the
+// waterfall row entirely (body.analysis-psd), and a channel can leave the
+// header set on a reconnect. Focusing something invisible would blank the
+// dashboard with no way back except Esc.
+function focusIsAvailable(target) {
+    if (target === "psd") return true;
+    if (!channelList || !channelList.includes(target)) return false;
+    return !document.body.classList.contains("analysis-psd");
+}
+
+function toggleFocus(target) {
+    if (focusTarget === target) return setFocus(null);
+    if (!focusIsAvailable(target)) return;
+    setFocus(target);
+}
+
+// Header clicks. Delegated from the document so panes cloned later are
+// covered without rebinding. `.pane-zoom` is a plain span, not a control, so
+// the read-only guard (CONTROL_SELECTOR) never sees it — focus is a view
+// action every role may take.
+document.addEventListener("click", (ev) => {
+    const title = ev.target.closest && ev.target.closest(".wf-title");
+    if (title) {
+        const pane = title.closest(".wf-pane");
+        const ch = pane && Number(pane.id.replace("wf-pane-", ""));
+        if (pane && Number.isFinite(ch)) toggleFocus(ch);
+        return;
+    }
+    const head = ev.target.closest && ev.target.closest("#psd-row .panel-head");
+    if (head) toggleFocus("psd");
+});
+
+document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && focusTarget !== null) setFocus(null);
+});
 
 function updateWaterfall(ch, block, rows, nfft, center, fs) {
     const depth = computeDisplayDepth(rows, nfft, fs);
@@ -1718,19 +1814,43 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
         levels = [vmin, vmax - vmin < 5 ? vmin + 5 : vmax];
     }
 
-    // ── Render buffer → ImageData via viridis LUT ─────────────────────────
-    // In rolling mode only the incoming rows need color conversion. Shift the
-    // existing canvas in its native bitmap, then upload the small dirty strip.
-    // The old full-buffer conversion touched >1 million pixels per frame and
-    // limited Chromium to ~11 FPS even though the wire delivered exactly 15.
+    // Geometry the repaint-on-restore path needs (see paintWaterfall).
+    wfGeom[ch] = { nfft, depth };
+
+    // A pane hidden by focus mode keeps its BUFFER current — the PSD, band
+    // monitor and hold/min traces all read wfBuf, and a restored pane must
+    // show continuous history, not a hole. Only the pixel work below is
+    // skipped, which is where the cost actually is.
+    if (!paneVisible(ch)) {
+        wfNeedsRepaint[ch] = true;
+        return;
+    }
+
+    const fullRender = replaceMode || ahawiActive || reallocated
+                       || wfNeedsRepaint[ch];
+    paintWaterfall(ch, nfft, depth,
+                   fullRender ? depth : Math.min(bLen / nfft, depth),
+                   fullRender);
+    wfNeedsRepaint[ch] = false;
+}
+
+// Render `newRows` rows of wfBuf[ch] → the pane's canvas via the viridis LUT.
+//
+// In rolling mode only the incoming rows need color conversion: shift the
+// existing canvas in its native bitmap, then upload the small dirty strip.
+// The old full-buffer conversion touched >1 million pixels per frame and
+// limited Chromium to ~11 FPS even though the wire delivered exactly 15.
+// `full` repaints the whole buffer instead — used on reallocation, on
+// replace/AHAWI frames, and when a pane comes back from being hidden.
+function paintWaterfall(ch, nfft, depth, newRows, full) {
+    const buf = wfBuf[ch];
+    if (!buf || !wfImageData[ch] || !wfCtx[ch]) return;
     const imgData  = wfImageData[ch].data;
     const LUT      = window.VIRIDIS_LUT;
     const [vmin, vmax] = levels;
     const rng      = vmax - vmin || 1;
 
-    const fullRender = replaceMode || ahawiActive || reallocated;
-    const newRows = fullRender ? depth : Math.min(bLen / nfft, depth);
-    const renderSize = newRows * nfft;
+    const renderSize = Math.min(newRows * nfft, buf.length);
     for (let i = 0; i < renderSize; i++) {
         const t  = Math.max(0, Math.min(1, (buf[i] - vmin) / rng));
         const li = Math.round(t * 255) * 4;
@@ -1739,7 +1859,7 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
         imgData[i * 4 + 2] = LUT[li + 2];
         imgData[i * 4 + 3] = 255;
     }
-    if (fullRender) {
+    if (full) {
         wfCtx[ch].putImageData(wfImageData[ch], 0, 0);
     } else if (newRows > 0) {
         const keepRows = depth - newRows;
@@ -1969,6 +2089,10 @@ function drawAhawiStrips() {
 function drawAhawiStrip(ch, colorIdx) {
     const canvas = document.querySelector(`#wf-pane-${ch} .wf-strip`);
     if (!canvas || !ahawiCap) return;
+    // A hidden pane reports clientWidth 0, so drawing it would size the strip
+    // from the fallback and cache a bitmap that is wrong the moment the pane
+    // comes back. setFocus() redraws the strips on restore.
+    if (!paneVisible(ch)) return;
     const W = canvas.clientWidth || 600;
     const H = canvas.clientHeight || 46;
     if (canvas.width !== W)  canvas.width  = W;

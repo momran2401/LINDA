@@ -420,7 +420,11 @@
     <section id="waterfall-row"></section>
     <template id="wf-pane-tpl">
         <div class="wf-pane">
-            <div class="wf-title"><span class="dot"></span><span class="wf-title-text"></span></div>
+            <!-- The title bar is the focus target, not the canvas: the PSD's
+                 plot area already owns a drag gesture (band monitor) and the
+                 waterfall a crosshair, so a click on the graph itself is
+                 spoken for. A header click is unambiguous on every pane. -->
+            <div class="wf-title"><span class="dot"></span><span class="wf-title-text"></span><span class="pane-zoom" title="Give this graph the whole panel (Esc to restore)">⤢</span></div>
             <div class="wf-wrap">
                 <canvas class="wf-canvas"></canvas>
                 <div class="wf-freq-axis"></div>
@@ -439,6 +443,7 @@
                 <span class="key"><i class="swatch swatch-mean"></i>Mean</span>
                 <span class="key"><i class="swatch swatch-max"></i>Max</span>
             </div>
+            <span class="pane-zoom" title="Give this graph the whole panel (Esc to restore)">⤢</span>
         </div>
         <div id="psd-container">
             <div id="psd-plot"></div>

@@ -389,6 +389,42 @@ body.analysis-psd #psd-row { flex: 1 1 auto; }
 }
 .wf-freq-axis .wf-axis-win { color: var(--yellow); }
 
+/* ── Focus mode (click a pane header to give it the whole dashboard) ─────
+   Why this is worth having at all: .wf-canvas has a bitmap of exactly
+   nfft × depth (set in updateWaterfall) stretched to the pane by CSS, with
+   image-rendering: pixelated. When the pane is narrower than nfft — 1024
+   bins in a ~600 px half-width pane, the normal two-channel case — the
+   browser downscales NEAREST-NEIGHBOUR and simply drops ~40% of the
+   frequency bins from what you see. Going full width is not cosmetic; it
+   puts bins back on screen that were being discarded at the last step.
+
+   Focus is purely a VIEW state: per-client, sends nothing, changes no server
+   config. Hidden panes keep ingesting into their buffers (the PSD is derived
+   from them) and skip only the pixel work — see paneVisible() in app.js. */
+.pane-zoom {
+    margin-left: auto; flex: 0 0 auto; cursor: zoom-in; user-select: none;
+    padding: 0 2px; font-size: 12px; line-height: 1; color: var(--text-faint);
+    transition: color .12s;
+}
+.pane-zoom:hover { color: var(--text); }
+.panel-head .pane-zoom { margin-left: 0; }
+body[data-focus] .pane-zoom { cursor: zoom-out; }
+/* The focused pane names its own escape hatch — a hidden sibling pane must
+   never read as a pane that broke. */
+body[data-focus] .pane-zoom::after {
+    content: " esc"; font: 600 9px sans-serif; letter-spacing: .06em;
+    vertical-align: 1px;
+}
+
+/* A focused waterfall takes the whole dashboard: PSD collapses, siblings
+   hide. The log row stays — it is not a graph, it is where notices land. */
+body[data-focus^="wf"] #psd-row { display: none; }
+body[data-focus^="wf"] #waterfall-row { flex: 1 1 auto; grid-template-columns: 1fr; }
+body[data-focus^="wf"] .wf-pane:not(.pane-focused) { display: none; }
+/* A focused PSD does the same in reverse. */
+body[data-focus="psd"] #waterfall-row { display: none; }
+body[data-focus="psd"] #psd-row { flex: 1 1 auto; }
+
 /* PSD */
 #psd-row { flex: 1.05 1 0; min-height: 0; display: flex; flex-direction: column; }
 #psd-container { flex: 1 1 auto; min-height: 0; background: var(--plot-bg); overflow: hidden; position: relative; padding: 6px; }
