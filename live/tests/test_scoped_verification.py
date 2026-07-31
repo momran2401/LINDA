@@ -53,3 +53,65 @@ def test_superseded_is_a_distinct_terminal_state():
     op2 = OPERATIONS.get(a2["op_id"])
     assert op2["state"] == "running"
     state.configure_device("demo")
+
+
+# ── Gain verdicts (audit item 9) ──────────────────────────────────────────
+# `cfg.gain` is striqt's CALIBRATED gain; most drivers report a raw composite
+# gain on a different scale. Judging them against each other collapsed every
+# config op on a healthy radio to "mismatch", because verdict_state treats any
+# mismatched field as fatal. An incomparable gain must read "we did not verify
+# this", not "the radio disagreed".
+
+def _demo_adapter():
+    from core.devices.base import DeviceAdapter
+    state.configure_device("demo")
+
+    class _A(DeviceAdapter):
+        name = "demo"
+    return _A()
+
+
+def test_incomparable_gain_is_unverified_not_mismatch():
+    from core.operations import verdict_state
+    adapter = _demo_adapter()
+    cfg = SharedConfig().snapshot()
+    cfg.gain = 0.0
+    # Driver reports a composite gain nowhere near the calibrated request.
+    actuals = {"center": cfg.center, "sample_rate": cfg.sample_rate,
+               "gain": [42.0, 42.0]}
+    verdicts = adapter.verify(cfg, actuals)
+    gains = [v for v in verdicts if v["field"].startswith("gain")]
+    assert gains, "gain must still be reported"
+    assert all(v["state"] == "readback_unsupported" for v in gains)
+    # What the driver said is still carried, so the op log can show it.
+    assert all(v["actual"] == 42.0 for v in gains)
+    # Center and rate agreed, so the operation as a whole is verified — not
+    # dragged to "mismatch" by a number that was never comparable.
+    assert verdict_state(verdicts) == "verified"
+
+
+def test_comparable_gain_is_judged_for_real():
+    from core.operations import verdict_state
+    adapter = _demo_adapter()
+    adapter.gain_readback_comparable = True
+    cfg = SharedConfig().snapshot()
+    cfg.gain = 0.0
+    ok = adapter.verify(cfg, {"center": cfg.center,
+                              "sample_rate": cfg.sample_rate,
+                              "gain": [0.1, 0.1]})
+    assert verdict_state(ok) == "verified"
+    bad = adapter.verify(cfg, {"center": cfg.center,
+                               "sample_rate": cfg.sample_rate,
+                               "gain": [9.0, 9.0]})
+    assert verdict_state(bad) == "mismatch"
+
+
+def test_center_mismatch_still_fatal():
+    # The gain change must not have softened the checks that matter.
+    from core.operations import verdict_state
+    adapter = _demo_adapter()
+    cfg = SharedConfig().snapshot()
+    verdicts = adapter.verify(cfg, {"center": cfg.center + 5e6,
+                                    "sample_rate": cfg.sample_rate,
+                                    "gain": [0.0, 0.0]})
+    assert verdict_state(verdicts) == "mismatch"

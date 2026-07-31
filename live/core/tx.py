@@ -1263,8 +1263,8 @@ class TxController:
         Returns:
             tuple: `(actual, mismatched)` — the driver's readback of
             `sample_rate_hz`/`frequency_hz`/`gain_db` (None for any getter
-            that failed), and the list of keys (excluding `gain_db`) whose
-            readback disagreed with the plan by more than its tolerance.
+            that failed), and the list of keys whose readback disagreed with
+            the plan by more than its tolerance.
         """
         OPERATIONS.stage(op_id, "applying",
                          f"tuning TX{ch}: {plan['frequency_hz']/1e6:.6g} MHz, "
@@ -1277,7 +1277,13 @@ class TxController:
              max(1.0, 1e-4 * abs(plan["sample_rate_hz"]))),
             ("frequency_hz", "getFrequency", "setFrequency",
              max(10.0, 1e-6 * abs(plan["frequency_hz"]))),
-            ("gain_db", "getGain", "setGain", 0.01),
+            # 0.5 dB, matching the RX tolerance in core/devices/base.py.
+            # This used to be 0.01 dB, which no driver meets — gain steps are
+            # quantized (0.25/0.5/1 dB depending on the part) — so gain had to
+            # be excluded from the mismatch list wholesale to stop it firing
+            # on every transmission. A tolerance the hardware can actually
+            # meet lets the check be real instead of disabled.
+            ("gain_db", "getGain", "setGain", 0.5),
         )
         untouched = []
         for key, getter, setter, tol in plan_keys:
@@ -1319,9 +1325,14 @@ class TxController:
 
         OPERATIONS.stage(op_id, "readback", "TX driver reports "
                          + ", ".join(_fmt(k, v) for k, v in actual.items()))
+        # gain_db is judged like the others now that its tolerance is one the
+        # hardware can meet. TX gain is the one setting here the operator is
+        # directly responsible for keeping legal, so a radio that quietly
+        # transmits at a different gain than commanded must not be reported as
+        # a clean transmission.
         mismatched = [
             key for key, _g, _s, tol in plan_keys
-            if key != "gain_db" and actual[key] is not None
+            if actual[key] is not None
             and abs(actual[key] - float(plan[key])) > tol
         ]
         return actual, mismatched

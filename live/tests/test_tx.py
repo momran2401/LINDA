@@ -898,3 +898,51 @@ def test_every_transmission_lands_in_the_operations_log(server):
     latest = [o for o in tx_ops if "915" in o["summary"]]
     assert latest, [o["summary"] for o in tx_ops]
     assert "two_tone" in latest[-1]["summary"] or "Two tone" in latest[-1]["summary"]
+
+
+# ── TX gain is verified like every other setting (audit item 5) ───────────
+# The tolerance used to be 0.01 dB, which no driver meets (gain steps are
+# quantized), so gain had to be excluded from the mismatch list wholesale —
+# a radio could transmit at a gain other than the one commanded and still
+# report a clean transmission. TX gain is the setting the operator is most
+# directly responsible for keeping legal, so it is judged for real now.
+
+def _op_state(ctl):
+    """Terminal state of the controller's last operation (the verdict)."""
+    from core.operations import OPERATIONS
+    return OPERATIONS.get(ctl.status()["op_id"])["state"]
+
+
+def test_tx_gain_snapped_by_the_driver_is_reported_as_a_mismatch(controller):
+    ctl, dev = controller
+    ctl.acknowledge("admin")
+
+    real_set_gain = dev.setGain
+
+    def snapping_set_gain(d, ch, v):
+        # Driver quietly runs 6 dB hotter than commanded.
+        real_set_gain(d, ch, v + 6.0)
+
+    dev.setGain = snapping_set_gain
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "gain_db": -20.0,
+               "duration_s": 0.3})
+    assert _wait_state(ctl, "idle", timeout=8)
+    assert _op_state(ctl) == "mismatch"
+
+
+def test_tx_gain_within_driver_quantization_is_not_a_mismatch(controller):
+    ctl, dev = controller
+    ctl.acknowledge("admin")
+
+    real_set_gain = dev.setGain
+
+    def quantizing_set_gain(d, ch, v):
+        # A realistic 0.25 dB step must NOT trip the check — that is exactly
+        # the false alarm the old 0.01 dB tolerance produced.
+        real_set_gain(d, ch, round(v * 4.0) / 4.0)
+
+    dev.setGain = quantizing_set_gain
+    ctl.start({"waveform": "cw", "frequency_hz": 2450e6, "gain_db": -20.1,
+               "duration_s": 0.3})
+    assert _wait_state(ctl, "idle", timeout=8)
+    assert _op_state(ctl) != "mismatch"

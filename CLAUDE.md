@@ -435,6 +435,26 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
   double-ruling — that keeps row separators right however many tabs a mode hides.
 - OPS rail tab renders `{"op": ...}` WS events + `/operations` backfill.
 - Waterfall panes are cloned per header `channels`; one channel = full width.
+- **One colour scale across all channels.** Frames are ingested for every
+  channel (`ingestWaterfall`) BEFORE anything paints (`renderWaterfalls`),
+  because auto-colour percentiles are pooled over all of them. Painting inside
+  the per-channel loop — which is what it used to do, writing a module-global
+  `levels` — gave each pane its own scale, so identical colours in RX1 and RX2
+  meant DIFFERENT powers and the panes could not be compared by eye. The
+  server already preserves this property deliberately (`core/serialization.py`
+  quantizes on a per-frame range across channels); the client must not throw
+  it away. `sampleForLevels` also forces its stride coprime with `nfft`: the
+  old `floor(size/2000)` stride aliased against the bin grid and, at depth
+  2000 with a 1024-point FFT, sampled a single frequency bin for the entire
+  scale.
+- **Never draw a uPlot whose scales are still null** (`uplotDrawable`).
+  `initUplot` builds with all-null series, and drawing in that window makes
+  uPlot's `axes()` throw "object null is not iterable", which aborts its own
+  pipeline and wedges the instance permanently — the PSD stays blank until a
+  reload. That was the Absolute-RF bug: the handler rebuilt the plot and
+  `resetBand` immediately redrew it. Rebuilds should also seed data straight
+  away (`updatePSD` reads `wfBuf`, which survives a pause) rather than waiting
+  for the next frame.
 - **Focus mode**: clicking a pane's HEADER (`.wf-title`, or the PSD
   `.panel-head` — the canvases already own a crosshair and the band-drag
   gesture) gives that graph the whole dashboard; Esc or a second click

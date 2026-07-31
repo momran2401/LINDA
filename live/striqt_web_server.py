@@ -931,8 +931,13 @@ TX_DISCLAIMER = {
         "Every transmission is logged: frequency, power, waveform, duration, "
         "and operator.",
     ],
-    "accept": "I have a license or a dummy load — arm TX",
-    "decline": "Take me back",
+    # These OVERWRITE the button labels in web/index.html (app.js applies
+    # d.accept / d.decline after fetching /tx). The notice is the legal gate —
+    # /tx/start returns 428 until it is acknowledged — so its wording lives
+    # with the server that enforces it, not in a page the browser can edit.
+    # Change the text HERE; editing index.html alone has no effect.
+    "accept": "I'm like that",
+    "decline": "I want my mommy",
 }
 
 

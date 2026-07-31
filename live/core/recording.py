@@ -82,6 +82,11 @@ class RecordingManager:
         self._stop = None
         self._thread_stop = threading.Event()
         self._status = {"state": "idle"}
+        # True while the sweep WORKER THREAD is inside run_sweep. Cleared by
+        # that thread, not by the coroutine awaiting it, so it stays truthful
+        # if `_run` is cancelled mid-await — Python cannot cancel a thread,
+        # and `_run`'s cleanup must not hand the radio back underneath one.
+        self._sweep_running = False
 
     def status(self):
         """Return a shallow copy of the current recording status dict.
@@ -298,11 +303,24 @@ class RecordingManager:
         Intended for server shutdown: unlike `stop()`, this blocks until the
         background `_run()` task finishes or the timeout elapses, swallowing
         any exception/timeout so shutdown always proceeds.
+
+        Deliberately `asyncio.wait`, NOT `asyncio.wait_for`: on timeout the
+        latter CANCELS `_run`, and cancelling it does not stop anything that
+        matters. The sweep runs in a worker thread (`asyncio.to_thread`), and
+        Python cannot cancel a thread — so the cancellation would only tear
+        down the coroutine awaiting it, run `_run`'s `finally`, and hand the
+        radio back to the live Acquirer while `run_sweep` was still inside
+        `finite_capture_mode` using it. `_run` guards that case as well (see
+        `_sweep_running`), but the cleanest answer is not to manufacture the
+        cancellation in the first place.
         """
         await self.stop()
         if self._task:
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(self._task, 15)
+            with contextlib.suppress(Exception):
+                await asyncio.wait([self._task], timeout=15)
+            if not self._task.done():
+                print("[record] sweep did not settle within 15 s; leaving it "
+                      "to finish rather than cancelling into a live handoff")
 
     def _default_spec(self, request, output):
         """Synthesize a striqt sweep YAML spec from the request and live config.
@@ -449,13 +467,32 @@ sink:
         except Exception as exc:
             terminal, detail = "failed", str(exc)
             self._status["error"] = detail
+        except asyncio.CancelledError:
+            terminal, detail = "failed", "recording task cancelled"
+            self._status["error"] = detail
+            raise
         finally:
             self._process = None
             if spec_path:
                 with contextlib.suppress(OSError):
                     spec_path.unlink()
-            self.acquirer.resume()
-            OPERATIONS.stage(op_id, "resume-live", "live acquisition resume requested")
+            # Handing the radio back while the sweep thread is still using it
+            # would race `finite_capture_mode`'s teardown — it restores the
+            # live source spec on ITS way out, and resuming underneath that
+            # puts the Acquirer on a source mid-swap. Normally the await
+            # above has already joined the thread; this only diverges if
+            # `_run` was cancelled out from under a still-running
+            # `asyncio.to_thread` (a thread Python cannot cancel).
+            if self._sweep_running:
+                print("[record] sweep thread still holds the radio; skipping "
+                      "resume to avoid racing its teardown")
+                OPERATIONS.stage(op_id, "resume-live",
+                                 "NOT resuming: the sweep thread still holds "
+                                 "the radio", level="warn")
+            else:
+                self.acquirer.resume()
+                OPERATIONS.stage(op_id, "resume-live",
+                                 "live acquisition resume requested")
             if terminal == "success":
                 self._status["state"] = "idle"
             else:
@@ -505,9 +542,22 @@ sink:
                     op_id, "progress",
                     f'{event["captures"]} captures · {event["elapsed_s"]:.1f} s')
 
-        result = await asyncio.to_thread(
-            run_sweep, str(spec_path), str(output), duration,
-            self._thread_stop.is_set, progress, self.acquirer.source)
+        def sweep():
+            """Run the blocking sweep, clearing the in-thread flag on the way out.
+
+            The flag is cleared HERE, in the worker thread, so it is still
+            true if the awaiting coroutine is cancelled while this is running
+            — that is precisely the case `_run`'s cleanup has to detect.
+            """
+            try:
+                return run_sweep(str(spec_path), str(output), duration,
+                                 self._thread_stop.is_set, progress,
+                                 self.acquirer.source)
+            finally:
+                self._sweep_running = False
+
+        self._sweep_running = True
+        result = await asyncio.to_thread(sweep)
         self._status.update(result)
 
     async def _run_demo(self, output, duration, op_id, spec_text):
