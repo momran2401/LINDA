@@ -43,6 +43,7 @@ from .constants import (
     SSB_WINDOW, SSB_LO_BANDSTOP, SSB_MAX_RATE, MAX_TAIL, RING_ROW_FILL,
     NFFT_CHOICES, BACKENDS, CALIBRATED_GRID_BACKENDS,
     AHAWI_DEFAULT_CAPTURE_MS, AHAWI_MIN_CAPTURE_MS, AHAWI_MAX_CAPTURE_MS,
+    QUALIFIED_MAX_RATE_HZ,
 )
 from .striqt_compat import _ANALYSIS_OK
 from .dsp import (
@@ -60,6 +61,30 @@ from .operations import OPERATIONS, fmt_value
 # ---------------------------------------------------------------------------
 # Shared radio config (thread-safe)
 # ---------------------------------------------------------------------------
+
+def unproven_rate_text(rate_hz: float) -> str:
+    """Wording for a sample rate above the hardware-qualified ceiling.
+
+    One function so the op log, the queued viewer notice, the terminal
+    frontend and the browser banner all say the SAME thing. The message
+    names both failure modes, because they look identical on screen (a
+    waterfall with holes in it) and neither raises: the radio can drop
+    samples faster than the host drains them, and the fixed-size IQ ring
+    holds proportionally less time at a higher rate.
+
+    Args:
+        rate_hz: The applied sample rate in Hz.
+
+    Returns:
+        A single-sentence warning naming the rate and the qualified ceiling.
+    """
+    return (
+        f"{rate_hz / 1e6:g} MS/s is above the {QUALIFIED_MAX_RATE_HZ / 1e6:g} "
+        f"MS/s this radio has been qualified at — the driver accepted it, but "
+        f"nothing has verified the pipeline keeps up. Watch for dropped "
+        f"samples and a shorter time span; both are silent."
+    )
+
 
 @dataclass
 class RadioConfig:
@@ -333,13 +358,27 @@ class SharedConfig:
 
         Args:
             env: Partial mapping of envelope keys (e.g. ``rate_min``,
-                ``freq_max``, ``gain_min``) to queried bounds. Unknown keys
-                and ``None`` values are dropped; missing keys keep their
-                existing (profile-fallback) value.
+                ``freq_max``, ``gain_min``) to queried bounds, plus the
+                optional ``rate_list`` of discrete sample rates the driver
+                enumerated. Unknown keys and ``None`` values are dropped;
+                missing keys keep their existing (profile-fallback) value.
         """
         clean = {}
         for key, value in (env or {}).items():
-            if key not in self._envelope or value is None:
+            if value is None:
+                continue
+            # `rate_list` has no profile fallback to overwrite — it exists
+            # only when a driver enumerates its rates — so it is admitted on
+            # name rather than on already being present.
+            if key == "rate_list":
+                try:
+                    rates = sorted({float(r) for r in value if float(r) > 0})
+                except (TypeError, ValueError):
+                    continue
+                if rates:
+                    clean[key] = rates
+                continue
+            if key not in self._envelope:
                 continue
             try:
                 clean[key] = float(value)
@@ -1219,6 +1258,10 @@ class SharedConfig:
             "duration", "ahawi", "ahawi_capture_ms", "ahawi_align",
         } | ANALYSIS_CFG_KEYS
         changes = []
+        # Set by the sample_rate clamp when this message lands a rate above
+        # QUALIFIED_MAX_RATE_HZ. The notice is queued after the lock is
+        # released — push_notice takes the same lock.
+        unproven_rate = None
         with self._lock:
             # Device capability bounds for this message's clamps (P3-3).
             # Read directly — self._lock is already held (envelope() would
@@ -1372,14 +1415,22 @@ class SharedConfig:
                 elif key == "sample_rate":
                     value = float(value)
                     used = value
+                    legal = allowed_rates(env)
                     if not (eff_backend == "ssb" and ssb_grid_compatible(used, eff_scs)):
-                        used = float(_snap(used, allowed_rates(env)))
+                        used = float(_snap(used, legal))
                     used = float(max(env["rate_min"], min(used, env["rate_max"])))
                     if used != value:
                         _tell(key, value, used,
-                              "sample rate snaps to the LTE/5G-NR grid ("
-                              + ", ".join(f"{r/1e6:g}" for r in allowed_rates(env))
+                              ("sample rate snaps to the rates this radio reports ("
+                               if env.get("rate_list") else
+                               "sample rate snaps to the LTE/5G-NR grid (")
+                              + ", ".join(f"{r/1e6:g}" for r in legal)
                               + " MS/s) within the radio's range")
+                    # Above the qualified line the radio may accept the rate,
+                    # read it back perfectly, and still starve the display.
+                    # Say so — a gappy waterfall looks like a quiet band.
+                    if used > QUALIFIED_MAX_RATE_HZ:
+                        unproven_rate = used
                     value = used
                 elif key == "gain":
                     used = float(max(env["gain_min"], min(value, env["gain_max"])))
@@ -1497,6 +1548,22 @@ class SharedConfig:
             else:
                 OPERATIONS.finish(op_id, "success",
                                   "nothing changed on the radio")
+            # Only when the rate actually MOVED there: the banner (driven by
+            # /config) is the standing disclosure, so re-announcing on every
+            # no-op Apply would be noise, not honesty.
+            if unproven_rate is not None and any(
+                    k == "sample_rate" for k, _, _ in changes):
+                OPERATIONS.stage(op_id, "validated",
+                                 unproven_rate_text(unproven_rate), level="warn")
+            else:
+                unproven_rate = None
+        else:
+            unproven_rate = None
+        # Queued outside the lock — push_notice takes it. The banner the
+        # client raises from /config is the primary disclosure; this notice
+        # is what the terminal frontend and radioctl see.
+        if unproven_rate is not None:
+            self.push_notice(unproven_rate_text(unproven_rate))
         return {
             "applied":   [k for k, _, _ in changes],
             "ignored":   ignored,

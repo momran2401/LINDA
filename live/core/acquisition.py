@@ -31,7 +31,7 @@ from . import devices, state
 from .config import RadioConfig, SharedConfig
 from .constants import (
     DEVICE_PROFILES, MAX_TAIL, READ_SIZE, DATA_STALE_SEC, DEMO_TONES,
-    DEFAULT_CENTER, DEMO_BURST, AHAWI_REFRESH_S,
+    DEFAULT_CENTER, DEMO_BURST, AHAWI_REFRESH_S, envelope_query_groups,
 )
 from .dsp import (
     AHAWI_BACKENDS, ahawi_capture, ahawi_plan, build_header, compute_blocks,
@@ -537,9 +537,11 @@ class Acquirer(threading.Thread):
         # clamp bounds from the live device. Failure is non-fatal — the
         # profile fallback stays in force. _recover() reopens through here,
         # so the envelope survives recovery cycles.
-        if DEVICE_PROFILES[state.DEVICE].get("query_envelope"):
+        groups = envelope_query_groups(DEVICE_PROFILES[state.DEVICE])
+        if groups:
             try:
-                self.shared.set_envelope(query_device_envelope(self.source))
+                self.shared.set_envelope(
+                    query_device_envelope(self.source, groups))
             except Exception as e:
                 print(f"[device] envelope query failed (profile fallback kept): {e}")
         print(

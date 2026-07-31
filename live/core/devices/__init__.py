@@ -285,7 +285,9 @@ def discover():
         list[dict]: One dict per enumerated device:
             {"device": profile_name, "driver": str, "label": str,
              "serial": str | None, "info": dict, "num_channels": int | None,
-             "num_tx_channels": int | None, "master_clock_rate": float | None}.
+             "num_tx_channels": int | None, "master_clock_rate": float | None,
+             "rate_list": list[float] | None, "rate_min": float | None,
+             "rate_max": float | None}.
 
     Raises:
         RuntimeError: If the SoapySDR module cannot be imported, or if
@@ -322,6 +324,9 @@ def discover():
             "num_channels": facts["num_channels"],
             "num_tx_channels": facts["num_tx_channels"],
             "master_clock_rate": facts["master_clock_rate"],
+            "rate_list":    facts["rate_list"],
+            "rate_min":     facts["rate_min"],
+            "rate_max":     facts["rate_max"],
         })
     return found
 
@@ -362,6 +367,61 @@ def _probe_master_clock(dev):
     return best
 
 
+def _probe_rate_limits(dev, rx_dir):
+    """Ask an open SoapySDR device which RX sample rates it will accept.
+
+    Asked here, at ENUMERATION, so the real ceiling is known before a source
+    is ever opened — the same reason the master clock and channel counts are
+    probed here. On the AIR-T that matters twice over: opening the radio is
+    expensive and the device is effectively a process-lifetime singleton, so
+    the UI cannot afford to wait for a live source just to learn what rates
+    to offer.
+
+    Two questions, because drivers answer them differently.
+    `listSampleRates` returns the DISCRETE set and is the stronger answer:
+    a driver can report a wide continuous range and still accept only a
+    handful of values inside it (this AIR-T firmware rejects the nominal low
+    grid points while its profile claims 1 MHz–125 MHz).
+    `getSampleRateRange` gives endpoints and is the fallback.
+
+    Args:
+        dev: An already-opened `SoapySDR.Device` instance.
+        rx_dir: The SoapySDR RX direction constant.
+
+    Returns:
+        dict: `{"rate_list": list[float] | None, "rate_min": float | None,
+        "rate_max": float | None}` — only what the driver actually answered.
+        Every failure mode yields None for that key, leaving the profile
+        fallback in force.
+    """
+    out = {"rate_list": None, "rate_min": None, "rate_max": None}
+    try:
+        listed = sorted({float(r) for r in dev.listSampleRates(rx_dir, 0)
+                         if float(r) > 0})
+    except Exception:
+        listed = []
+    if listed:
+        out["rate_list"] = listed
+        out["rate_min"], out["rate_max"] = listed[0], listed[-1]
+        return out
+    try:
+        ranges = dev.getSampleRateRange(rx_dir, 0)
+    except Exception:
+        return out
+    if not isinstance(ranges, (list, tuple)):
+        ranges = [ranges]
+    lows, highs = [], []
+    for r in ranges:
+        try:
+            lows.append(float(r.minimum()))
+            highs.append(float(r.maximum()))
+        except Exception:
+            continue
+    if lows and highs:
+        out["rate_min"], out["rate_max"] = min(lows), max(highs)
+    return out
+
+
 def _probe_device_facts(SoapySDR, info):
     """Briefly open one enumerated device to ask what it actually is.
 
@@ -390,7 +450,8 @@ def _probe_device_facts(SoapySDR, info):
         "master_clock_rate": float | None}.
     """
     facts = {"num_channels": None, "num_tx_channels": None,
-             "master_clock_rate": None}
+             "master_clock_rate": None, "rate_list": None,
+             "rate_min": None, "rate_max": None}
     try:
         from SoapySDR import SOAPY_SDR_RX as rx_dir
     except Exception:
@@ -411,6 +472,7 @@ def _probe_device_facts(SoapySDR, info):
         except Exception:
             pass
         facts["master_clock_rate"] = _probe_master_clock(dev)
+        facts.update(_probe_rate_limits(dev, rx_dir))
     except Exception:
         pass
     finally:
@@ -500,6 +562,11 @@ def resolve_device(selector: str):
             adapter.info["_num_tx_channels"] = int(m["num_tx_channels"])
         if m.get("master_clock_rate"):
             adapter.info["_master_clock_rate"] = float(m["master_clock_rate"])
+        # Rate limits the driver itself reported, so the UI can offer the
+        # real set before any source opens (see _probe_rate_limits).
+        for key in ("rate_list", "rate_min", "rate_max"):
+            if m.get(key):
+                adapter.info["_" + key] = m[key]
         print(f"[device] selected {m['device']} ({m['label']}"
               + (f", serial {m['serial']}" if m["serial"] else "") + ")")
         return m["device"], adapter

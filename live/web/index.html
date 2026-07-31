@@ -289,6 +289,14 @@
 
 <div id="recording-banner" hidden>Recording in progress — live display will resume automatically.</div>
 
+<!-- Unqualified sample rate. The radio may accept a rate well above anything
+     this project has sustained on hardware, read it back perfectly, and still
+     drop samples or hold only a few ms of history. Both failures are silent —
+     a waterfall with holes in it looks like a quiet band — so the rate that is
+     running says so on screen for as long as it runs, for every viewer, not
+     just the operator who set it. -->
+<div id="rate-banner" hidden></div>
+
 <!-- Transmit banner. Every connected client gets the TX state, not just the
      admin driving it: people sharing an instrument are entitled to know it is
      radiating. Admins see what is being transmitted; read-only roles are told

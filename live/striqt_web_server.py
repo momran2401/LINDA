@@ -54,8 +54,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core import devices, gps, health, state, tx
 from core.acquisition import Acquirer, Computer, DemoAcquirer
 from core.config import SharedConfig
-from core.constants import BACKENDS, CALIBRATED_GRID_BACKENDS, DEVICE_PROFILES
-from core.dsp import aligned_nfft
+from core.constants import (BACKENDS, CALIBRATED_GRID_BACKENDS, DEVICE_PROFILES,
+                            QUALIFIED_MAX_RATE_HZ)
+from core.dsp import aligned_nfft, allowed_rates
 from core.operations import OPERATIONS
 from core.recording import RecordingManager
 from core.insights import InsightService, calibration_status
@@ -758,6 +759,12 @@ def current_config():
         "source": dict(cfg.source_config or {}),
         "device": devices.get_adapter().describe_capabilities(),
         "envelope": _shared.envelope(),
+        # The sample rates this radio will actually accept — the driver's own
+        # discrete list when it enumerates one, else the cellular grid clipped
+        # to its envelope. The client offers exactly these and warns above
+        # `qualified_max_rate`, the highest rate hardware_qual has sustained.
+        "rates": list(allowed_rates(_shared.envelope())),
+        "qualified_max_rate": QUALIFIED_MAX_RATE_HZ,
         "backend": str(cfg.backend),
         "rows":    int(cfg.rows),
         "lo_null": bool(cfg.lo_null),

@@ -41,7 +41,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core import devices, health, state                        # noqa: E402
 from core.acquisition import Acquirer, Computer, DemoAcquirer  # noqa: E402
 from core.config import SharedConfig                           # noqa: E402
-from core.constants import BACKENDS, NFFT_CHOICES, RATES_HZ    # noqa: E402
+from core.constants import BACKENDS, NFFT_CHOICES              # noqa: E402
+from core.dsp import allowed_rates                             # noqa: E402
 from core.striqt_compat import _ANALYSIS_OK, _SENSOR_OK        # noqa: E402
 
 GRADIENT = " .:-=+*#%@"
@@ -243,7 +244,11 @@ def ui_loop(stdscr, shared, acquirer, fps, logbuf):
             elif ch == curses.KEY_DOWN:
                 shared.update({"gain": cfg.gain - 1.0})
             elif ch in (ord("r"), ord("R")):
-                shared.update({"sample_rate": cycle(RATES_HZ, cfg.sample_rate)})
+                # Cycle the rates THIS radio reports, not the whole cellular
+                # family: the grid now runs to 122.88 MS/s, and one keypress
+                # must not hand a radio a rate it never claimed to support.
+                shared.update({"sample_rate": cycle(allowed_rates(shared.envelope()),
+                                                    cfg.sample_rate)})
             elif ch in (ord("n"), ord("N")):
                 shared.update({"nfft": cycle(NFFT_CHOICES, cfg.nfft, key=int)})
             elif ch in (ord("b"), ord("B")):

@@ -37,6 +37,7 @@ import os
 import numpy as np
 
 from . import state
+from .constants import ENVELOPE_QUERY_GROUPS
 
 # ---------------------------------------------------------------------------
 # striqt hardware shims
@@ -460,7 +461,7 @@ def finite_capture_mode(source, *, receive_retries=2, array_backend=None):
         _unregister_source_spec(record)
 
 
-def query_device_envelope(source):
+def query_device_envelope(source, groups=None):
     """Ask the open SoapySDR device for its real frequency/gain/rate ranges (P3-3).
 
     Every step is defensive: a missing method, a failed call, or an
@@ -469,17 +470,26 @@ def query_device_envelope(source):
 
     Args:
         source: An open striqt source object.
+        groups: Optional iterable of bound groups to ask about
+            (``"freq"``/``"gain"``/``"rate"``, see
+            ``constants.ENVELOPE_QUERY_GROUPS``). ``None`` asks for all
+            three. Callers pass a subset when a profile's fallback is more
+            truthful than the driver for some bound — the AIR-T's calibrated
+            gain window being the standing example.
 
     Returns:
         dict: A partial envelope — only the keys the device actually
         answered (``freq_min``/``freq_max``, ``gain_min``/``gain_max``,
-        ``rate_min``/``rate_max``) — meant to be merged over the profile
-        fallback by ``SharedConfig.set_envelope``. Empty if the source has no
-        device.
+        ``rate_min``/``rate_max``, plus ``rate_list`` when the driver
+        enumerates discrete sample rates) — meant to be merged over the
+        profile fallback by ``SharedConfig.set_envelope``. Empty if the
+        source has no device.
     """
     dev = get_device(source)
     if dev is None:
         return {}
+    want = frozenset(groups) if groups is not None else frozenset(
+        ENVELOPE_QUERY_GROUPS)
     try:
         from SoapySDR import SOAPY_SDR_RX as _rx_dir
     except Exception:
@@ -503,11 +513,13 @@ def query_device_envelope(source):
         return None
 
     env = {}
-    for method, lo_key, hi_key in (
-        ("getFrequencyRange",  "freq_min", "freq_max"),
-        ("getGainRange",       "gain_min", "gain_max"),
-        ("getSampleRateRange", "rate_min", "rate_max"),
+    for group, method, lo_key, hi_key in (
+        ("freq", "getFrequencyRange",  "freq_min", "freq_max"),
+        ("gain", "getGainRange",       "gain_min", "gain_max"),
+        ("rate", "getSampleRateRange", "rate_min", "rate_max"),
     ):
+        if group not in want:
+            continue
         fn = getattr(dev, method, None)
         if fn is None:
             continue
@@ -520,4 +532,23 @@ def query_device_envelope(source):
         got = _bounds(ranges)
         if got:
             env[lo_key], env[hi_key] = got
+    # Discrete rates, when the driver enumerates them. This is the strongest
+    # answer available to the question "what can this radio actually run" —
+    # `getSampleRateRange` only gives endpoints, and a continuous-looking
+    # range routinely hides a driver that accepts a handful of values. When
+    # present it overrides the static grid entirely (see dsp.allowed_rates).
+    if "rate" in want:
+        lister = getattr(dev, "listSampleRates", None)
+        if lister is not None:
+            try:
+                listed = sorted({float(r) for r in lister(_rx_dir, ch)
+                                 if float(r) > 0})
+            except Exception:
+                listed = []
+            if listed:
+                env["rate_list"] = listed
+                # Endpoints implied by the list are more trustworthy than a
+                # range the same driver may report loosely.
+                env.setdefault("rate_min", listed[0])
+                env.setdefault("rate_max", listed[-1])
     return env

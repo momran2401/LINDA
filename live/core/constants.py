@@ -23,13 +23,48 @@ from fractions import Fraction
 #   channels        RX port tuple the acquirer streams
 #   defaults        RadioConfig seeds (center / sample_rate / gain)
 #   envelope        capability fallback: tier-1 clamp bounds (P3-3)
-#   query_envelope  True → ask the live SoapySDR device for its real ranges
-#                   after open and merge them over the fallback. False for
-#                   air8201b/demo: their fallback IS today's exact clamp
-#                   numbers (the −60..10 gain window is a striqt calibrated-
-#                   gain convention, not the raw SoapyAIRT range — querying
-#                   would shift legal bounds on the existing deployment).
+#   query_envelope  Which bound GROUPS to ask the live SoapySDR device for
+#                   after open, merged over the fallback. True = all of
+#                   them, False = none, or a tuple naming the subset
+#                   ("freq" / "gain" / "rate") — see ENVELOPE_QUERY_GROUPS.
+#
+#                   Per-group, not all-or-nothing, because the two halves of
+#                   the AIR-T's envelope have opposite truth values. Its
+#                   −60..10 dB gain window is a striqt CALIBRATED-gain
+#                   convention, not the raw SoapyAIRT range: querying it
+#                   would shift legal bounds on the existing deployment (and
+#                   the driver rejects −60/−50 outright — see
+#                   tools/hardware_qual.py). Its RATE bounds are the
+#                   opposite: the static numbers here are a guess, and the
+#                   driver is the only honest source. So air8201b queries
+#                   "rate" and nothing else.
 # ---------------------------------------------------------------------------
+
+# Envelope bound groups a device may be asked about (see query_envelope
+# above). core.shims.query_device_envelope maps each to its SoapySDR getter.
+ENVELOPE_QUERY_GROUPS = ("freq", "gain", "rate")
+
+
+def envelope_query_groups(profile):
+    """Resolve a profile's `query_envelope` setting to a set of group names.
+
+    Args:
+        profile: A `DEVICE_PROFILES` entry (or any mapping with the key).
+
+    Returns:
+        frozenset[str]: The subset of `ENVELOPE_QUERY_GROUPS` this profile
+        wants queried from the live driver. `True` means all of them,
+        `False`/absent means none, and a tuple/list/set is taken verbatim
+        (unknown names dropped).
+    """
+    want = (profile or {}).get("query_envelope", False)
+    if want is True:
+        return frozenset(ENVELOPE_QUERY_GROUPS)
+    if not want:
+        return frozenset()
+    return frozenset(str(g).strip().lower() for g in want) & frozenset(
+        ENVELOPE_QUERY_GROUPS)
+
 
 DEVICE_PROFILES = {
     "air8201b": {
@@ -44,7 +79,10 @@ DEVICE_PROFILES = {
             "gain_min": -60.0, "gain_max": 10.0,
             "rate_min": 1e6,   "rate_max": 125e6,
         },
-        "query_envelope": False,
+        # Rate ONLY. The gain window above is a striqt calibrated-gain
+        # convention the driver would overwrite with its raw range; the rate
+        # bounds are a guess only the driver can correct.
+        "query_envelope": ("rate",),
     },
     # Other Deepwave AIR-T models: same SoapyAIRT driver + AirStack stack.
     # Their striqt spec classes are used when the installed build ships them
@@ -158,7 +196,34 @@ RING_ROW_FILL       = 0.9       # fraction of MAX_TAIL usable for one frame's ne
 # Allowed sample rates (LTE/5G-NR multiples of 1.92 MHz) and FFT sizes. Incoming
 # control values are snapped to the nearest of these so an off-list value can't
 # reach arm_spec or trip the calibrated ValueError guard (LV-R2).
-RATES_HZ      = (3.84e6, 7.68e6, 15.36e6, 30.72e6)
+#
+# This is the cellular FAMILY, not any one radio's capability: the doubling
+# ladder off the 1.92 MHz base. `core.dsp.allowed_rates()` narrows it per
+# device — preferring the discrete list the DRIVER reports (`rate_list`,
+# from SoapySDR's listSampleRates) and falling back to this grid clipped to
+# the envelope. The top two entries exist so a radio that can genuinely run
+# them is not capped by a constant; whether a given radio accepts them is
+# the driver's answer, never this tuple's.
+RATE_BASE_HZ  = 1.92e6
+RATES_HZ      = tuple(RATE_BASE_HZ * (2 ** k) for k in range(1, 7))
+#             = (3.84e6, 7.68e6, 15.36e6, 30.72e6, 61.44e6, 122.88e6)
+
+# Highest rate anything in this repo has actually QUALIFIED on hardware.
+#
+# Not a limit — nothing clamps to it. It is the line between "proven" and
+# "the driver said yes". Above it the radio may accept the rate, read it
+# back perfectly, and still starve the display: at 122.88 MS/s two channels
+# of complex64 is ~2 GB/s into the ring, and the whole MAX_TAIL ring is only
+# ~34 ms deep. Both failures are silent — a gappy waterfall looks like a
+# quiet band. So a rate above this line raises a banner that says so
+# (`SharedConfig.update` queues the notice; the client shows the banner)
+# rather than letting the operator find out from the data later.
+#
+# Raise this only after tools/hardware_qual.py sustains frames at the higher
+# rate on the radio in question — the same standard every other verified
+# number in this project is held to.
+QUALIFIED_MAX_RATE_HZ = 30.72e6
+
 NFFT_CHOICES  = (256, 512, 1024, 2048, 4096)
 
 # Demo tone plan (P3-2): per-channel CW tone sets of (amplitude, offset_hz),
