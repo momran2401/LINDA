@@ -47,6 +47,12 @@ class DeviceAdapter:
     freq_tol_rel  = 1e-6        # relative to the requested value
     rate_tol_rel  = 1e-4
     gain_tol_db   = 0.5
+    # Whether `cfg.gain` and the driver's gain readback are the SAME quantity.
+    # Default False: striqt hands the radio a calibrated gain, and most
+    # drivers report a raw composite gain on their own scale, so comparing
+    # them manufactures a mismatch on a perfectly healthy radio (see
+    # verify()). Adapters that know the two agree opt in.
+    gain_readback_comparable = False
     # Whether the driver supports config readback at all (demo says no and
     # reports "readback_unsupported" honestly instead of faking agreement).
     supports_readback = True
@@ -238,10 +244,27 @@ class DeviceAdapter:
 
         Center frequency and sample rate are judged against `expected`
         (from `hardware_expectations()`) when given, else against `cfg`
-        directly; gain is always judged per channel against `cfg.gain`. Some
-        drivers report a composite gain that differs from the requested
-        calibrated value by a fixed offset, so a gain mismatch is treated as a
-        warning-grade signal here, not proof of failure.
+        directly.
+
+        Gain is only judged when this adapter can say what the driver OUGHT
+        to report (`gain_readback_comparable`). It usually cannot: on the
+        AIR-T `cfg.gain` is striqt's CALIBRATED gain (the −60…10 dB window in
+        the profile) while the driver reports its own raw composite gain on a
+        different scale entirely — the two disagree by construction, and
+        `tools/hardware_qual.py` already documents SoapyAIRT rejecting gains
+        the profile declares legal. Judging them against each other made
+        every config change on a healthy AIR-T collapse to `mismatch`
+        (`verdict_state` treats any mismatched field as fatal), which is
+        worse than useless: an alarm that is always on is an alarm nobody
+        reads.
+
+        So an incomparable gain is reported `readback_unsupported` — "we did
+        not verify this" — rather than `mismatch` — "the radio disagreed."
+        That is the honest claim, and it leaves a center/rate-verified
+        operation reading `verified` instead of being dragged to `mismatch`
+        by a number that was never comparable. Adapters whose driver does
+        report the same quantity set `gain_readback_comparable = True` and
+        get a real verdict.
 
         Args:
             cfg: The current `RadioConfig`/`SharedConfig` holding the
@@ -279,6 +302,15 @@ class DeviceAdapter:
         gains = actuals.get("gain") or []
         for i, ch in enumerate(state.CHANNELS):
             actual = gains[i] if i < len(gains) else None
-            v = judge(f"gain[ch{ch}]", cfg.gain, actual, self.gain_tol_db)
-            verdicts.append(v)
+            if not self.gain_readback_comparable:
+                # Reported, never judged — see the docstring. `actual` is
+                # still carried so the op log can show what the driver said.
+                verdicts.append({"field": f"gain[ch{ch}]",
+                                 "requested": float(cfg.gain),
+                                 "actual": (None if actual is None
+                                            else float(actual)),
+                                 "state": "readback_unsupported"})
+                continue
+            verdicts.append(
+                judge(f"gain[ch{ch}]", cfg.gain, actual, self.gain_tol_db))
         return verdicts

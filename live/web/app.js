@@ -1541,9 +1541,13 @@ function onFrame(data) {
         psdData.server = null;
         const stdKind = "std:" + channelsKey(channelList);
         if (uplotKind !== stdKind) initUplot(freqsMHz);
+        // Ingest every channel first, THEN paint: the auto color scale is
+        // shared across channels and cannot be computed until all their
+        // buffers hold this frame.
         for (const ch of channels) {
-            updateWaterfall(ch, blocks[ch], rows, nfft, center, fs);
+            ingestWaterfall(ch, blocks[ch], rows, nfft, center, fs);
         }
+        renderWaterfalls(channels);
         // A rolling-window PSD scans roughly 1.1 million values for the
         // two-channel 20 ms view. Updating that trace at the 15 FPS waterfall
         // rate needlessly starved canvas rendering; 5 Hz is responsive for a
@@ -1638,6 +1642,11 @@ function ensureChannels(channels) {
     const tpl = document.getElementById("wf-pane-tpl");
     row.textContent = "";
     wfCanvas = {}; wfCtx = {}; wfImageData = {};
+    // Geometry/paint bookkeeping is keyed by channel; a channel that leaves
+    // the header set must not leave a stale entry behind for a later one.
+    for (const key of Object.keys(wfGeom)) delete wfGeom[key];
+    for (const key of Object.keys(wfPending)) delete wfPending[key];
+    for (const key of Object.keys(wfNeedsRepaint)) delete wfNeedsRepaint[key];
     clearChannelBufs(wfBuf, holdBuf, minBuf, psdData.mean, psdData.max);
 
     channelList.forEach((ch, i) => {
@@ -1701,6 +1710,7 @@ function computeDisplayDepth(rows, nfft, fs) {
 let focusTarget = null;          // null | "psd" | channel number
 const wfNeedsRepaint = {};       // pane fell behind while hidden → full repaint
 const wfGeom = {};               // ch → {nfft, depth} for the repaint path
+const wfPending = {};            // ch → {newRows, full} awaiting the paint pass
 
 function paneVisible(ch) {
     return focusTarget === null || focusTarget === ch;
@@ -1766,7 +1776,10 @@ document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && focusTarget !== null) setFocus(null);
 });
 
-function updateWaterfall(ch, block, rows, nfft, center, fs) {
+// Ingest one channel's new rows into its display buffer. Painting is a
+// SEPARATE pass (renderWaterfalls) because the color scale is shared: it
+// cannot be computed until every channel's buffer for this frame is in.
+function ingestWaterfall(ch, block, rows, nfft, center, fs) {
     const depth = computeDisplayDepth(rows, nfft, fs);
     const size  = depth * nfft;
     let reallocated = false;
@@ -1800,38 +1813,99 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
         }
     }
 
-    // ── Auto color levels (5th / 99th percentile of a subsample) ──────────
-    // AHAWI pins one scale per CAPTURE (set in renderAhawiSegment): a
-    // per-segment recompute would pump the brightness as bursts enter and
-    // leave segments, exactly the flicker artifact the mode exists to remove.
-    if (autoColor && !ahawiActive) {
-        const step = Math.max(1, Math.floor(size / 2000));
-        const samp = [];
-        for (let i = 0; i < size; i += step) samp.push(buf[i]);
-        samp.sort((a, b) => a - b);
-        const vmin = samp[Math.floor(samp.length * 0.05)];
-        const vmax = samp[Math.floor(samp.length * 0.99)];
-        levels = [vmin, vmax - vmin < 5 ? vmin + 5 : vmax];
-    }
-
-    // Geometry the repaint-on-restore path needs (see paintWaterfall).
+    // Geometry the paint pass and the repaint-on-restore path need.
     wfGeom[ch] = { nfft, depth };
+    wfPending[ch] = {
+        newRows: Math.min(bLen / nfft, depth),
+        full:    replaceMode || ahawiActive || reallocated,
+    };
+}
 
-    // A pane hidden by focus mode keeps its BUFFER current — the PSD, band
-    // monitor and hold/min traces all read wfBuf, and a restored pane must
-    // show continuous history, not a hole. Only the pixel work below is
-    // skipped, which is where the cost actually is.
-    if (!paneVisible(ch)) {
-        wfNeedsRepaint[ch] = true;
-        return;
+// Sample a display buffer for percentile estimation without aliasing against
+// the FFT bin grid.
+//
+// The buffer is row-major (buf[row*nfft + bin]), so a plain `i += step` walk
+// only visits every bin if step is coprime with nfft — and the old stride,
+// floor(size/2000) = floor(depth*nfft/2000), is not. At depth 1200 it shared a
+// factor of 2 with a 1024-point FFT and sampled half the spectrum; at depth
+// 2000 the stride lands on exactly nfft and every single sample is the SAME
+// frequency bin, so the whole color scale gets set by one bin — the DC spike
+// or whatever carrier happens to sit there. That is the "auto color sometimes
+// looks worse than fixed" case: not a tuning problem, a sampling bug.
+function sampleForLevels(buf, nfft) {
+    const size = buf.length;
+    let step = Math.max(1, Math.floor(size / 2000));
+    // Nudge the stride until it is coprime with nfft; the walk then visits
+    // every bin before repeating. At most a handful of increments.
+    const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+    while (step < size && gcd(step, nfft) !== 1) step++;
+    const out = [];
+    for (let i = 0; i < size; i += step) out.push(buf[i]);
+    return out;
+}
+
+// One color scale for EVERY channel, recomputed once per frame.
+//
+// This used to run inside the per-channel loop while writing a module-global
+// `levels`, so each pane was painted with its own percentiles: identical
+// colors in RX1 and RX2 meant DIFFERENT powers, and the panes could not be
+// compared by eye at all. That silently discarded a property the server goes
+// out of its way to preserve — core/serialization.py quantizes on a per-frame
+// range across all channels precisely "so channels stay comparable on one
+// color scale". Pooling the samples restores it.
+//
+// AHAWI pins one scale per CAPTURE (set in renderAhawiSegment): a per-segment
+// recompute would pump the brightness as bursts enter and leave segments,
+// exactly the flicker artifact that mode exists to remove.
+function updateAutoLevels(channels) {
+    if (!autoColor || ahawiActive) return;
+    let samp = [];
+    for (const ch of channels) {
+        const buf = wfBuf[ch];
+        const geom = wfGeom[ch];
+        if (buf && geom) samp = samp.concat(sampleForLevels(buf, geom.nfft));
     }
+    if (!samp.length) return;
+    samp.sort((a, b) => a - b);
+    const vmin = samp[Math.floor(samp.length * 0.05)];
+    let   vmax = samp[Math.floor(samp.length * 0.99)];
+    if (vmax - vmin < 5) vmax = vmin + 5;
 
-    const fullRender = replaceMode || ahawiActive || reallocated
-                       || wfNeedsRepaint[ch];
-    paintWaterfall(ch, nfft, depth,
-                   fullRender ? depth : Math.min(bLen / nfft, depth),
-                   fullRender);
-    wfNeedsRepaint[ch] = false;
+    // Ease toward the new estimate instead of snapping to it. The percentiles
+    // move every frame as bursts enter and leave the rolling window, and
+    // re-mapping the palette that often reads as the whole waterfall pulsing —
+    // the same artifact AHAWI pins its scale to avoid. A large jump (retune,
+    // rate or gain change) still takes effect at once, so this smooths flicker
+    // without lagging a real change in the picture.
+    const SNAP_DB = 8, EASE = 0.25;
+    if (!Number.isFinite(levels[0]) || Math.abs(vmin - levels[0]) > SNAP_DB
+                                    || Math.abs(vmax - levels[1]) > SNAP_DB) {
+        levels = [vmin, vmax];
+    } else {
+        levels = [levels[0] + (vmin - levels[0]) * EASE,
+                  levels[1] + (vmax - levels[1]) * EASE];
+    }
+}
+
+// Paint every channel from its ingested buffer, on the shared scale.
+function renderWaterfalls(channels) {
+    updateAutoLevels(channels);
+    for (const ch of channels) {
+        const geom = wfGeom[ch], pend = wfPending[ch];
+        if (!geom || !pend) continue;
+        // A pane hidden by focus mode keeps its BUFFER current — the PSD, band
+        // monitor and hold/min traces all read wfBuf, and a restored pane must
+        // show continuous history, not a hole. Only the pixel work is skipped,
+        // which is where the cost actually is.
+        if (!paneVisible(ch)) {
+            wfNeedsRepaint[ch] = true;
+            continue;
+        }
+        const full = pend.full || wfNeedsRepaint[ch];
+        paintWaterfall(ch, geom.nfft, geom.depth,
+                       full ? geom.depth : pend.newRows, full);
+        wfNeedsRepaint[ch] = false;
+    }
 }
 
 // Render `newRows` rows of wfBuf[ch] → the pane's canvas via the viridis LUT.
@@ -2058,8 +2132,11 @@ function renderAhawiSegment() {
                                             (ahawiSeg + 1) * rps * bins);
     }
     for (const ch of channels) {
-        updateWaterfall(ch, segBlocks[ch], rps, bins, center, fs);
+        ingestWaterfall(ch, segBlocks[ch], rps, bins, center, fs);
     }
+    // AHAWI's scale is pinned per capture above, so updateAutoLevels no-ops
+    // here; the paint pass is still what puts pixels on the canvas.
+    renderWaterfalls(channels);
     if (ahawiCap.psd) {
         // striqt capture-wide PSD statistics from the bundle — same renderer
         // as the PSD backend. serverStats is frame-derived global state;
@@ -3015,13 +3092,31 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
 // Band selection drag (on the uPlot canvas)
 // ---------------------------------------------------------------------------
 
+// A uPlot instance is only safe to DRAW once both scales have ranges. A plot
+// built by initUplot starts with all-null y series (uPlot reads data[i].length,
+// so the series cannot simply be absent), and in that state uPlot's axes()
+// iterates a null splits array and throws
+//     "object null is not iterable"
+// — which aborts its own setData/scale pipeline and leaves the instance
+// permanently wedged: scales stay null, every later setData draws nothing, and
+// the PSD is blank until a page reload. fitUplotToContainer has guarded
+// setSize this way for a while; drawing needs the same guard, because the
+// window is not rare — every rebuild passes through it.
+function uplotDrawable() {
+    return !!uplot && uplot.scales.x.min != null && uplot.scales.y.min != null;
+}
+
+function redrawPsd() {
+    if (uplotDrawable()) uplot.redraw();
+}
+
 function resetBand(freqs) {
     if (!freqs) return;
     const lo = freqs[Math.floor(freqs.length * 0.45)];
     const hi = freqs[Math.floor(freqs.length * 0.55)];
     bandLo = Math.min(lo, hi);
     bandHi = Math.max(lo, hi);
-    if (uplot) uplot.redraw();
+    redrawPsd();
 }
 
 // PSD band-monitor selection: drag to move/resize the analysis band.
@@ -3098,7 +3193,7 @@ function setupBandDrag() {
         else if (bandDrag === "hi")  { bandHi = origHi + delta; }
         else if (bandDrag === "body"){ bandLo = origLo + delta; bandHi = origHi + delta; }
         else if (bandDrag === "new") { bandHi = f; }
-        if (uplot) uplot.redraw();
+        redrawPsd();
     }, { signal: sig });
 
     window.addEventListener("pointerup", () => {
@@ -3373,7 +3468,16 @@ document.getElementById("lo-null").addEventListener("change", (e) => {
 document.getElementById("abs-rf").addEventListener("change", (e) => {
     absRF    = e.target.checked;
     freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);
-    if (uplot && freqsMHz) initUplot(freqsMHz);
+    if (uplot && freqsMHz) {
+        initUplot(freqsMHz);
+        // Seed the fresh plot from the display buffers BEFORE anything can
+        // draw it. initUplot builds with all-null series, and a draw in that
+        // state wedges uPlot for good (see uplotDrawable). Waiting for the
+        // next frame would also leave the axis stale for as long as the
+        // stream is paused — psdSeries reads wfBuf, which survives a pause,
+        // so there is no reason to wait.
+        updatePSD(channelList, null, 0, curBins);
+    }
     resetBand(freqsMHz);
     renderWfAxis();
 });
