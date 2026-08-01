@@ -870,6 +870,10 @@ class Acquirer(threading.Thread):
                             try:
                                 self.rearm(cfg, None)
                                 read_size, tmp, buffers = self._make_read_buffers()
+                                OPERATIONS.stage(
+                                    op_id, "recovered",
+                                    "rolled back to the last-good config after "
+                                    "the failed apply")
                                 continue
                             except Exception as rollback_error:
                                 print(f"[radio] rollback rearm failed: "
