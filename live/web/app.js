@@ -23,7 +23,7 @@
 
 let ws          = null;
 let paused      = false;
-let replaceMode = true;     // Boring Mode (full-window snapshots) vs Cool Mode (fast scroll)
+let replaceMode = false;     // Boring Mode (full-window snapshots) vs Cool Mode (fast scroll)
                             // — must match the `selected` option on #mode-sel
 let absRF       = true;     // absolute RF freq vs baseband offset
 let autoColor   = true;
