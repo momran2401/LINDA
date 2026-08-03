@@ -53,12 +53,12 @@
         <span id="calibration-badge" class="role-badge">UNCALIBRATED</span>
 
         <div class="mode-switch" role="group" aria-label="Interface mode">
-            <button type="button" class="mode-opt" data-mode="pro">DAN</button>
-            <button type="button" class="mode-opt" data-mode="noob">ARIC</button>
+            <button type="button" class="mode-opt" data-mode="pro">PRO</button>
+            <button type="button" class="mode-opt" data-mode="noob">NOT PRO</button>
         </div>
 
         <button id="theme-toggle" type="button" title="Toggle light / dark mode" aria-label="Toggle light / dark mode">
-            <span class="theme-icon" aria-hidden="true">🌙</span>
+            <!-- <span class="theme-icon" aria-hidden="true">🌙</span> -->
             <span class="theme-label">Dark</span>
         </button>
         <button id="signout-btn" type="button" title="Sign out / switch user" hidden>
@@ -101,7 +101,7 @@
 
             <label class="ctrl-row">Mode
                 <select id="mode-sel">
-                    <option value="replace" selected title="Full-window snapshots; large time windows can reduce frame rate">Boring 🥱</option>
+                    <!-- <option value="replace" selected title="Full-window snapshots; large time windows can reduce frame rate">Boring 🥱</option> -->
                     <option value="scroll" title="Rolling client-side history; keeps the live stream responsive">Cool 😎</option>
                     <option value="ahawi" title="One coherent capture analyzed with striqt, replayed one viewing window at a time — TDD slots and SSB bursts hold still instead of swimming">AHAWI ⚡</option>
                 </select>
@@ -166,7 +166,7 @@
                  radio with TX channels and RADIO_TX enabled — a receive-only
                  SDR must never be offered a button that can only fail. -->
             <button id="tx-open-btn" class="rail-danger pro-only admin-only" hidden
-                    title="Transmit on the hardware's TX port">I'm feeling like a bad boy</button>
+                    title="Transmit on the hardware's TX port">Transmit</button>
         </section>
 
         <section class="rail-panel pro-only admin-only" data-panel="record">
