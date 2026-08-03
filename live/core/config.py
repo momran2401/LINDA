@@ -124,7 +124,7 @@ class RadioConfig:
     nfft:        int   = DEFAULT_NFFT
     rows:        int   = DEFAULT_ROWS
     backend:     str   = state.SPEC_BACKEND
-    lo_null:     bool  = True
+    lo_null:     bool  = False
     # Displayed time span in seconds (P2a-4). When > 0, duration OWNS rows: they
     # are re-derived hop-aware (duration·fs / row_hop) on every change to nfft/
     # backend/overlap/sample_rate. 0 = legacy rows-driven mode (an explicit
