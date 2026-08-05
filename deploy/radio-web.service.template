@@ -5,7 +5,23 @@
 Description=LINDA live radio viewer (@RADIO_MODE@ mode)
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=0
+# Bounded on purpose. This was StartLimitIntervalSec=0 — restart forever, no
+# rate limit — and a radio the service cannot open turns that into a hazard
+# rather than resilience: observed on a Pi 5 after a radio swap, restart
+# counter 142, each attempt grabbing at the USB device and failing with
+# "Unable to claim interface 3:2:5: Device or resource busy (16)". The loop
+# was self-sustaining (each attempt was busy because of its own predecessor),
+# it buried the first, real error under hundreds of journal lines, and it kept
+# the radio claimed against anyone trying to diagnose it.
+#
+# Ten failures in five minutes is far more than any transient needs, so a
+# radio that briefly re-enumerates still recovers on its own. Past that the
+# unit gives up: the radio is left free, and `journalctl -u radio-web` opens
+# on the actual fault instead of the 142nd copy of it. Restart it by hand with
+# `systemctl reset-failed radio-web && systemctl start radio-web`, or just
+# re-run install_linda.sh, which does both.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple

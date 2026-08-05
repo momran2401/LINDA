@@ -388,19 +388,57 @@ re-fetches it if missing) so hotspot/ethernet modes work fully offline.
 
 `install_linda.sh` is idempotent and derives the device FRESH every run — it
 never reads the previous `RADIO_DEVICE` back — so unplugging one radio, plugging
-another and re-running is the supported way to switch. Three things make that
+another and re-running is the supported way to switch. Several things make that
 actually work, and each was a bug before:
 
 - `stop_existing_service` runs **before** `detect_radio`, not after. A radio
   another process holds open does not appear in SoapySDR's enumeration *at
   all*, and on a re-run the previously-installed service is still running.
+- It stops the service **unconditionally**, never gated on `is-active`. A
+  service whose radio was swapped out CRASH-LOOPS, and systemd reports it as
+  `activating`/`failed` — never `active` — for most of that cycle, so the old
+  guard skipped the stop exactly when it mattered and `Restart=always` kept
+  relaunching a viewer that raced the installer for the USB device all the way
+  through setup. Observed on a Pi 5 + Pluto: restart counter **142**, every
+  open failing `Unable to claim interface 3:2:5: Device or resource busy (16)`.
+  It also `reset-failed`s, and `install_service` does so again before its
+  `restart` — mandatory now that the unit carries a start-rate limit, or a
+  unit that tripped it on the previous radio refuses to start at all.
 - `install_python` **skips the pip transaction** when its marker matches and
   the venv still imports. That transaction is `pip install --upgrade` against
   a git URL, so it hits the network every run and `die`s without one — which
   made re-running impossible on the offline hotspot/ethernet boxes this
   project exists to serve.
-- `install_pluto_driver` returns early when SoapySDR already lists `plutosdr`.
-  It otherwise wipes and re-clones from GitHub every single run.
+- `install_pluto_driver` returns early when `pluto_driver_ok` — and only then
+  does any apt work, for the same offline reason (`apt_install` triggers
+  `apt-get update` on first use). It otherwise wipes and re-clones from GitHub
+  every single run. "OK" must mean **loadable, not merely installed**: a
+  module whose runtime libs are missing makes SoapySDRUtil print
+  `loadModule(.../libPlutoSDRSupport.so) dlopen() failed`, and that line
+  contains "plutosdr" case-insensitively — so the old bare grep matched the
+  ERROR, declared the driver fine, and returned early, leaving a Pluto broken
+  across every re-run. The dlopen check is attributed to the pluto module
+  specifically; a blanket match would send a *working* Pluto into the source
+  build, which `die`s offline.
+- Pluto runtime deps are installed **one package per `apt_install` call**.
+  They were one transaction, and Debian trixie renamed the libiio runtime
+  (no `libiio0`), so a stale package name failed the whole transaction and
+  took `libiio-utils`/`libad9361-0` with it — `|| true` swallowing the
+  evidence. `libiio0` or `libiio1` is accepted.
+- `discover()` **dedupes rows that are one physical radio** (`_dedupe_same_radio`)
+  BEFORE `_probe_device_facts` opens anything. A Pluto raises a USB-ethernet
+  gadget beside its USB IIO interface, so SoapySDR lists it twice
+  (`usb:3.2.5` + `ip:pluto.local`): `--device auto` and any `driver=` selector
+  counted 2 and refused ("need exactly 1"), and probing opened the same
+  hardware twice, the second open hitting the first's claim. USB wins (it
+  works with no network — the premise of hotspot/ethernet modes); every
+  DISTINCT usb: uri is kept, so two Plutos stay two radios even though the
+  driver reports no serial.
+- The unit is **start-rate limited** (`StartLimitBurst=10` / 300 s), not
+  `StartLimitIntervalSec=0`. Unlimited restarts on an unopenable radio are a
+  hazard, not resilience: the loop is self-sustaining (each attempt is busy
+  because of its predecessor), it buries the first real error, and it holds
+  the radio against anyone diagnosing it.
 
 The udev rules are written for every supported vendor ID at once, so no rule
 change is needed on a swap. An unrecognised radio resolves to `demo` and the

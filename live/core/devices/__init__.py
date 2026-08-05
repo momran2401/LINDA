@@ -272,6 +272,87 @@ def probe_channels(profile_name, adapter=None):
 # Discovery
 # ---------------------------------------------------------------------------
 
+# Drivers that can present ONE physical radio as several enumeration rows, and
+# the URI prefix to keep when they do. A PlutoSDR raises a USB-ethernet gadget
+# alongside its USB IIO interface, so SoapySDR lists it twice:
+#     device = PlutoSDR   uri = usb:3.2.5
+#     device = PlutoSDR   uri = ip:pluto.local
+# Two separate failures came out of that, both fatal to a swap-and-go install:
+#   * `--device auto` (and any `driver=` selector) counted 2 matches against
+#     one radio and refused to start at all — "matched 2 radios (need
+#     exactly 1)".
+#   * `_probe_device_facts` opened each row in turn, so the second open hit
+#     hardware the first had just claimed:
+#         ERROR: Unable to claim interface 3:2:5: Device or resource busy (16)
+_MULTI_URI_DRIVERS = {"plutosdr": "usb:"}
+
+
+def _dedupe_same_radio(infos):
+    """Collapse enumeration rows that are one physical radio reached two ways.
+
+    Only drivers in `_MULTI_URI_DRIVERS` are touched, and only when a row with
+    the preferred URI prefix is actually present — so this can never make a
+    radio disappear. USB wins over the network gadget because it is the path
+    that works with no network configured, which is the whole point of the
+    hotspot and ethernet deployment modes.
+
+    Rows are grouped by serial when the driver reports one, so two Plutos on
+    the same host still enumerate as two radios. When no serial is reported
+    (the Pluto's Soapy driver does not), every row of that driver forms one
+    group: with a single radio attached that is correct, and it is the
+    configuration this collapses for. The cost is that a USB Pluto plus a
+    *different* Pluto reached over the network would collapse to the USB one;
+    that is disclosed rather than silently guessed, via the note printed
+    below.
+
+    Args:
+        infos: Enumeration dicts, straight from `SoapySDR.Device.enumerate()`.
+
+    Returns:
+        list[dict]: `infos` with duplicate rows of the same radio removed,
+        original order otherwise preserved.
+    """
+    keep, dropped = [], []
+    seen_groups = set()
+    for info in infos:
+        driver = str(info.get("driver", ""))
+        prefix = _MULTI_URI_DRIVERS.get(driver)
+        if prefix is None:
+            keep.append(info)
+            continue
+        group = (driver, str(info.get("serial") or ""))
+        siblings = [
+            o for o in infos
+            if str(o.get("driver", "")) == driver
+            and (driver, str(o.get("serial") or "")) == group
+        ]
+        # Nothing to choose between: leave the row exactly as enumerated.
+        if len(siblings) < 2 or not any(
+                str(o.get("uri", "")).startswith(prefix) for o in siblings):
+            keep.append(info)
+            continue
+        if not str(info.get("uri", "")).startswith(prefix):
+            dropped.append(info)
+            continue
+        # Every DISTINCT preferred URI is kept: two Plutos on two USB ports
+        # are two radios even when neither reports a serial, and collapsing
+        # them would hide hardware rather than hide a duplicate. Only an
+        # exactly repeated URI is a true duplicate, and dropping it is what
+        # stops the double-open this function exists to prevent.
+        uri = str(info.get("uri", ""))
+        if (group, uri) in seen_groups:
+            dropped.append(info)
+            continue
+        seen_groups.add((group, uri))
+        keep.append(info)
+    for info in dropped:
+        print(f"[device] ignoring duplicate enumeration of "
+              f"{info.get('label') or info.get('driver')} "
+              f"({info.get('uri') or 'no uri'}) — same radio as its "
+              f"{_MULTI_URI_DRIVERS[str(info.get('driver', ''))]}… entry")
+    return keep
+
+
 def discover():
     """Enumerate every SoapySDR-visible device and classify it into a profile.
 
@@ -301,15 +382,20 @@ def discover():
         results = SoapySDR.Device.enumerate()
     except Exception as e:
         raise RuntimeError(f"SoapySDR enumeration failed: {e}")
-    found = []
+    infos = []
     for r in results:
         try:
             info = dict(r)
         except Exception:
             info = {}
+        if str(info.get("driver", "")):
+            infos.append(info)
+    # BEFORE probing, not after: _probe_device_facts opens every row it is
+    # given, and the duplicate rows below are the SAME piece of hardware.
+    infos = _dedupe_same_radio(infos)
+    found = []
+    for info in infos:
         driver = str(info.get("driver", ""))
-        if not driver:
-            continue
         if driver == "SoapyAIRT":
             device = identify_deepwave(info)
         else:
