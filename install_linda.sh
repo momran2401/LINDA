@@ -541,22 +541,70 @@ install_radio_driver() {
 # SoapyPlutoSDR is not packaged before Debian forky. Building it is the only
 # way a Pluto works on the releases this installer supports, so build it
 # rather than telling the user to go do it themselves.
+# Does this box have a WORKING SoapyPlutoSDR right now? Prints nothing.
+#
+# "Working" has to mean loadable, not merely installed, and the difference is
+# the whole bug. When the module is present but its runtime libraries are not,
+# SoapySDRUtil prints a load error naming the file —
+#   [ERROR] SoapySDR::loadModule(.../modules0.8/libPlutoSDRSupport.so)
+#           dlopen() failed: libiio.so.0: cannot open shared object file
+# — and that line contains the string "plutosdr" case-insensitively. The old
+# `SoapySDRUtil --info | grep -qi plutosdr` check matched the ERROR, concluded
+# the driver was fine, and returned early, so re-running the installer could
+# never repair a Pluto broken exactly this way. It stayed broken across every
+# re-run until someone read the journal. Check for the failure FIRST.
+# The load failure must be attributed to the PLUTO module specifically. A
+# blanket 'dlopen() failed' test would let some unrelated broken Soapy module
+# condemn a perfectly good Pluto — and the penalty for that is not cosmetic:
+# it sends this function into the source build, which clones from GitHub and
+# `die`s on an offline box, i.e. exactly the hotspot install that was working
+# a moment earlier.
+pluto_driver_ok() {
+    local info
+    info="$(SoapySDRUtil --info 2>&1 || true)"
+    if printf '%s\n' "$info" | grep -qi 'dlopen() failed' \
+       && printf '%s\n' "$info" | grep -qi 'loadModule.*pluto'; then
+        return 1
+    fi
+    printf '%s\n' "$info" | grep -qi 'plutosdr'
+}
+
 install_pluto_driver() {
     say "Installing the ADALM-Pluto driver"
-    apt_install libiio-utils libiio0 libad9361-0 || true
-    # Already there? Say so and stop. The source build below wipes and
-    # re-clones from GitHub every time, which on a Pi costs minutes per run
-    # and — the part that matters for a demo — DIES if the box is offline,
-    # which a hotspot/ethernet-mode install very often is. Swapping radios
-    # back and forth is a normal thing to do, and re-running the installer
-    # must not need the internet to reinstall a driver that is already built.
-    #
-    # Presence is the only safe direction to trust this check in: a module
-    # that IS listed is unambiguously loadable. Absence proves nothing (an
-    # earlier version treated it as build failure and cried wolf on a working
-    # Pluto), so a miss just falls through and builds.
-    if SoapySDRUtil --info 2>/dev/null | grep -qi 'plutosdr'; then
-        ok "SoapyPlutoSDR already present — leaving it alone"
+    # Nothing to do? Then do NOTHING — no apt, no clone, no network. The
+    # source build below wipes and re-clones from GitHub every time, which on
+    # a Pi costs minutes per run and — the part that matters for a demo —
+    # DIES if the box is offline, which a hotspot/ethernet-mode install very
+    # often is. Swapping radios back and forth is a normal thing to do, and
+    # re-running the installer must not need the internet to reinstall a
+    # driver that already works. The apt calls sit AFTER this check for the
+    # same reason: apt_install triggers `apt-get update` on first use, so
+    # doing it unconditionally put a network round-trip in front of every
+    # re-run on a box that by design has no network.
+    if pluto_driver_ok; then
+        ok "SoapyPlutoSDR already present and loading — leaving it alone"
+        return 0
+    fi
+
+    # ONE package per call, deliberately. This used to be a single
+    #   apt_install libiio-utils libiio0 libad9361-0 || true
+    # which is ONE apt transaction: Debian trixie renamed the libiio runtime
+    # (there is no libiio0 there), so the whole transaction failed over a
+    # merely stale package name and took libiio-utils and libad9361-0 down
+    # with it — and `|| true` swallowed the evidence. The module then built
+    # happily against libiio-dev and died at load time with the dlopen error
+    # above. Install each separately so one bad name cannot mask the others,
+    # and accept whichever libiio soname this release actually ships.
+    apt_install libiio-utils || true
+    apt_install libad9361-0  || true
+    if ! apt_install libiio0 && ! apt_install libiio1; then
+        warn "no packaged libiio runtime found (tried libiio0, libiio1)"
+    fi
+    # Re-check before building: if the module was installed all along and only
+    # its dependency was missing, the apt work above just fixed it and there
+    # is no reason to clone and compile anything.
+    if pluto_driver_ok; then
+        ok "SoapyPlutoSDR loads now that its runtime libraries are installed"
         return 0
     fi
     if apt_has soapysdr-module-plutosdr && apt_install soapysdr-module-plutosdr; then
@@ -602,6 +650,17 @@ install_pluto_driver() {
         ok "SoapyPlutoSDR installed: $module"
     else
         ok "SoapyPlutoSDR built and installed under $prefix"
+    fi
+    # Closing the loop the comment above deliberately left open. A presence
+    # grep cries wolf, so it is not used here — but a LOAD FAILURE is not a
+    # guess: the driver itself reported that it could not open a shared
+    # object. Catching it now costs one command; not catching it means the
+    # service discovers it instead, at 3-second restart intervals, in a
+    # journal nobody reads until the demo is already live.
+    if SoapySDRUtil --info 2>&1 | grep -qi 'dlopen() failed'; then
+        warn "SoapyPlutoSDR is installed but will not load:"
+        SoapySDRUtil --info 2>&1 | grep -i 'loadModule\|dlopen' | sed 's/^/        /'
+        warn "the radio check below will fail until that library is installed"
     fi
     return 0
 }
@@ -992,6 +1051,19 @@ for r in rows:
         RADIO_CHECK_STATUS="FAILED — no radio enumerated"
         warn "SoapySDR enumerated no radios. It said:"
         printf '%s\n' "$out" | sed 's/^/        /'
+        # "Device or resource busy" is not the same failure as "absent", and
+        # telling them apart saves a trip to the radio. A USB interface that
+        # was claimed by a process systemd had to SIGKILL stays claimed —
+        # nothing in software releases it, so the honest instruction is the
+        # physical one rather than another round of re-running this script.
+        if printf '%s\n' "$out" | grep -qi 'resource busy\|claim interface'; then
+            warn "the radio is PRESENT but still claimed by something else."
+            warn "this installer already stopped the service and killed every"
+            warn "LINDA viewer, so a claim surviving that is stuck in the"
+            warn "kernel: UNPLUG THE RADIO, PLUG IT BACK IN, and re-run:"
+            warn "    sudo bash $SELF"
+            warn "check who holds it with:  sudo fuser -v /dev/bus/usb/*/*"
+        fi
         # Cross-check with the driver's own tool. If SoapySDRUtil sees the
         # radio and we do not, the fault is in LINDA; if neither sees it, the
         # radio is absent, unpowered, or still held by another process.
@@ -1305,6 +1377,13 @@ install_service() {
         ufw allow "$PORT/tcp" >/dev/null 2>&1 && info "ufw: opened $PORT/tcp" || true
     fi
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    # MANDATORY before the restart, now that the unit carries a start-rate
+    # limit (StartLimitBurst in the template). A unit that tripped that limit
+    # on the PREVIOUS radio refuses `systemctl restart` outright — "start
+    # request repeated too quickly" — and the install would end by reporting a
+    # service it never actually started. Clearing the counter here is what
+    # makes re-running the installer the reliable way to recover a radio swap.
+    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl restart "$SERVICE_NAME"
     ok "service installed and started"
     return 0
@@ -1336,12 +1415,26 @@ health_check() {
     die "the service did not answer /health within 120 seconds"
 }
 
+# `is-active` is NOT a safe guard for the stop, and gating on it was the single
+# reason a radio swap could not be fixed by re-running this installer. Swap the
+# radio out and the service crash-loops on a device selector that no longer
+# matches anything; for almost all of that cycle systemd reports it as
+# "activating" or "failed", never "active". So the guard skipped the stop
+# exactly when it mattered, `Restart=always` kept relaunching a viewer every 3
+# seconds, and that viewer raced this installer for the USB device through
+# detect_radio, verify_radio and the driver install. Observed on a Pi 5 with a
+# Pluto: restart counter 142, and every open failing with
+#   ERROR: Unable to claim interface 3:2:5: Device or resource busy (16)
+# Stop unconditionally instead, and clear the failed state so the restart
+# counter (and any start-rate limit) begins this install from zero.
 stop_existing_service() {
-    if [[ $HAVE_SYSTEMD -eq 1 && $IS_ROOT -eq 1 ]] \
-            && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        WAS_SERVICE_ACTIVE=1
-        systemctl stop "$SERVICE_NAME"
-        info "stopped the running $SERVICE_NAME for the duration of setup"
+    if [[ $HAVE_SYSTEMD -eq 1 && $IS_ROOT -eq 1 && -f "$UNIT_FILE" ]]; then
+        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && WAS_SERVICE_ACTIVE=1
+        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        # A crash-looping unit can be mid-restart when the stop lands, so the
+        # job queue may still hold a pending start. reset-failed drops it.
+        systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+        info "stopped $SERVICE_NAME for the duration of setup"
     fi
     release_radio
     return 0
