@@ -583,6 +583,24 @@ install still completes.
 | `MASTER_CLOCK_RATE` | 125e6 | AIR-T reference clock. **Not** a universal default — each profile declares its own `master_clock_rate` |
 | `SOAPY_FALLBACK_MASTER_CLOCK` | 61.44e6 | generic-SoapySDR clock used only when `_probe_device_facts` could not ask the driver |
 
+## LO bandstop vs sample rate
+
+`DEFAULT_LO_BANDSTOP` (120 kHz) is config, so it survives retunes — and a
+retune can move the rate underneath it (the Pluto's driver floor is 65105 Hz,
+narrower than the notch). striqt then rejects the spec every frame
+("offset - bandwidth/2 < fs/2") and the compute backstop can't recover:
+the analysis params never changed, the RATE did, so there's nothing to revert
+— the viewer wedges in an error loop and op verification waits forever on a
+frame that cannot compute (observed: hardware qual hung at the Pluto floor
+rate). `dsp.resolve_lo_bandstop(value, sample_rate)` disables the notch
+(disclosed once per pairing, raw DC leak shows) when it exceeds fs/2; it is
+applied inside `make_analysis_spec`/`make_psd_kwargs`/`make_ssb_kwargs` (SSB:
+against the truncated output rate) so the tier-2 validators inherit it, and at
+every `fit_display_rows` call so the display null vanishes with the notch.
+Never pass a raw `cfg.*lo_bandstop` to striqt or to a display null. Repeated
+identical `[compute]` errors are throttled to one line per 5 s
+(`_log_compute_error`); a different error always prints immediately.
+
 ## striqt.analysis spectrogram contract
 
 `evaluate_spectrogram` sets `nfft = round(sample_rate / frequency_resolution)`
