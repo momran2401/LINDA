@@ -963,6 +963,27 @@ class Computer(threading.Thread):
         self.shared   = shared
         self.insights = insights
         self._last_err_notice = 0.0
+        self._last_err_print  = ("", 0.0)   # (message, time) of the last log line
+
+    def _log_compute_error(self, prefix: str, e: Exception) -> None:
+        """Log a compute failure without flooding the journal.
+
+        The compute loop runs per display tick, so a PERSISTENT fault — one
+        the backstop cannot revert, e.g. a striqt spec invalid at the current
+        sample rate — used to print identically at frame rate, forever.
+        Observed on a Pi 5 + Pluto: hundreds of `offset - bandwidth/2 < fs/2`
+        lines burying the op log and the installer transcript. A repeat of
+        the SAME message is suppressed for 5 s; a DIFFERENT error always
+        prints immediately, so a changing failure is never masked.
+        """
+        msg = f"{prefix}{e}"
+        last_msg, last_t = self._last_err_print
+        now = time.time()
+        if msg == last_msg and now - last_t <= 5.0:
+            return
+        suffix = " (repeating — logged at most every 5 s)" if msg == last_msg else ""
+        print(f"[compute] {msg}{suffix}")
+        self._last_err_print = (msg, now)
 
     def _ahawi_cycle(self, cfg):
         """One AHAWI round: coherent chunk -> analyze once -> publish -> pace.
@@ -1012,7 +1033,7 @@ class Computer(threading.Thread):
         except Exception as e:
             # Same backstop as the rolling path (P2a-3): revert bad analysis
             # params, keep the viewer alive, surface the reason.
-            print(f"[compute] ahawi error: {e}")
+            self._log_compute_error("ahawi error: ", e)
             reverted = self.shared.revert_analysis(str(e))
             if reverted:
                 print(f"[compute] reverted analysis params: {reverted}")
@@ -1085,7 +1106,7 @@ class Computer(threading.Thread):
                 # the live compute, catch it, revert to the last-good analysis
                 # config, keep streaming, and surface the reason — the viewer
                 # must never freeze.
-                print(f"[compute] error: {e}")
+                self._log_compute_error("error: ", e)
                 reverted = self.shared.revert_analysis(str(e))
                 if reverted:
                     print(f"[compute] reverted analysis params: {reverted}")

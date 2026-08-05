@@ -191,6 +191,57 @@ def resolve_integration_bandwidth(value, nfft: int, sample_rate: float):
     return float(value)
 
 
+# One disclosure per (bandstop, rate) pairing, not one per frame: the compute
+# loop rebuilds its spec every tick, and an unconditional print would replay
+# the very journal spam this exists to prevent.
+_LO_BANDSTOP_DISCLOSED = set()
+
+
+def resolve_lo_bandstop(value, sample_rate):
+    """Drop an LO bandstop that cannot fit inside the sampled span.
+
+    The default bandstop (`DEFAULT_LO_BANDSTOP`, 120 kHz) is sized for the
+    MS/s rates this project usually runs. It is CONFIG, so it survives a
+    retune — and a retune can move the rate underneath it: the Pluto's driver
+    floor is 65105 Hz, a span narrower than the notch itself. striqt then
+    rejects the filter design on every frame ("offset - bandwidth/2 < fs/2"),
+    and the compute backstop cannot save the viewer because there is nothing
+    to revert — the analysis params never changed, the rate did. Observed on
+    a Pi 5 + Pluto: the hardware qual's rate sweep hit the 65105 Hz point and
+    wedged there, erroring once per tick forever, because op verification
+    waits for a frame that could never compute.
+
+    Disabling the notch is the honest resolution, not clamping: a notch as
+    wide as the whole span IS "no spectrum", and the display convention
+    already exists — `lo_bandstop=None` shows the raw DC leak, disclosed, and
+    `fit_display_rows` skips its null the same way. The margin is fs/2, not
+    fs: a notch is centered at DC, so each half must fit inside its Nyquist
+    half-span, and striqt's own filter design needs room for a transition
+    band beyond that — half the span is the widest notch that leaves any
+    passband on both sides.
+
+    Args:
+        value: The configured bandstop width in Hz; None/0/"" disables.
+        sample_rate: The rate the radio is actually running, in Hz.
+
+    Returns:
+        float | None: `value` unchanged when it fits, else None.
+    """
+    if not value:
+        return None
+    lo = float(value)
+    fs = float(sample_rate)
+    if lo <= fs / 2:
+        return lo
+    key = (round(lo), round(fs))
+    if key not in _LO_BANDSTOP_DISCLOSED:
+        _LO_BANDSTOP_DISCLOSED.add(key)
+        print(f"[analysis] lo_bandstop {lo/1e3:g} kHz exceeds half the "
+              f"{fs/1e3:g} kHz span at this sample rate — LO notch disabled "
+              f"until the rate can hold it (raw DC leak will show)")
+    return None
+
+
 def make_analysis_spec(cfg: "RadioConfig", nfft: int, sample_rate: float):
     """Build the striqt `Spectrogram` spec from cfg's analysis param block (P2a-1).
 
@@ -210,7 +261,6 @@ def make_analysis_spec(cfg: "RadioConfig", nfft: int, sample_rate: float):
     integration = resolve_integration_bandwidth(
         cfg.integration_bandwidth, nfft, sample_rate
     )
-    lo = cfg.lo_bandstop
     aperture = cfg.time_aperture
     return analysis_specs.Spectrogram(
         window=cfg.window,
@@ -219,7 +269,7 @@ def make_analysis_spec(cfg: "RadioConfig", nfft: int, sample_rate: float):
         window_fill=Fraction(cfg.window_fill),
         integration_bandwidth=integration,
         trim_stopband=bool(cfg.trim_stopband),
-        lo_bandstop=(float(lo) if lo else None),
+        lo_bandstop=resolve_lo_bandstop(cfg.lo_bandstop, sample_rate),
         time_aperture=(float(aperture) if aperture else None),
     )
 
@@ -319,7 +369,10 @@ def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig",
     blocks = fit_display_rows(
         np.asarray(spg, dtype=np.float32), rows_out,
         bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate,
-        lo_null=cfg.lo_null, lo_bandstop=cfg.lo_bandstop,
+        # Resolved, same as the spec above: when the notch was disabled for
+        # this rate, the display null must not paint over the span either.
+        lo_null=cfg.lo_null,
+        lo_bandstop=resolve_lo_bandstop(cfg.lo_bandstop, sample_rate),
     )
     meta = {"fft_nfft": int(nfft), "bin_avg": int(average_bins),
             "hop_size": int(hop * time_bins), "compute_backend": gpu_backend}
@@ -356,7 +409,6 @@ def make_psd_kwargs(cfg: "RadioConfig", nfft: int, sample_rate: float) -> dict:
     integration = resolve_integration_bandwidth(
         cfg.psd_integration_bandwidth, nfft, sample_rate
     )
-    lo = cfg.psd_lo_bandstop
     return dict(
         window=cfg.psd_window,
         frequency_resolution=float(sample_rate) / float(nfft),
@@ -364,7 +416,7 @@ def make_psd_kwargs(cfg: "RadioConfig", nfft: int, sample_rate: float) -> dict:
         window_fill=Fraction(cfg.psd_window_fill),
         integration_bandwidth=integration,
         trim_stopband=bool(cfg.psd_trim_stopband),
-        lo_bandstop=(float(lo) if lo else None),
+        lo_bandstop=resolve_lo_bandstop(cfg.psd_lo_bandstop, sample_rate),
         time_statistic=tuple(cfg.psd_time_statistic),
     )
 
@@ -427,7 +479,8 @@ def psd_traces(samples: np.ndarray, cfg: "RadioConfig",
     blocks = fit_display_rows(
         psd, psd.shape[1],
         bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate,
-        lo_null=cfg.lo_null, lo_bandstop=cfg.psd_lo_bandstop,
+        lo_null=cfg.lo_null,
+        lo_bandstop=resolve_lo_bandstop(cfg.psd_lo_bandstop, sample_rate),
     )
     meta = {
         "fft_nfft": int(nfft), "bin_avg": int(average_bins), "hop_size": int(hop),
@@ -520,7 +573,9 @@ def ssb_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
         spg, spg.shape[1],
         bin_avg=2, fft_nfft=geo["nfft"], sample_rate=sample_rate,
         lo_null=(cfg.lo_null and not cfg.ssb_frequency_offset),
-        lo_bandstop=cfg.ssb_lo_bandstop,
+        # Same resolved value striqt was given (make_ssb_kwargs) — the display
+        # null must vanish together with the notch it is sized to.
+        lo_bandstop=kwargs["lo_bandstop"],
     )
     # One display row = one OFDM symbol (hop samples). Rows across burst-set
     # boundaries jump a discovery period — the view is a burst montage, so the
@@ -861,17 +916,21 @@ def make_ssb_kwargs(cfg: "RadioConfig") -> dict:
         Dict of kwargs ready to splat into
         `striqt_measurements.cellular_5g_ssb_spectrogram`.
     """
+    # striqt truncates the frequency axis to this output rate; it can never
+    # exceed the sampled span.
+    out_rate = min(float(cfg.ssb_sample_rate), float(cfg.sample_rate))
     return dict(
         subcarrier_spacing=float(cfg.ssb_subcarrier_spacing),
-        # striqt truncates the frequency axis to this output rate; it can never
-        # exceed the sampled span.
-        sample_rate=min(float(cfg.ssb_sample_rate), float(cfg.sample_rate)),
+        sample_rate=out_rate,
         discovery_periodicity=float(cfg.ssb_discovery_periodicity),
         frequency_offset=float(cfg.ssb_frequency_offset),
         max_block_count=(int(cfg.ssb_max_block_count)
                          if cfg.ssb_max_block_count else None),
         window=cfg.ssb_window,
-        lo_bandstop=(float(cfg.ssb_lo_bandstop) if cfg.ssb_lo_bandstop else None),
+        # Judged against the truncated OUTPUT span, since that is the axis the
+        # notch is cut from — a capture rate wide enough for the notch does
+        # not help if the SSB band it is cut from is narrower.
+        lo_bandstop=resolve_lo_bandstop(cfg.ssb_lo_bandstop, out_rate),
     )
 
 
