@@ -1650,6 +1650,25 @@ async def reset_radio(request: Request):
         )
     OPERATIONS.stage(op_id, "validated", "sudoers rule allows the restart")
 
+    # Clear any tripped start-rate limit BEFORE restarting. The unit bounds
+    # its restarts (StartLimitBurst), and a unit that hit the limit refuses
+    # `systemctl restart` outright — so on the one occasion Reset Radio is
+    # needed most (a crash-looping radio), the button would fail for the rest
+    # of the limit window. Best-effort on purpose: a host whose sudoers rule
+    # predates the reset-failed line just skips this, exactly as before.
+    def _reset_failed():
+        try:
+            subprocess.run(
+                [sudo_path, "-n", systemctl_path, "reset-failed",
+                 RADIO_SERVICE_NAME],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except Exception:  # noqa: BLE001 — never let cleanup block the restart
+            pass
+
+    await asyncio.get_running_loop().run_in_executor(None, _reset_failed)
+
     # stderr goes to a PERSISTENT log (survives this process being replaced):
     # RADIO_RESET_LOG, set by the systemd unit to /var/log/radio-web/reset.log.
     log_path = Path(os.environ.get(
