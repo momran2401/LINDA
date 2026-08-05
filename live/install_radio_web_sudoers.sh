@@ -43,8 +43,15 @@ TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 cat > "$TMP" <<EOF
 # Managed by live/install_radio_web_sudoers.sh — lets the striqt web viewer's
-# "Reset Radio" button restart the radio service with no password. Scoped to a
-# single command; do not broaden.
+# "Reset Radio" button restart the radio service with no password. Scoped to
+# two exact commands against a single unit; do not broaden.
+#
+# reset-failed is required, not a convenience: the unit carries a start-rate
+# limit (StartLimitBurst), and a unit that tripped it refuses BOTH
+# \`systemctl restart\` and its own Restart=always until the counter clears.
+# Without this line, pressing Reset Radio on a crash-looping radio would
+# dead-end for the rest of the limit window.
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL reset-failed $SERVICE_NAME
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL restart $SERVICE_NAME
 EOF
 

@@ -1145,29 +1145,36 @@ detect_tx_support() {
             TX_NOTE="disabled — $RADIO_LABEL is receive-only"
             return 0 ;;
     esac
+    # Through core.devices.discover(), NOT a raw SoapySDR.Device.enumerate()
+    # loop. The raw loop opened EVERY enumeration row, and a Pluto presents
+    # one radio as two rows (usb: + its ip: network gadget) — the same
+    # double-open that produced "Unable to claim interface: Device or
+    # resource busy" elsewhere. discover() dedupes those rows before opening
+    # anything, and already probes the TX channel count this needs.
     local channels=""
     if [[ -x "$VENV_PY" ]]; then
-        channels="$("$VENV_PY" - <<'PY' 2>/dev/null
-import SoapySDR
-best = 0
+        channels="$( cd "$REPO_ROOT" && "$VENV_PY" - <<'PY' 2>/dev/null
+import os, sys
+sys.path.insert(0, "live")
+from core import devices
+# discover() narrates to stdout ("[device] selected ..."), and this stdout IS
+# the captured value — divert the narration, keep only the final number.
+real, sys.stdout = sys.stdout, open(os.devnull, "w")
 try:
-    rows = SoapySDR.Device.enumerate()
+    rows = devices.discover()
 except Exception:
     rows = []
-for row in rows:
-    dev = None
-    try:
-        dev = SoapySDR.Device(dict(row))
-        best = max(best, int(dev.getNumChannels(SoapySDR.SOAPY_SDR_TX)))
-    except Exception:
-        pass
-    finally:
-        if dev is not None:
-            try:
-                SoapySDR.Device.unmake(dev)
-            except Exception:
-                pass
-print(best)
+finally:
+    sys.stdout = real
+# None = the probe could not ask (device busy, driver quirk): that is
+# "unknown", never "0 TX channels" — the empty print takes the installer to
+# its could-not-probe fallback, which leaves TX enabled and defers to the
+# runtime re-check in the server instead of silently disabling it.
+# NOTE: no apostrophes in this heredoc — bash 3.2 (macOS) scans $( ) bodies
+# naively and treats one as an unterminated quote.
+known = [int(r["num_tx_channels"]) for r in rows
+         if r.get("num_tx_channels") is not None]
+print(max(known) if known else "")
 PY
 )"
     fi
