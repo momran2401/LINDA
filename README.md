@@ -117,9 +117,7 @@ All AI-generated outputs were reviewed, tested, and edited by the human project 
 ## Additional references
 
 - [LINDA manual](docs/README_MANUAL.md) — detailed operational manual.
-- [File map](docs/FILE_MAP.md) — diagrams of how the files connect: module
-  imports, startup chain, client/server endpoints, and what is deliberately
-  unconnected.
+- [File map](docs/FILE_MAP.md) — diagrams of how the files connect
 - [Repository overview](docs/REPO_OVERVIEW.md) — codebase architecture and source map.
 - [striqt README](https://github.com/usnistgov/striqt/blob/main/README.md) — upstream package install and CLI notes.
 
