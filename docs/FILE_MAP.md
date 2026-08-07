@@ -264,14 +264,3 @@ purpose:
 | `live/legacy/` | **Frozen.** Four pre-`core` scripts, each with a duplicated backend. Nothing imports or launches them. Kept because `core/shims.py`, `core/acquisition.py`, and `core/devices/sources.py` cite them for provenance. Fix bugs in `core/`, never here. |
 | `live/web_sim/index.html` | Self-contained browser **simulation** with synthetic IQ and inline CSS/JS. Not served, not mounted, not opened by any script. A standalone demo — it will drift from `app.js` by design, so do not treat it as a second client to keep in sync. |
 | `live/tests/` | 21 files. Imports `core` heavily; imports no frontend. Runs with no hardware and no striqt, and also runs *on* the radio host. |
-
----
-
-## 9. Reading order for a new contributor
-
-1. `CLAUDE.md` — the hardware quirks and the "why", none of which is recoverable from the code
-2. This file — where things live
-3. `core/constants.py` → `core/state.py` → `core/config.py` — the data model
-4. `core/acquisition.py` — the ring buffer and the frame loop
-5. `striqt_web_server.py` — how a frontend consumes all of it
-6. `docs/README_MANUAL.md` — the operational reference
