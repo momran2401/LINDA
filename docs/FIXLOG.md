@@ -836,3 +836,5 @@ server-seeded capture values returns `applied []` (no rearm); choosing 7.68 MS/s
 applies-then-retunes with the reported `rounded sample_rate → 13.44e6`; on the calibrated
 backend 13.44 still snaps to 15.36. **Verify [hardware]:** with SSB live, a bare Apply causes
 no waterfall blank/rearm log line.
+
+Mustafa
