@@ -11,17 +11,17 @@ and nature of any such change. Please explicitly acknowledge the
 National Institute of Standards and Technology as the source of
 the software.
 
-NIST-developed software is expressly provided "AS IS." NIST MAKES
-NO WARRANTY OF ANY KIND, EXPRESS, IMPLIED, IN FACT, OR ARISING BY
-OPERATION OF LAW, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
-WARRANTY OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
-NON-INFRINGEMENT, AND DATA ACCURACY. NIST NEITHER REPRESENTS NOR
-WARRANTS THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED
-OR ERROR-FREE, OR THAT ANY DEFECTS WILL BE CORRECTED. NIST DOES
-NOT WARRANT OR MAKE ANY REPRESENTATIONS REGARDING THE USE OF THE
-SOFTWARE OR THE RESULTS THEREOF, INCLUDING BUT NOT LIMITED TO THE
-CORRECTNESS, ACCURACY, RELIABILITY, OR USEFULNESS OF THE
-SOFTWARE.
+NIST-developed software is expressly provided "AS IS." NIST makes
+no warranty of any kind, express, implied, in fact, or arising by
+operation of law, including, without limitation, the implied
+warranty of merchantability, fitness for a particular purpose,
+non-infringement, and data accuracy. nist neither represents nor
+warrants that the operation of the software will be uninterrupted
+or error-free, or that any defects will be corrected. nist does
+not warrant or make any representations regarding the use of the
+software or the results thereof, including but not limited to the
+correctness, accuracy, reliability, or usefulness of the
+software.
 
 You are solely responsible for determining the appropriateness of
 using and distributing the software and you assume all risks
