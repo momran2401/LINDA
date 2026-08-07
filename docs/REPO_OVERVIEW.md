@@ -30,15 +30,11 @@ but contains only `plot.yaml` (no captured datasets).
 
 ```
 NIST-Omran/
-├── CLAUDE.md                      # Claude Code project instructions (architecture, known bugs, constants)
 ├── README.md                      # Human overview of the live viewers + quick usage
 ├── REPO_OVERVIEW.md               # (this file)
 ├── bug_report.md                  # Read-only bug inspection of live/ (dated 2026-06-24, 498 lines)
 ├── INSTALLED_STRIQT_API.txt       # Dump of the installed striqt.analysis API + evaluate_spectrogram signature
-├── setup.sh                       # One-time Raspberry Pi 5 setup for pluto_standalone.py (apt + pip + import checks)
-├── .gitignore                     # Ignores CLAUDE.md (listed twice)
-├── .claude/
-│   └── settings.local.json        # Local Claude Code permission allowlist (python3, web_sim open, RADIO_USER/PASS run)
+├── install_linda.sh                       # One-time Raspberry Pi 5 setup for pluto_standalone.py (apt + pip + import checks)
 │
 ├── live/                          # ── PROJECT CODE ──
 │   ├── striqt_web_server.py       # FastAPI/uvicorn WebSocket live viewer server (main web entry point)
