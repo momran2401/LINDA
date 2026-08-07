@@ -3,8 +3,6 @@
 </p>
 <h1 align="center">Live IQ Navigation and Display Application</h1>
 
-3 months worth of wonderfulness 😙🤌
-
 Built by the GOAT *Mustafa A. Omran*
 under supervision of *Aric W. Sanders, and Dan Kuester*.
 
