@@ -99,6 +99,10 @@ transmit safety, diagnostics, and troubleshooting.
 - `install_linda.sh` / `uninstall_linda.sh` — idempotent installation and
   removal of program.
 
+See the [file map](docs/FILE_MAP.md) for how these pieces connect: the import
+graph of `live/core/`, the service startup chain, and the browser/server
+endpoints.
+
 ## Testing
 
 ```sh
@@ -113,6 +117,9 @@ All AI-generated outputs were reviewed, tested, and edited by the human project 
 ## Additional references
 
 - [LINDA manual](docs/README_MANUAL.md) — detailed operational manual.
+- [File map](docs/FILE_MAP.md) — diagrams of how the files connect: module
+  imports, startup chain, client/server endpoints, and what is deliberately
+  unconnected.
 - [Repository overview](docs/REPO_OVERVIEW.md) — codebase architecture and source map.
 - [striqt README](https://github.com/usnistgov/striqt/blob/main/README.md) — upstream package install and CLI notes.
 
