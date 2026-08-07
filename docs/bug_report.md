@@ -498,3 +498,5 @@ self.images[1].setVisible(False)
 | P-3 | `pluto_standalone.py` | **Critical** | Same acquirer-crash-on-dirty-recovery bug as A-1 (copy-pasted) |
 | P-4 | `pluto_standalone.py` | Low | Same print-inside-lock as A-2 (copy-pasted) |
 | P-5 | `pluto_standalone.py` | Low | Same `_save_csv` crash as A-3 (copy-pasted) |
+
+Mustafa
